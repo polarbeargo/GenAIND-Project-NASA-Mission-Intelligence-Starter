@@ -24,7 +24,7 @@ try:
     RAGAS_AVAILABLE = True
 except ImportError:
     RAGAS_AVAILABLE = False
-    st.warning("RAGAS not available. Install with: pip install ragas")
+    st.warning("RAGAS not available. Install with: uv add ragas")
 
 # Page configuration
 st.set_page_config(
@@ -127,7 +127,10 @@ def main():
         
         if not available_backends:
             st.error("No ChromaDB backends found!")
-            st.info("Please run the embedding pipeline first:\n`python run_text_embedding.py`")
+            st.info(
+                "Please run the embedding pipeline first:\n"
+                "`uv run python embedding_pipeline.py --openai-key YOUR_KEY --data-path ./data_text`"
+            )
             st.stop()
         
         # Backend selection
