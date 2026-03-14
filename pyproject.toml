@@ -1,0 +1,17 @@
+[project]
+name = "nasa-mission-intelligence-starter"
+version = "0.1.0"
+description = "NASA mission intelligence RAG learning project"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "chromadb>=0.5.0",
+    "langchain-openai>=0.2.0",
+    "openai>=1.0.0",
+    "pandas>=2.0.0",
+    "ragas>=0.2.0",
+    "streamlit>=1.32.0",
+]
+
+[tool.uv]
+package = false
