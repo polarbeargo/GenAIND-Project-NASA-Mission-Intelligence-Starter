@@ -16,6 +16,7 @@ Supported data sources:
 import os
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import chromadb
@@ -27,8 +28,10 @@ import time
 from datetime import datetime
 import argparse
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from dotenv import load_dotenv
 
-# Configure logging
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -188,10 +191,7 @@ class ChromaEmbeddingPipelineTextOnly:
             True if successful, False otherwise
         """
         try:
-            # Get new embedding
             embedding = self.get_embedding(text)
-            
-            # Update the document
             self.collection.update(
                 ids=[doc_id],
                 documents=[text],
@@ -215,10 +215,8 @@ class ChromaEmbeddingPipelineTextOnly:
             Number of documents deleted
         """
         try:
-            # Get all documents
             all_docs = self.collection.get()
             
-            # Find documents matching the source pattern
             ids_to_delete = []
             for i, metadata in enumerate(all_docs['metadatas']):
                 if source_pattern in metadata.get('source', ''):
@@ -250,10 +248,8 @@ class ChromaEmbeddingPipelineTextOnly:
             source = file_path.stem
             mission = self.extract_mission_from_path(file_path)
             
-            # Get all documents
             all_docs = self.collection.get()
             
-            # Find documents from this file
             file_doc_ids = []
             for i, metadata in enumerate(all_docs['metadatas']):
                 if (metadata.get('source') == source and 
@@ -319,7 +315,6 @@ class ChromaEmbeddingPipelineTextOnly:
             if not content.strip():
                 return []
             
-            # Enhanced metadata extraction
             metadata = {
                 'source': file_path.stem,
                 'file_path': str(file_path),
@@ -368,7 +363,6 @@ class ChromaEmbeddingPipelineTextOnly:
         """Extract document category from filename for better organization"""
         filename_lower = filename.lower()
         
-        # Apollo transcript types
         if 'pao' in filename_lower:
             return 'public_affairs_officer'
         elif 'cm' in filename_lower:
@@ -378,11 +372,9 @@ class ChromaEmbeddingPipelineTextOnly:
         elif 'flight_plan' in filename_lower:
             return 'flight_plan'
         
-        # Challenger audio segments
         elif 'mission_audio' in filename_lower:
             return 'mission_audio'
         
-        # NASA archive documents
         elif 'ntrs' in filename_lower:
             return 'nasa_archive'
         elif '19900066485' in filename_lower:
@@ -390,7 +382,6 @@ class ChromaEmbeddingPipelineTextOnly:
         elif '19710015566' in filename_lower:
             return 'mission_report'
         
-        # General categories
         elif 'full_text' in filename_lower:
             return 'complete_document'
         else:
@@ -409,7 +400,6 @@ class ChromaEmbeddingPipelineTextOnly:
         base_path = Path(base_path)
         files_to_process = []
         
-        # Define directories to scan
         data_dirs = [
             'apollo11',
             'apollo13',
@@ -421,15 +411,12 @@ class ChromaEmbeddingPipelineTextOnly:
             if dir_path.exists():
                 logger.info(f"Scanning directory: {dir_path}")
                 
-                # Find only text files
                 text_files = list(dir_path.glob('**/*.txt'))
                 files_to_process.extend(text_files)
                 logger.info(f"Found {len(text_files)} text files in {data_dir}")
         
-        # Filter out unwanted files
         filtered_files = []
         for file_path in files_to_process:
-            # Skip system files and summaries
             if (file_path.name.startswith('.') or 
                 'summary' in file_path.name.lower() or
                 file_path.suffix.lower() != '.txt'):
@@ -438,7 +425,6 @@ class ChromaEmbeddingPipelineTextOnly:
         
         logger.info(f"Total text files to process: {len(filtered_files)}")
         
-        # Log file breakdown by mission
         mission_counts = {}
         for file_path in filtered_files:
             mission = self.extract_mission_from_path(file_path)
@@ -618,40 +604,29 @@ class ChromaEmbeddingPipelineTextOnly:
     def get_collection_stats(self) -> Dict[str, Any]:
         """Get detailed statistics about the collection"""
         try:
-            # Get all documents to analyze
             all_docs = self.collection.get()
             
             if not all_docs['metadatas']:
                 return {'error': 'No documents in collection'}
             
-            stats = {
-                'total_documents': len(all_docs['metadatas']),
-                'missions': {},
-                'data_types': {},
-                'document_categories': {},
-                'file_types': {}
-            }
-            
-            # Analyze metadata
+            missions: Counter = Counter()
+            data_types: Counter = Counter()
+            doc_categories: Counter = Counter()
+            file_types: Counter = Counter()
+
             for metadata in all_docs['metadatas']:
-                mission = metadata.get('mission', 'unknown')
-                data_type = metadata.get('data_type', 'unknown')
-                doc_category = metadata.get('document_category', 'unknown')
-                file_type = metadata.get('file_type', 'unknown')
-                
-                # Count by mission
-                stats['missions'][mission] = stats['missions'].get(mission, 0) + 1
-                
-                # Count by data type
-                stats['data_types'][data_type] = stats['data_types'].get(data_type, 0) + 1
-                
-                # Count by document category
-                stats['document_categories'][doc_category] = stats['document_categories'].get(doc_category, 0) + 1
-                
-                # Count by file type
-                stats['file_types'][file_type] = stats['file_types'].get(file_type, 0) + 1
-            
-            return stats
+                missions[metadata.get('mission', 'unknown')] += 1
+                data_types[metadata.get('data_type', 'unknown')] += 1
+                doc_categories[metadata.get('document_category', 'unknown')] += 1
+                file_types[metadata.get('file_type', 'unknown')] += 1
+
+            return {
+                'total_documents': len(all_docs['metadatas']),
+                'missions': dict(missions),
+                'data_types': dict(data_types),
+                'document_categories': dict(doc_categories),
+                'file_types': dict(file_types),
+            }
             
         except Exception as e:
             logger.error(f"Error getting collection stats: {e}")
@@ -661,7 +636,7 @@ def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='ChromaDB Embedding Pipeline for NASA Data')
     parser.add_argument('--data-path', default='.', help='Path to data directories')
-    parser.add_argument('--openai-key', required=True, help='OpenAI API key')
+    parser.add_argument('--openai-key', default=None, help='OpenAI API key (or set OPENAI_API_KEY in .env)')
     parser.add_argument('--chroma-dir', default='./chroma_db_openai', help='ChromaDB persist directory')
     parser.add_argument('--collection-name', default='nasa_space_missions_text', help='Collection name')
     parser.add_argument('--embedding-model', default='text-embedding-3-small', help='OpenAI embedding model')
@@ -676,10 +651,14 @@ def main():
     
     args = parser.parse_args()
     
-    # Initialize pipeline
+    openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
+    if not openai_key:
+        logger.error("OpenAI API key not found. Provide --openai-key or set OPENAI_API_KEY in .env")
+        return
+ 
     logger.info("Initializing ChromaDB Embedding Pipeline...")
     pipeline = ChromaEmbeddingPipelineTextOnly(
-        openai_api_key=args.openai_key,
+        openai_api_key=openai_key,
         chroma_persist_directory=args.chroma_dir,
         collection_name=args.collection_name,
         embedding_model=args.embedding_model,
@@ -687,13 +666,11 @@ def main():
         chunk_overlap=args.chunk_overlap
     )
     
-    # Handle delete source operation
     if args.delete_source:
         deleted_count = pipeline.delete_documents_by_source(args.delete_source)
         logger.info(f"Deleted {deleted_count} documents matching source pattern: {args.delete_source}")
         return
     
-    # If stats only, show collection statistics and exit
     if args.stats_only:
         logger.info("Collection Statistics:")
         stats = pipeline.get_collection_stats()
@@ -701,7 +678,6 @@ def main():
             logger.info(f"{key}: {value}")
         return
     
-    # Process all data
     logger.info(f"Starting text data processing with update mode: {args.update_mode}")
     start_time = time.time()
     
@@ -710,7 +686,6 @@ def main():
     end_time = time.time()
     processing_time = end_time - start_time
     
-    # Print results
     logger.info("=" * 60)
     logger.info("PROCESSING COMPLETE")
     logger.info("=" * 60)
@@ -721,19 +696,15 @@ def main():
     logger.info(f"Documents skipped (already exist): {stats['documents_skipped']}")
     logger.info(f"Errors: {stats['errors']}")
     logger.info(f"Processing time: {processing_time:.2f} seconds")
-    
-    # Mission breakdown
     logger.info("\nMission breakdown:")
     for mission, mission_stats in stats['missions'].items():
         logger.info(f"  {mission}: {mission_stats['files']} files, {mission_stats['chunks']} chunks")
         logger.info(f"    Added: {mission_stats['added']}, Updated: {mission_stats['updated']}, Skipped: {mission_stats['skipped']}")
     
-    # Collection info
     collection_info = pipeline.get_collection_info()
     logger.info(f"\nCollection: {collection_info.get('collection_name', 'N/A')}")
     logger.info(f"Total documents in collection: {collection_info.get('document_count', 'N/A')}")
     
-    # Test query if provided
     if args.test_query:
         logger.info(f"\nTesting query: '{args.test_query}'")
         results = pipeline.query_collection(args.test_query)
