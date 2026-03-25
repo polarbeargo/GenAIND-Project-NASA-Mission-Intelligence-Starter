@@ -75,17 +75,20 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
         return {"error": "OpenAI API key not configured for evaluation"}
 
     try:
+        _openai_base = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
         evaluator_llm = LangchainLLMWrapper(
             ChatOpenAI(
                 model="gpt-3.5-turbo",
                 temperature=0,
                 api_key=openai_api_key,
+                base_url=_openai_base,
             )
         )
         evaluator_embeddings = LangchainEmbeddingsWrapper(
             OpenAIEmbeddings(
                 model="text-embedding-3-small",
                 api_key=openai_api_key,
+                base_url=_openai_base,
             )
         )
 

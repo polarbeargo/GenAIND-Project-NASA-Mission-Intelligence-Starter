@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List
 from openai import OpenAI
 
@@ -35,7 +36,10 @@ def generate_response(openai_key: str, user_message: str, context: str,
 
     messages.append({"role": "user", "content": user_message})
 
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url=os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1"),
+        api_key=openai_key,
+    )
     response = client.chat.completions.create(
         model=model,
         messages=messages,
