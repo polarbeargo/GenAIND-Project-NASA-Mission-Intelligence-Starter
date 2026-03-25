@@ -7,7 +7,6 @@ from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from typing import Dict, List, Optional
 
-# RAGAS imports
 try:
     from ragas import SingleTurnSample
     from ragas.metrics import BleuScore, NonLLMContextPrecisionWithReference, ResponseRelevancy, Faithfulness, RougeScore
