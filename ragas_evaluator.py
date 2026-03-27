@@ -1,11 +1,17 @@
 import asyncio
 import inspect
-import os
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from typing import Dict, List, Optional
+
+from openai_config import (
+    get_openai_api_key,
+    get_openai_base_url,
+    get_openai_chat_model,
+    get_openai_embedding_model,
+)
 
 try:
     from ragas import SingleTurnSample
@@ -70,15 +76,15 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
     if not cleaned_contexts:
         return {"error": "No contexts available for evaluation"}
 
-    openai_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("CHROMA_OPENAI_API_KEY")
+    openai_api_key = get_openai_api_key()
     if not openai_api_key:
         return {"error": "OpenAI API key not configured for evaluation"}
 
     try:
-        _openai_base = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
+        _openai_base = get_openai_base_url()
         evaluator_llm = LangchainLLMWrapper(
             ChatOpenAI(
-                model="gpt-3.5-turbo",
+                model=get_openai_chat_model(),
                 temperature=0,
                 api_key=openai_api_key,
                 base_url=_openai_base,
@@ -86,7 +92,7 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
         )
         evaluator_embeddings = LangchainEmbeddingsWrapper(
             OpenAIEmbeddings(
-                model="text-embedding-3-small",
+                model=get_openai_embedding_model(),
                 api_key=openai_api_key,
                 base_url=_openai_base,
             )

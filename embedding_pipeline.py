@@ -28,7 +28,13 @@ import time
 from datetime import datetime
 import argparse
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-from dotenv import load_dotenv
+
+from env_utils import load_project_env
+from openai_config import (
+    get_openai_api_key,
+    get_openai_base_url,
+    set_chroma_openai_api_key,
+)
 
 try:
     import polars as pl
@@ -44,7 +50,7 @@ except Exception:
     pd = None
     PANDAS_AVAILABLE = False
 
-load_dotenv()
+load_project_env(__file__)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +83,7 @@ class ChromaEmbeddingPipelineTextOnly:
             chunk_size: Maximum size of text chunks
             chunk_overlap: Overlap between chunks
         """
-        _openai_base = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
+        _openai_base = get_openai_base_url()
         self.openai_client = OpenAI(api_key=openai_api_key, base_url=_openai_base)
         self.openai_api_key = openai_api_key
         self.chroma_persist_directory = chroma_persist_directory
@@ -86,7 +92,7 @@ class ChromaEmbeddingPipelineTextOnly:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
-        os.environ["CHROMA_OPENAI_API_KEY"] = openai_api_key
+        set_chroma_openai_api_key(openai_api_key)
         Path(chroma_persist_directory).mkdir(parents=True, exist_ok=True)
 
         self.chroma_client = chromadb.PersistentClient(
@@ -837,7 +843,7 @@ def main():
     
     args = parser.parse_args()
     
-    openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
+    openai_key = args.openai_key or get_openai_api_key(include_chroma_fallback=False)
     if not openai_key:
         logger.error("OpenAI API key not found. Provide --openai-key or set OPENAI_API_KEY in .env")
         return

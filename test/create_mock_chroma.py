@@ -3,12 +3,17 @@
 Create a mock ChromaDB collection for testing without OpenAI API key
 """
 
+import sys
+
 import chromadb
 from chromadb.config import Settings
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from env_utils import load_project_env
+
+load_project_env(__file__)
 
 def create_mock_chroma():
     """Create a mock ChromaDB with sample data for testing"""

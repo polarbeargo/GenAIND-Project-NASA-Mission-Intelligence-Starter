@@ -10,8 +10,14 @@ import streamlit as st
 import os
 import json
 import pandas as pd
-from dotenv import load_dotenv
 
+from env_utils import load_project_env
+from openai_config import (
+    get_openai_api_key,
+    get_openai_chat_model,
+    get_openai_chat_model_options,
+    set_chroma_openai_api_key,
+)
 import ragas_evaluator
 import rag_client
 import llm_client
@@ -19,7 +25,7 @@ import llm_client
 from pathlib import Path
 from typing import Dict, List, Optional
 
-load_dotenv()
+load_project_env(__file__)
 
 try:
     from ragas import SingleTurnSample
@@ -48,11 +54,16 @@ def initialize_rag_system(chroma_dir: str, collection_name: str):
     except Exception as e:
         return None, False, str(e)
 
-def retrieve_documents(collection, query: str, n_results: int = 3, 
-                      mission_filter: Optional[str] = None) -> Optional[Dict]:
+def retrieve_documents(
+    collection,
+    query: str,
+    n_results: int = 3,
+    mission_filter: Optional[str] = None,
+    chroma_dir: Optional[str] = None,
+) -> Optional[Dict]:
     """Retrieve relevant documents from ChromaDB with optional filtering"""
     try:
-        return rag_client.retrieve_documents(collection, query, n_results, mission_filter)
+        return rag_client.retrieve_documents(collection, query, n_results, mission_filter, chroma_dir)
     except Exception as e:
         st.error(f"Error retrieving documents: {e}")
         return None
@@ -62,8 +73,8 @@ def format_context(documents: List[str], metadatas: List[Dict]) -> str:
     
     return rag_client.format_context(documents, metadatas)
 
-def generate_response(openai_key, user_message: str, context: str, 
-                     conversation_history: List[Dict], model: str = "gpt-3.5-turbo") -> str:
+def generate_response(openai_key, user_message: str, context: str,
+                     conversation_history: List[Dict], model: str | None = None) -> str:
     """Generate response using OpenAI with context"""
     try:
         return llm_client.generate_response(openai_key, user_message, context, conversation_history, model)
@@ -79,8 +90,15 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
 
 def display_evaluation_metrics(scores: Dict[str, float]):
     """Display evaluation metrics in the sidebar"""
+    if scores.get("status") == "skipped_no_contexts":
+        st.sidebar.info("Evaluation skipped: no retrieved contexts for this turn.")
+        return
+
     if "error" in scores:
-        st.sidebar.error(f"Evaluation Error: {scores['error']}")
+        if scores["error"] == "No contexts available for evaluation":
+            st.sidebar.info("Evaluation skipped: no retrieved contexts for this turn.")
+        else:
+            st.sidebar.error(f"Evaluation Error: {scores['error']}")
         return
     
     st.sidebar.subheader("📊 Response Quality")
@@ -145,7 +163,7 @@ def main():
         openai_key = st.text_input(
             "OpenAI API Key", 
             type="password",
-            value=os.getenv("OPENAI_API_KEY", ""),
+            value=get_openai_api_key(include_chroma_fallback=False) or "",
             help="Enter your OpenAI API key"
         )
         
@@ -153,11 +171,12 @@ def main():
             st.warning("Please enter your OpenAI API key")
             st.stop()
         else:
-            os.environ["CHROMA_OPENAI_API_KEY"] = openai_key
+            set_chroma_openai_api_key(openai_key)
         
         model_choice = st.selectbox(
             "OpenAI Model",
-            options=["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo-preview"],
+            options=get_openai_chat_model_options(),
+            index=get_openai_chat_model_options().index(get_openai_chat_model()),
             help="Choose the OpenAI model for responses"
         )
         
@@ -199,7 +218,8 @@ def main():
                 docs_result = retrieve_documents(
                     collection, 
                     prompt, 
-                    n_docs
+                    n_docs,
+                    chroma_dir=selected_backend["directory"],
                 )
  
                 context = ""
@@ -219,13 +239,16 @@ def main():
                 st.markdown(response)
                 
                 if enable_evaluation and RAGAS_AVAILABLE:
-                    with st.spinner("Evaluating response quality..."):
-                        evaluation_scores = evaluate_response_quality(
-                            prompt, 
-                            response, 
-                            contexts_list
-                        )
-                        st.session_state.last_evaluation = evaluation_scores
+                    if contexts_list:
+                        with st.spinner("Evaluating response quality..."):
+                            evaluation_scores = evaluate_response_quality(
+                                prompt,
+                                response,
+                                contexts_list
+                            )
+                            st.session_state.last_evaluation = evaluation_scores
+                    else:
+                        st.session_state.last_evaluation = {"status": "skipped_no_contexts"}
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()

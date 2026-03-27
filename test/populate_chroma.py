@@ -5,14 +5,15 @@ Process a single sample file to populate chroma_db_openai with real NASA data
 import os
 import sys
 from pathlib import Path
-from dotenv import load_dotenv
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+from env_utils import load_project_env
+from openai_config import get_openai_api_key
 from embedding_pipeline import ChromaEmbeddingPipelineTextOnly
 
-load_dotenv()
+load_project_env(__file__)
 
-api_key = os.getenv('OPENAI_API_KEY')
+api_key = get_openai_api_key(include_chroma_fallback=False)
 if not api_key:
     print("ERROR: OPENAI_API_KEY not set")
     exit(1)

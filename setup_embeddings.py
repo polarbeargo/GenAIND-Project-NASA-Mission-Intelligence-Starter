@@ -6,10 +6,12 @@ Processes documents and creates embeddings using your OPENAI_API_KEY from .env
 import os
 import sys
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
-api_key = os.getenv('OPENAI_API_KEY')
+from env_utils import load_project_env
+from openai_config import get_openai_api_key
+
+load_project_env(__file__)
+api_key = get_openai_api_key(include_chroma_fallback=False)
 
 if not api_key:
     print("❌ ERROR: OPENAI_API_KEY not found in .env")
