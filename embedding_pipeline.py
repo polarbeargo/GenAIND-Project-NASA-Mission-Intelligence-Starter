@@ -30,6 +30,20 @@ import argparse
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dotenv import load_dotenv
 
+try:
+    import polars as pl
+    POLARS_AVAILABLE = True
+except Exception:
+    pl = None
+    POLARS_AVAILABLE = False
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except Exception:
+    pd = None
+    PANDAS_AVAILABLE = False
+
 load_dotenv()
 
 logging.basicConfig(
@@ -63,7 +77,8 @@ class ChromaEmbeddingPipelineTextOnly:
             chunk_size: Maximum size of text chunks
             chunk_overlap: Overlap between chunks
         """
-        self.openai_client = OpenAI(api_key=openai_api_key)
+        _openai_base = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
+        self.openai_client = OpenAI(api_key=openai_api_key, base_url=_openai_base)
         self.openai_api_key = openai_api_key
         self.chroma_persist_directory = chroma_persist_directory
         self.collection_name = collection_name
@@ -80,7 +95,8 @@ class ChromaEmbeddingPipelineTextOnly:
         )
         self.embedding_function = OpenAIEmbeddingFunction(
             api_key=openai_api_key,
-            model_name=embedding_model
+            model_name=embedding_model,
+            api_base=_openai_base,
         )
         self.collection = self.chroma_client.get_or_create_collection(
             name=collection_name,
@@ -522,6 +538,7 @@ class ChromaEmbeddingPipelineTextOnly:
             'total_chunks': 0,
             'missions': {}
         }
+        run_rows: List[Dict[str, Any]] = []
 
         files_to_process = self.scan_text_files_only(base_path)
 
@@ -536,6 +553,19 @@ class ChromaEmbeddingPipelineTextOnly:
                     'skipped': 0,
                 }
 
+            run_row: Dict[str, Any] = {
+                'file_path': str(file_path),
+                'source': file_path.stem,
+                'mission': mission,
+                'update_mode': update_mode,
+                'chunks': 0,
+                'added': 0,
+                'updated': 0,
+                'skipped': 0,
+                'status': 'pending',
+                'error': '',
+            }
+
             try:
                 documents = self.process_text_file(file_path)
 
@@ -543,6 +573,7 @@ class ChromaEmbeddingPipelineTextOnly:
                 stats['missions'][mission]['files'] += 1
 
                 if not documents:
+                    run_row['status'] = 'empty'
                     continue
 
                 file_stats = self.add_documents_to_collection(
@@ -561,11 +592,120 @@ class ChromaEmbeddingPipelineTextOnly:
                 stats['missions'][mission]['added'] += file_stats['added']
                 stats['missions'][mission]['updated'] += file_stats['updated']
                 stats['missions'][mission]['skipped'] += file_stats['skipped']
+                run_row['chunks'] = chunk_count
+                run_row['added'] = file_stats['added']
+                run_row['updated'] = file_stats['updated']
+                run_row['skipped'] = file_stats['skipped']
+                run_row['status'] = 'processed'
             except Exception as e:
                 stats['errors'] += 1
                 logger.error(f"Error processing file {file_path}: {e}")
+                run_row['status'] = 'error'
+                run_row['error'] = str(e)[:500]
+            finally:
+                run_rows.append(run_row)
+
+        stats['run_summary_artifacts'] = self._persist_run_summary_artifacts(
+            run_rows=run_rows,
+            base_path=base_path,
+            update_mode=update_mode,
+        )
         
         return stats
+
+    def _persist_run_summary_artifacts(
+        self,
+        run_rows: List[Dict[str, Any]],
+        base_path: str,
+        update_mode: str,
+    ) -> Dict[str, str]:
+        """Persist run-level artifacts with a Polars-first approach."""
+        if not run_rows:
+            return {}
+
+        output_dir = Path("monitoring") / "embedding_runs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        prefix = f"embedding_run_{run_id}"
+        artifact_paths: Dict[str, str] = {}
+
+        if POLARS_AVAILABLE and pl is not None:
+            dataset = pl.DataFrame(run_rows)
+            dataset = dataset.with_columns([
+                pl.lit(run_id).alias("run_id"),
+                pl.lit(str(base_path)).alias("base_path"),
+                pl.lit(update_mode).alias("update_mode"),
+                pl.lit(datetime.utcnow().isoformat() + "Z").alias("generated_at"),
+            ])
+
+            detail_parquet = output_dir / f"{prefix}_detail.parquet"
+            detail_csv = output_dir / f"{prefix}_detail.csv"
+            rollup_csv = output_dir / f"{prefix}_rollup.csv"
+
+            dataset.write_parquet(str(detail_parquet))
+            dataset.write_csv(str(detail_csv))
+
+            rollup = dataset.group_by(["mission", "status"]).agg([
+                pl.len().alias("files"),
+                pl.col("chunks").sum().alias("chunks"),
+                pl.col("added").sum().alias("added"),
+                pl.col("updated").sum().alias("updated"),
+                pl.col("skipped").sum().alias("skipped"),
+            ]).sort(["mission", "status"])
+            rollup.write_csv(str(rollup_csv))
+
+            artifact_paths = {
+                "run_id": run_id,
+                "detail_parquet": str(detail_parquet),
+                "detail_csv": str(detail_csv),
+                "rollup_csv": str(rollup_csv),
+            }
+            return artifact_paths
+
+        if PANDAS_AVAILABLE and pd is not None:
+            dataset = pd.DataFrame(run_rows)
+            dataset["run_id"] = run_id
+            dataset["base_path"] = str(base_path)
+            dataset["update_mode"] = update_mode
+            dataset["generated_at"] = datetime.utcnow().isoformat() + "Z"
+
+            detail_csv = output_dir / f"{prefix}_detail.csv"
+            rollup_csv = output_dir / f"{prefix}_rollup.csv"
+            dataset.to_csv(detail_csv, index=False)
+
+            rollup = dataset.groupby(["mission", "status"], dropna=False).agg(
+                files=("file_path", "count"),
+                chunks=("chunks", "sum"),
+                added=("added", "sum"),
+                updated=("updated", "sum"),
+                skipped=("skipped", "sum"),
+            ).reset_index()
+            rollup.to_csv(rollup_csv, index=False)
+
+            return {
+                "run_id": run_id,
+                "detail_csv": str(detail_csv),
+                "rollup_csv": str(rollup_csv),
+            }
+
+        detail_json = output_dir / f"{prefix}_detail.json"
+        with detail_json.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "run_id": run_id,
+                    "base_path": str(base_path),
+                    "update_mode": update_mode,
+                    "rows": run_rows,
+                },
+                handle,
+                ensure_ascii=True,
+                indent=2,
+            )
+        return {
+            "run_id": run_id,
+            "detail_json": str(detail_json),
+        }
     
     def get_collection_info(self) -> Dict[str, Any]:
         """Get information about the ChromaDB collection"""
@@ -608,20 +748,66 @@ class ChromaEmbeddingPipelineTextOnly:
             
             if not all_docs['metadatas']:
                 return {'error': 'No documents in collection'}
-            
+
+            rows = [
+                {
+                    'mission': str((metadata or {}).get('mission', 'unknown') or 'unknown'),
+                    'data_type': str((metadata or {}).get('data_type', 'unknown') or 'unknown'),
+                    'document_category': str((metadata or {}).get('document_category', 'unknown') or 'unknown'),
+                    'file_type': str((metadata or {}).get('file_type', 'unknown') or 'unknown'),
+                }
+                for metadata in all_docs['metadatas']
+            ]
+
+            if POLARS_AVAILABLE and pl is not None:
+                dataset = pl.DataFrame(rows)
+
+                def _counts_polars(column: str) -> Dict[str, int]:
+                    grouped = dataset.group_by(column).len()
+                    return {
+                        str(value): int(count)
+                        for value, count in grouped.iter_rows()
+                    }
+
+                return {
+                    'total_documents': len(rows),
+                    'missions': _counts_polars('mission'),
+                    'data_types': _counts_polars('data_type'),
+                    'document_categories': _counts_polars('document_category'),
+                    'file_types': _counts_polars('file_type'),
+                }
+
+            if PANDAS_AVAILABLE and pd is not None:
+                dataset = pd.DataFrame(rows)
+
+                def _counts_pandas(column: str) -> Dict[str, int]:
+                    value_counts = dataset[column].fillna('unknown').astype(str).value_counts(dropna=False)
+                    return {
+                        str(key): int(value)
+                        for key, value in value_counts.to_dict().items()
+                    }
+
+                return {
+                    'total_documents': len(rows),
+                    'missions': _counts_pandas('mission'),
+                    'data_types': _counts_pandas('data_type'),
+                    'document_categories': _counts_pandas('document_category'),
+                    'file_types': _counts_pandas('file_type'),
+                }
+
             missions: Counter = Counter()
             data_types: Counter = Counter()
             doc_categories: Counter = Counter()
             file_types: Counter = Counter()
 
-            for metadata in all_docs['metadatas']:
-                missions[metadata.get('mission', 'unknown')] += 1
-                data_types[metadata.get('data_type', 'unknown')] += 1
-                doc_categories[metadata.get('document_category', 'unknown')] += 1
-                file_types[metadata.get('file_type', 'unknown')] += 1
+            for row in rows:
+                missions[row['mission']] += 1
+                data_types[row['data_type']] += 1
+                doc_categories[row['document_category']] += 1
+                file_types[row['file_type']] += 1
 
             return {
-                'total_documents': len(all_docs['metadatas']),
+                'total_documents': len(rows),
                 'missions': dict(missions),
                 'data_types': dict(data_types),
                 'document_categories': dict(doc_categories),
