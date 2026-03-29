@@ -1,7 +1,33 @@
+import os
+
 import chromadb
+import logging
 from chromadb.config import Settings
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from typing import Dict, List, Optional
 from pathlib import Path
+
+from openai_config import get_openai_api_key, get_openai_base_url, get_openai_embedding_model
+
+try:
+    from security import VectorSecurityValidator, SecurityViolation
+except ImportError:
+    VectorSecurityValidator = None  # Graceful degradation
+    SecurityViolation = Exception
+
+logger = logging.getLogger(__name__)
+
+
+def _build_embedding_function():
+    api_key = get_openai_api_key()
+    if not api_key:
+        return None
+
+    return OpenAIEmbeddingFunction(
+        api_key=api_key,
+        model_name=get_openai_embedding_model(),
+        api_base=get_openai_base_url(),
+    )
 
 def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
     """Discover available ChromaDB backends in the project directory"""
@@ -59,14 +85,49 @@ def initialize_rag_system(chroma_dir: str, collection_name: str):
             path=chroma_dir,
             settings=Settings(anonymized_telemetry=False)
         )
-        collection = client.get_collection(name=collection_name)
+        embedding_function = _build_embedding_function()
+        collection = None
+
+        if embedding_function is not None and chroma_dir == "./chroma_db_openai":
+            collection = client.get_collection(
+                name=collection_name,
+                embedding_function=embedding_function,
+            )
+
+        if collection is None:
+            collection = client.get_collection(name=collection_name)
+
+        try:
+            setattr(collection, "_rag_chroma_dir", chroma_dir)
+        except Exception:
+            pass
+
         return collection, True, None
     except Exception as error:
         return None, False, str(error)
 
-def retrieve_documents(collection, query: str, n_results: int = 3, 
-                      mission_filter: Optional[str] = None) -> Optional[Dict]:
-    """Retrieve relevant documents from ChromaDB with optional filtering"""
+def retrieve_documents(
+    collection,
+    query: str,
+    n_results: int = 3,
+    mission_filter: Optional[str] = None,
+    chroma_dir: Optional[str] = None,
+) -> Optional[Dict]:
+    """Retrieve relevant documents from ChromaDB with security validation (LLM08)."""
+    
+
+
+    if VectorSecurityValidator:
+        try:
+            effective_chroma_dir = chroma_dir or getattr(collection, "_rag_chroma_dir", "./chroma_db_openai")
+            VectorSecurityValidator.validate_embedding_source(
+                collection.name if hasattr(collection, 'name') else 'unknown',
+                effective_chroma_dir,
+            )
+        except SecurityViolation as e:
+            logger.error(f"Vector validation failed: {e}")
+            raise
+    
     where_filter = None
 
     if mission_filter and mission_filter.strip().lower() not in {"all", "any", "*", "none"}:
@@ -78,6 +139,14 @@ def retrieve_documents(collection, query: str, n_results: int = 3,
         n_results=n_results,
         where=where_filter
     )
+    
+    if VectorSecurityValidator and results and results.get("documents"):
+        poisoning_check = VectorSecurityValidator.detect_poisoned_results(
+            results["documents"][0] if results.get("documents") else [],
+            results["metadatas"][0] if results.get("metadatas") else [{} for _ in range(n_results)],
+        )
+        if poisoning_check:
+            logger.warning(f"Potentially poisoned results detected: {poisoning_check}")
 
     return results
 
