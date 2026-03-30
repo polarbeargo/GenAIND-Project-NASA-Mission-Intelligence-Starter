@@ -1,0 +1,62 @@
+description: NASA mission RAG end-to-end evaluations
+
+prompts:
+  - "{{ question }}"
+
+# Test against the live FastAPI /chat endpoint for real retrieval + generation
+providers:
+  - id: http
+    config:
+      url: http://localhost:8001/chat
+      method: POST
+      headers:
+        Content-Type: application/json
+      body: |
+        {
+          "question": "{{ question }}",
+          "chroma_dir": "./chroma_db",
+          "collection_name": "nasa_space_missions_test",
+          "n_results": 3,
+          "evaluate": true,
+          "model": "gpt-3.5-turbo"
+        }
+      responseParser: |
+        (response) => response.answer || JSON.stringify(response)
+
+defaultTest:
+  assert: []
+
+tests:
+  - vars:
+      question: "What happened during the Apollo 13 emergency?"
+    assert:
+      - type: contains-any
+        value:
+          - oxygen
+          - tank
+          - explosion
+          - problem
+          - emergency
+        threshold: 0.3
+
+  - vars:
+      question: "Which mission achieved the first lunar landing?"
+    assert:
+      - type: contains-any
+        value:
+          - Apollo 11
+          - 1969
+          - moon
+          - landing
+        threshold: 0.5
+
+  - vars:
+      question: "Describe the Challenger mission outcome."
+    assert:
+      - type: contains-any
+        value:
+          - Challenger
+          - loss
+          - crew
+          - failure
+        threshold: 0.3
