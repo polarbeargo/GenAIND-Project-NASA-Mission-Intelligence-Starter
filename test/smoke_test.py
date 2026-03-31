@@ -4,8 +4,13 @@
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import requests
+
+from openai_config import get_openai_chat_model
 
 API_BASE = "http://127.0.0.1:8001"
 SLEEP_BEFORE_REQUESTS = 1.5
@@ -50,7 +55,7 @@ def test_chat() -> bool:
         "collection_name": "nasa_space_missions_test",
         "n_results": 3,
         "evaluate": False,
-        "model": "gpt-3.5-turbo",
+        "model": get_openai_chat_model(),
     }
     try:
         print_info(f"Query: {payload['question']}")
@@ -130,8 +135,53 @@ def test_monitoring_analytics() -> bool:
         return False
 
 
+def test_monitoring_rag() -> bool:
+    print_header("TEST 5: RAG Monitoring Dashboard")
+    try:
+        resp = requests.get(f"{API_BASE}/monitoring/rag", params={"recent_failures_limit": 10}, timeout=10)
+        if resp.status_code != 200:
+            print_fail(f"HTTP {resp.status_code}")
+            return False
+
+        data = resp.json()
+
+        if "error" in data:
+            if data["error"] in {
+                "No monitoring data found",
+                "Monitoring data is empty",
+                "No RAGAS-scored monitoring data found",
+            }:
+                print_info(f"RAG monitoring status: {data['error']} (acceptable for fresh runs)")
+                return True
+            print_fail(f"Unexpected RAG monitoring error: {data['error']}")
+            return False
+
+        required_keys = {
+            "status",
+            "overall",
+            "avg_faithfulness_by_backend",
+            "avg_response_relevancy_by_mission",
+            "context_count_vs_score_bands",
+            "low_score_recent_failures",
+            "retrieval_quality_trend",
+            "ranking_inc_rag",
+        }
+        if not required_keys.issubset(data.keys()):
+            missing = sorted(required_keys.difference(data.keys()))
+            print_fail(f"Missing RAG analytics keys: {missing}")
+            return False
+
+        print_pass(
+            f"RAG dashboard OK (scored requests: {data.get('overall', {}).get('scored_requests', 0)})"
+        )
+        return True
+    except Exception as e:
+        print_fail(f"Failed: {e}")
+        return False
+
+
 def test_promptfoo() -> bool:
-    print_header("TEST 5: Promptfoo Evaluation")
+    print_header("TEST 6: Promptfoo Evaluation")
     try:
         print_info("Running Promptfoo...")
         result = subprocess.run(
@@ -172,6 +222,7 @@ def main():
         "chat": test_chat(),
         "monitoring": test_monitoring(),
         "monitoring_analytics": test_monitoring_analytics(),
+        "monitoring_rag": test_monitoring_rag(),
         "promptfoo": test_promptfoo(),
     }
     
