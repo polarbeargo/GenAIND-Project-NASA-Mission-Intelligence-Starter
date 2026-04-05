@@ -15,12 +15,11 @@ from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-import llm_client
 import rag_client
-import ragas_evaluator
 from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
+from multi_agent import ChatWorkflowInput, MultiAgentChatWorkflow, WorkflowError
 
 try:
     from security import (
@@ -144,6 +143,20 @@ JAILBREAK_KEYWORDS = [
     "ignore previous", "disregard", "forget", "override",
 ]
 
+chat_workflow = MultiAgentChatWorkflow(
+    get_collection_fn=_get_cached_rag_init,
+    logger=logger,
+    jailbreak_keywords=JAILBREAK_KEYWORDS,
+    resource_limiter=resource_limiter,
+    prompt_injection_detector=PromptInjectionDetector,
+    vector_security_validator=VectorSecurityValidator,
+    output_validator=OutputValidator,
+    sensitive_info_filter=SensitiveInfoFilter,
+    security_violation=SecurityViolation,
+    security_auditor=SecurityAuditor,
+    security_level=SecurityLevel,
+)
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -222,243 +235,55 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         span.set_attribute("n_results", request.n_results)
         span.set_attribute("backend", backend_name)
 
+        workflow_input = ChatWorkflowInput(
+            question=request.question,
+            chroma_dir=request.chroma_dir,
+            collection_name=request.collection_name,
+            n_results=request.n_results,
+            mission_filter=request.mission_filter,
+            model=request.model,
+            evaluate=request.evaluate,
+            conversation_history=request.conversation_history,
+            client_ip=client_ip,
+        )
+
         try:
-            # ====================
-            # SECURITY: Jailbreak Detection (LLM07)
-            # ====================
-            if any(kw in request.question.lower() for kw in JAILBREAK_KEYWORDS):
-                logger.warning(f"Jailbreak attempt from {client_ip}: {request.question[:50]}")
-                if SecurityAuditor:
-                    SecurityAuditor.log_security_event(
-                        event_type="jailbreak_attempt",
-                        severity=SecurityLevel.HIGH,
-                        user_id=client_ip,
-                        details={"question_sample": request.question[:100]}
-                    )
-                return ChatResponse(
-                    answer="I'm designed to answer questions about NASA missions. Please ask about Apollo, Challenger, or Shuttle missions.",
-                    contexts=[],
-                    evaluation={},
-                    latency_ms=(time.perf_counter() - started) * 1000,
-                    backend=backend_name,
-                )
-            
-            # ====================
-            # SECURITY: Token & Rate Limits (LLM10)
-            # ====================
-            if resource_limiter:
-                try:
-                    resource_limiter.check_input_tokens(request.question)
-                    resource_limiter.check_query_rate(client_ip)
-                except SecurityViolation as e:
-                    logger.warning(f"Resource limit exceeded: {e}")
-                    if SecurityAuditor:
-                        SecurityAuditor.log_security_event(
-                            event_type="rate_limit_exceeded",
-                            severity=SecurityLevel.MEDIUM,
-                            user_id=client_ip,
-                            details={"error": str(e)}
-                        )
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Rate limit exceeded",
-                    )
-            
-            # ====================
-            # SECURITY: Prompt Injection Detection (LLM01)
-            # ====================
-            if PromptInjectionDetector:
-                injection_check = PromptInjectionDetector.detect_injection(request.question)
-                if injection_check:
-                    logger.warning(f"Injection attempt from {client_ip}")
-                    if SecurityAuditor:
-                        SecurityAuditor.log_security_event(
-                            event_type="injection_attempt",
-                            severity=SecurityLevel.HIGH,
-                            user_id=client_ip,
-                        )
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid input detected",
-                    )
-            
-            # ====================
-            # SECURITY: Vector Security Validation (LLM08)
-            # ====================
-            if VectorSecurityValidator:
-                try:
-                    VectorSecurityValidator.validate_embedding_source(
-                        request.collection_name,
-                        request.chroma_dir
-                    )
-                except SecurityViolation as e:
-                    logger.error(f"Vector validation failed: {e}")
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Invalid collection",
-                    )
-            
-            # Use cached collection initialization with hit/miss tracking
-            collection, success, error = _get_cached_rag_init(
-                request.chroma_dir,
-                request.collection_name,
+            workflow_result = chat_workflow.run(
+                workflow_input=workflow_input,
+                openai_key=openai_key,
             )
-            if not success or collection is None:
-                error_msg = f"Failed to initialize RAG: {error}"
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=error_msg,
-                )
-
-            docs_result = rag_client.retrieve_documents(
-                collection,
-                request.question,
-                request.n_results,
-                request.mission_filter,
-                request.chroma_dir,
-            )
-
-            contexts: List[str] = []
-            context_text = ""
-            if docs_result and docs_result.get("documents"):
-                contexts = docs_result["documents"][0]
-                
-                # SECURITY: Check vector results for poisoning (LLM08)
-                if VectorSecurityValidator:
-                    poisoning_check = VectorSecurityValidator.detect_poisoned_results(
-                        docs_result["documents"][0],
-                        docs_result.get("metadatas", [{}])[0] if docs_result.get("metadatas") else {},
-                    )
-                    if poisoning_check:
-                        logger.warning(f"Potentially poisoned results detected")
-                        if SecurityAuditor:
-                            SecurityAuditor.log_security_event(
-                                event_type="poisoned_results",
-                                severity=SecurityLevel.MEDIUM,
-                                details={"count": len(contexts)}
-                            )
-                
-                context_text = rag_client.format_context(
-                    docs_result["documents"][0],
-                    docs_result["metadatas"][0],
-                )
-
-            # Call LLM (security checks done in llm_client.py)
-            try:
-                answer = llm_client.generate_response(
-                    openai_key=openai_key,
-                    user_message=request.question,
-                    context=context_text,
-                    conversation_history=request.conversation_history,
-                    model=request.model,
-                )
-            except SecurityViolation as se:
-                logger.error(f"Security violation in LLM call: {se}")
-                if SecurityAuditor:
-                    SecurityAuditor.log_security_event(
-                        event_type="security_violation",
-                        severity=SecurityLevel.HIGH,
-                        user_id=client_ip,
-                        details={"error": str(se)}
-                    )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Security validation failed",
-                )
-            except Exception as e:
-                error_str = str(e)
-                logger.error(f"LLM generation failed: {error_str}")
-                
-                if "401" in error_str or "invalid_api_key" in error_str.lower():
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Invalid OpenAI API key. Check OPENAI_API_KEY configuration.",
-                    )
-                elif "429" in error_str or "rate_limit" in error_str.lower():
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="OpenAI rate limit exceeded. Please retry after a moment.",
-                    )
-                elif "503" in error_str or "unavailable" in error_str.lower():
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="OpenAI service temporarily unavailable.",
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=f"LLM generation error: {error_str[:100]}",
-                    )
-
-            # ====================
-            # SECURITY: Output Validation (LLM05)
-            # ====================
-            if OutputValidator:
-                validation = OutputValidator.validate_response(answer, contexts)
-                
-                if validation["severity"] == "critical":
-                    logger.error(f"Critical output validation failure: {validation}")
-                    if SecurityAuditor:
-                        SecurityAuditor.log_security_event(
-                            event_type="output_validation_critical",
-                            severity=SecurityLevel.CRITICAL,
-                            user_id=client_ip,
-                        )
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Response validation failed",
-                    )
-                
-                if validation["severity"] == "warning":
-                    logger.warning(f"Output validation warnings: {validation['issues']}")
-            
-            # ====================
-            # SECURITY: Sensitive Information Filtering (LLM02, LLM07)
-            # ====================
-            if SensitiveInfoFilter:
-                answer = SensitiveInfoFilter.filter_response(answer, strict=True)
-            
-            evaluation: Dict[str, float | str] = {}
-            if request.evaluate and contexts:
-                try:
-                    evaluation = ragas_evaluator.evaluate_response_quality(
-                        question=request.question,
-                        answer=answer,
-                        contexts=contexts,
-                    )
-                except Exception as e:
-                    logger.warning(f"Evaluation failed (non-fatal): {e}")
-                    evaluation = {"error": "Evaluation unavailable"}
 
             latency_ms = (time.perf_counter() - started) * 1000.0
             span.set_attribute("latency_ms", latency_ms)
-            span.set_attribute("context_count", len(contexts))
+            span.set_attribute("context_count", len(workflow_result.contexts))
             span.set_attribute("error", False)
 
             monitor.log_interaction(
                 question=request.question,
-                answer=answer,
+                answer=workflow_result.answer,
                 model=request.model,
                 backend=backend_name,
-                context_count=len(contexts),
+                context_count=len(workflow_result.contexts),
                 mission=request.mission_filter,
-                evaluation=evaluation if isinstance(evaluation, dict) else None,
+                evaluation=workflow_result.evaluation if isinstance(workflow_result.evaluation, dict) else None,
                 error=False,
                 latency_ms=latency_ms,
             )
 
             return ChatResponse(
-                answer=answer,
-                contexts=contexts,
-                evaluation=evaluation,
+                answer=workflow_result.answer,
+                contexts=workflow_result.contexts,
+                evaluation=workflow_result.evaluation,
                 latency_ms=latency_ms,
                 backend=backend_name,
             )
 
+        except WorkflowError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail)
         except HTTPException:
             raise
-        except Exception as e:
-            error_msg = str(e)
+        except Exception as error:
+            error_msg = str(error)
             logger.error(f"Unexpected error in /chat: {error_msg}")
             latency_ms = (time.perf_counter() - started) * 1000.0
             span.set_attribute("error", True)
