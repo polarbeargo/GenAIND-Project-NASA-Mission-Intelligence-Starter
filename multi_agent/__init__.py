@@ -6,10 +6,12 @@ from multi_agent.models import (
     WorkflowError,
 )
 from multi_agent.workflow import MultiAgentChatWorkflow
+from multi_agent.workers import JudgeWorker
 
 __all__ = [
     "ChatWorkflowInput",
     "ChatWorkflowResult",
     "WorkflowError",
     "MultiAgentChatWorkflow",
+    "JudgeWorker",
 ]

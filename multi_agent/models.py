@@ -26,6 +26,7 @@ class ChatWorkflowInput:
     mission_filter: Optional[str]
     model: str
     evaluate: bool
+    judge_mode: str
     conversation_history: List[Dict[str, str]]
     client_ip: str
 
@@ -52,4 +53,5 @@ class ChatWorkflowResult:
     answer: str
     contexts: List[str]
     evaluation: Dict[str, Any]
+    judge: Dict[str, Any] = field(default_factory=dict)
     blocked: bool = False

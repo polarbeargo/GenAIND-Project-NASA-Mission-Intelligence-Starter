@@ -46,6 +46,26 @@ load_project_env(__file__)
 
 logger = logging.getLogger(__name__)
 
+
+def _get_default_judge_mode() -> str:
+    mode = os.getenv("JUDGE_MODE_DEFAULT", "async").strip().lower()
+    return mode if mode in {"sync", "async", "off"} else "async"
+
+
+def _get_judge_timeout_seconds() -> float:
+    try:
+        configured = float(os.getenv("JUDGE_TIMEOUT_SECONDS", "2.5"))
+    except ValueError:
+        configured = 2.5
+    return max(1.5, min(configured, 10.0))
+
+
+def _judge_timed_out(judge: Dict[str, Any]) -> bool:
+    rationale = str(judge.get("rationale", "")).lower()
+    source = str(judge.get("source", "")).lower()
+    explicit = bool(judge.get("timed_out", False))
+    return explicit or (source == "heuristic" and "timeout" in rationale)
+
 class CacheStats:
     """Track cache performance metrics for monitoring."""
 
@@ -155,6 +175,7 @@ chat_workflow = MultiAgentChatWorkflow(
     security_violation=SecurityViolation,
     security_auditor=SecurityAuditor,
     security_level=SecurityLevel,
+    judge_timeout_seconds=_get_judge_timeout_seconds(),
 )
 
 @app.middleware("http")
@@ -184,13 +205,15 @@ class ChatRequest(BaseModel):
     mission_filter: Optional[str] = None
     model: str = Field(default_factory=get_openai_chat_model)
     evaluate: bool = True
+    judge_mode: str = Field(default_factory=_get_default_judge_mode, pattern="^(sync|async|off)$")
     conversation_history: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
     answer: str
     contexts: List[str]
-    evaluation: Dict[str, float | str]
+    evaluation: Dict[str, Any]
+    judge: Dict[str, Any]
     latency_ms: float
     backend: str
 
@@ -243,6 +266,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             mission_filter=request.mission_filter,
             model=request.model,
             evaluate=request.evaluate,
+            judge_mode=request.judge_mode,
             conversation_history=request.conversation_history,
             client_ip=client_ip,
         )
@@ -256,6 +280,10 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             latency_ms = (time.perf_counter() - started) * 1000.0
             span.set_attribute("latency_ms", latency_ms)
             span.set_attribute("context_count", len(workflow_result.contexts))
+            span.set_attribute("judge_mode", request.judge_mode)
+            span.set_attribute("judge_source", str(workflow_result.judge.get("source", "unknown")))
+            span.set_attribute("judge_timeout", _judge_timed_out(workflow_result.judge))
+            span.set_attribute("judge_passed", bool(workflow_result.judge.get("passed", True)))
             span.set_attribute("error", False)
 
             monitor.log_interaction(
@@ -274,6 +302,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                 answer=workflow_result.answer,
                 contexts=workflow_result.contexts,
                 evaluation=workflow_result.evaluation,
+                judge=workflow_result.judge,
                 latency_ms=latency_ms,
                 backend=backend_name,
             )
@@ -327,6 +356,26 @@ def monitoring_rag(recent_failures_limit: int = 20) -> Dict[str, Any]:
 def monitoring_rag_report(reference_rows: int = 100) -> Dict[str, str]:
     """Generate an Evidently HTML report for RAG-specific score trends."""
     return monitor.build_rag_report(reference_rows=reference_rows)
+
+
+@app.get("/monitoring/judge")
+def monitoring_judge(limit: int = 20) -> Dict[str, Any]:
+    """Return recent async judge results from in-memory workflow buffer."""
+    results = chat_workflow.get_recent_judge_results(limit=limit)
+    return {
+        "count": len(results),
+        "results": results,
+    }
+
+
+@app.get("/judge/last")
+def judge_last() -> Dict[str, Any]:
+    """Return latest async judge result."""
+    last = chat_workflow.get_last_judge_result()
+    return {
+        "available": bool(last),
+        "result": last,
+    }
 
 
 @app.get("/collections/clear-cache")
