@@ -18,6 +18,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_openai_chroma_dir(chroma_dir: str) -> bool:
+    """Return True when the selected backend points to chroma_db_openai."""
+    normalized = os.path.normpath(chroma_dir or "")
+    return os.path.basename(normalized) == "chroma_db_openai"
+
+
 def _build_embedding_function():
     api_key = get_openai_api_key()
     if not api_key:
@@ -88,7 +94,7 @@ def initialize_rag_system(chroma_dir: str, collection_name: str):
         embedding_function = _build_embedding_function()
         collection = None
 
-        if embedding_function is not None and chroma_dir == "./chroma_db_openai":
+        if embedding_function is not None and _is_openai_chroma_dir(chroma_dir):
             collection = client.get_collection(
                 name=collection_name,
                 embedding_function=embedding_function,

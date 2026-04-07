@@ -42,3 +42,5 @@ def get_openai_chat_model_options() -> list[str]:
 
 def set_chroma_openai_api_key(api_key: str) -> None:
     os.environ["CHROMA_OPENAI_API_KEY"] = api_key
+    # Chroma's persisted OpenAI embedding configuration commonly resolves this env var.
+    os.environ["OPENAI_API_KEY"] = api_key
