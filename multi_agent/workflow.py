@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
+from typing import Any
 
 from multi_agent.models import (
     ChatWorkflowInput,
@@ -33,6 +36,10 @@ class MultiAgentChatWorkflow:
         security_auditor,
         security_level,
         judge_timeout_seconds: float = 2.5,
+        retrieval_cache_ttl_seconds: int = 180,
+        answer_cache_ttl_seconds: int = 240,
+        retrieval_cache_max_entries: int = 500,
+        answer_cache_max_entries: int = 500,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -57,17 +64,40 @@ class MultiAgentChatWorkflow:
             sensitive_info_filter=sensitive_info_filter,
             judge_timeout_seconds=judge_timeout_seconds,
         )
+        self._io_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nasa-io-worker")
         self._judge_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-judge-worker")
         self._judge_results = deque(maxlen=200)
         self._judge_lock = Lock()
+        self._retrieval_cache_ttl = max(60, int(retrieval_cache_ttl_seconds))
+        self._answer_cache_ttl = max(60, int(answer_cache_ttl_seconds))
+        self._retrieval_cache_max_entries = max(100, int(retrieval_cache_max_entries))
+        self._answer_cache_max_entries = max(100, int(answer_cache_max_entries))
+        self._retrieval_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self._answer_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._cache_lock = Lock()
 
     def run(self, workflow_input: ChatWorkflowInput, openai_key: str) -> ChatWorkflowResult:
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-chat-agents") as executor:
-            retrieval_future = executor.submit(self.retrieval_worker.run, workflow_input)
-            preflight_future = executor.submit(self.safety_worker.preflight, workflow_input)
+        retrieval_key = self._retrieval_cache_key(workflow_input)
+        answer_key = self._answer_cache_key(workflow_input)
+
+        retrieval_result = self._cache_get(self._retrieval_cache, retrieval_key)
+
+        if retrieval_result is None:
+            retrieval_future = self._io_executor.submit(self.retrieval_worker.run, workflow_input)
+            preflight_future = self._io_executor.submit(self.safety_worker.preflight, workflow_input)
 
             preflight_result = preflight_future.result()
             retrieval_result = retrieval_future.result()
+
+            self._cache_set(
+                self._retrieval_cache,
+                retrieval_key,
+                retrieval_result,
+                ttl_seconds=self._retrieval_cache_ttl,
+                max_entries=self._retrieval_cache_max_entries,
+            )
+        else:
+            preflight_result = self.safety_worker.preflight(workflow_input)
 
         if preflight_result.blocked_response:
             return ChatWorkflowResult(
@@ -88,17 +118,27 @@ class MultiAgentChatWorkflow:
                 blocked=True,
             )
 
-        answer = self.analysis_worker.generate_answer(
-            openai_key=openai_key,
-            workflow_input=workflow_input,
-            context_text=retrieval_result.context_text,
-        )
+        answer = self._cache_get(self._answer_cache, answer_key)
+        if answer is None:
+            answer = self.analysis_worker.generate_answer(
+                openai_key=openai_key,
+                workflow_input=workflow_input,
+                context_text=retrieval_result.context_text,
+            )
 
-        answer = self.safety_worker.postflight(
-            answer=answer,
-            contexts=retrieval_result.contexts,
-            client_ip=workflow_input.client_ip,
-        )
+            answer = self.safety_worker.postflight(
+                answer=answer,
+                contexts=retrieval_result.contexts,
+                client_ip=workflow_input.client_ip,
+            )
+
+            self._cache_set(
+                self._answer_cache,
+                answer_key,
+                answer,
+                ttl_seconds=self._answer_cache_ttl,
+                max_entries=self._answer_cache_max_entries,
+            )
 
         judge_mode = (workflow_input.judge_mode or "async").lower()
         if judge_mode == "off":
@@ -215,3 +255,71 @@ class MultiAgentChatWorkflow:
         safe_limit = max(1, min(limit, 200))
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
+
+    def shutdown(self) -> None:
+        """Stop background executors used by the workflow."""
+        self._io_executor.shutdown(wait=False, cancel_futures=False)
+        self._judge_executor.shutdown(wait=False, cancel_futures=False)
+
+    def __del__(self):
+        # Best-effort cleanup for interpreter shutdown paths.
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_query(text: str) -> str:
+        """Normalize query text for cache keys."""
+        collapsed = re.sub(r"\s+", " ", (text or "").strip().lower())
+        return collapsed
+
+    def _retrieval_cache_key(self, workflow_input: ChatWorkflowInput) -> str:
+        normalized_question = self._normalize_query(workflow_input.question)
+        mission_filter = (workflow_input.mission_filter or "").strip().lower()
+        raw_key = (
+            f"{workflow_input.chroma_dir}|{workflow_input.collection_name}|"
+            f"{workflow_input.n_results}|{mission_filter}|{normalized_question}"
+        )
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def _answer_cache_key(self, workflow_input: ChatWorkflowInput) -> str:
+        normalized_question = self._normalize_query(workflow_input.question)
+        mission_filter = (workflow_input.mission_filter or "").strip().lower()
+        # Keep required tuple dimensions while including backend/model guards.
+        raw_key = (
+            f"{normalized_question}|{mission_filter}|{workflow_input.collection_name}|"
+            f"{workflow_input.chroma_dir}|{workflow_input.model}|{workflow_input.n_results}"
+        )
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, cache: OrderedDict[str, tuple[float, Any]], key: str):
+        now = time.time()
+        with self._cache_lock:
+            item = cache.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if expires_at < now:
+                cache.pop(key, None)
+                return None
+            # Mark as recently used for LRU semantics.
+            cache.move_to_end(key)
+            return value
+
+    def _cache_set(
+        self,
+        cache: OrderedDict[str, tuple[float, Any]],
+        key: str,
+        value: Any,
+        ttl_seconds: int,
+        max_entries: int,
+    ) -> None:
+        expires_at = time.time() + ttl_seconds
+        with self._cache_lock:
+            cache[key] = (expires_at, value)
+            cache.move_to_end(key)
+
+            # Evict until size is within capacity.
+            while len(cache) > max_entries:
+                cache.popitem(last=False)
