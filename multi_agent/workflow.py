@@ -8,6 +8,7 @@ import re
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Lock
 from typing import Any
 
@@ -15,6 +16,11 @@ from multi_agent.models import (
     ChatWorkflowInput,
     ChatWorkflowResult,
     WorkflowError,
+)
+from multi_agent.retrieval_depth import (
+    HeuristicRetrievalDepthConfig,
+    HeuristicRetrievalDepthPolicy,
+    RetrievalDepthPolicy,
 )
 from multi_agent.workers import AnalysisWorker, JudgeWorker, RetrievalWorker, SafetyWorker
 
@@ -40,6 +46,9 @@ class MultiAgentChatWorkflow:
         answer_cache_ttl_seconds: int = 240,
         retrieval_cache_max_entries: int = 500,
         answer_cache_max_entries: int = 500,
+        retrieval_depth_policy: RetrievalDepthPolicy | None = None,
+        factoid_n_results: int = 2,
+        broad_n_results: int = 4,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -75,15 +84,24 @@ class MultiAgentChatWorkflow:
         self._retrieval_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
         self._answer_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_lock = Lock()
+        self._retrieval_depth_policy = retrieval_depth_policy or HeuristicRetrievalDepthPolicy(
+            HeuristicRetrievalDepthConfig(
+                factoid_n_results=max(1, int(factoid_n_results)),
+                broad_n_results=max(1, int(broad_n_results)),
+            )
+        )
 
     def run(self, workflow_input: ChatWorkflowInput, openai_key: str) -> ChatWorkflowResult:
-        retrieval_key = self._retrieval_cache_key(workflow_input)
-        answer_key = self._answer_cache_key(workflow_input)
+        effective_n_results = self._effective_retrieval_depth(workflow_input)
+        effective_input = replace(workflow_input, n_results=effective_n_results)
+
+        retrieval_key = self._retrieval_cache_key(effective_input)
+        answer_key = self._answer_cache_key(effective_input)
 
         retrieval_result = self._cache_get(self._retrieval_cache, retrieval_key)
 
         if retrieval_result is None:
-            retrieval_future = self._io_executor.submit(self.retrieval_worker.run, workflow_input)
+            retrieval_future = self._io_executor.submit(self.retrieval_worker.run, effective_input)
             preflight_future = self._io_executor.submit(self.safety_worker.preflight, workflow_input)
 
             preflight_result = preflight_future.result()
@@ -122,7 +140,7 @@ class MultiAgentChatWorkflow:
         if answer is None:
             answer = self.analysis_worker.generate_answer(
                 openai_key=openai_key,
-                workflow_input=workflow_input,
+                workflow_input=effective_input,
                 context_text=retrieval_result.context_text,
             )
 
@@ -157,7 +175,7 @@ class MultiAgentChatWorkflow:
             self._judge_executor.submit(
                 self._run_async_judge,
                 openai_key,
-                workflow_input,
+                effective_input,
                 answer,
                 retrieval_result.contexts,
             )
@@ -176,13 +194,13 @@ class MultiAgentChatWorkflow:
         else:
             judge = self.judge_worker.judge(
                 openai_key=openai_key,
-                workflow_input=workflow_input,
+                workflow_input=effective_input,
                 answer=answer,
                 contexts=retrieval_result.contexts,
             )
 
         evaluation = self.analysis_worker.evaluate(
-            workflow_input=workflow_input,
+            workflow_input=effective_input,
             answer=answer,
             contexts=retrieval_result.contexts,
         )
@@ -255,6 +273,9 @@ class MultiAgentChatWorkflow:
         safe_limit = max(1, min(limit, 200))
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
+    def _effective_retrieval_depth(self, workflow_input: ChatWorkflowInput) -> int:
+        """Choose retrieval depth through an injected policy."""
+        return max(1, int(self._retrieval_depth_policy.resolve_n_results(workflow_input)))
 
     def shutdown(self) -> None:
         """Stop background executors used by the workflow."""

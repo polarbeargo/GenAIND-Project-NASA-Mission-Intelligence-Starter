@@ -66,6 +66,14 @@ def _judge_timed_out(judge: Dict[str, Any]) -> bool:
     explicit = bool(judge.get("timed_out", False))
     return explicit or (source == "heuristic" and "timeout" in rationale)
 
+
+def _get_depth_threshold(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, 10))
+
 class CacheStats:
     """Track cache performance metrics for monitoring."""
 
@@ -176,6 +184,8 @@ chat_workflow = MultiAgentChatWorkflow(
     security_auditor=SecurityAuditor,
     security_level=SecurityLevel,
     judge_timeout_seconds=_get_judge_timeout_seconds(),
+    factoid_n_results=_get_depth_threshold("RETRIEVAL_FACTOID_N_RESULTS", 2),
+    broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
 )
 
 @app.middleware("http")
