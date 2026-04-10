@@ -12,9 +12,16 @@ from dataclasses import replace
 from threading import Lock
 from typing import Any
 
+import rag_client
+from multi_agent.context_compression import (
+    CompressionConfig,
+    ContextCompressor,
+    DeduplicatingCompressor,
+)
 from multi_agent.models import (
     ChatWorkflowInput,
     ChatWorkflowResult,
+    RetrievalResult,
     WorkflowError,
 )
 from multi_agent.retrieval_depth import (
@@ -49,6 +56,9 @@ class MultiAgentChatWorkflow:
         retrieval_depth_policy: RetrievalDepthPolicy | None = None,
         factoid_n_results: int = 2,
         broad_n_results: int = 4,
+        context_compressor: ContextCompressor | None = None,
+        context_max_tokens: int = 2000,
+        context_dedup_threshold: float = 0.85,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -90,6 +100,12 @@ class MultiAgentChatWorkflow:
                 broad_n_results=max(1, int(broad_n_results)),
             )
         )
+        self._context_compressor: ContextCompressor = context_compressor or DeduplicatingCompressor(
+            CompressionConfig(
+                max_tokens=max(200, int(context_max_tokens)),
+                similarity_threshold=max(0.5, min(1.0, float(context_dedup_threshold))),
+            )
+        )
 
     def run(self, workflow_input: ChatWorkflowInput, openai_key: str) -> ChatWorkflowResult:
         effective_n_results = self._effective_retrieval_depth(workflow_input)
@@ -116,6 +132,14 @@ class MultiAgentChatWorkflow:
             )
         else:
             preflight_result = self.safety_worker.preflight(workflow_input)
+
+        # Apply context compression (dedup + mission priority + token cap) on the
+        # raw retrieval result before passing context_text to generation.  The raw
+        # result remains in the retrieval cache such that compression config changes do not
+        # require a cache flush.
+        retrieval_result = self._compress_retrieval_result(
+            retrieval_result, effective_input.mission_filter
+        )
 
         if preflight_result.blocked_response:
             return ChatWorkflowResult(
@@ -273,6 +297,22 @@ class MultiAgentChatWorkflow:
         safe_limit = max(1, min(limit, 200))
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
+    def _compress_retrieval_result(
+        self, result: RetrievalResult, mission_filter: str | None
+    ) -> RetrievalResult:
+        """Apply dedup, mission priority, and token cap to a raw retrieval result."""
+        if not result.contexts:
+            return result
+        compressed_c, compressed_m = self._context_compressor.compress(
+            result.contexts, result.metadatas, mission_filter
+        )
+        context_text = rag_client.format_context(compressed_c, compressed_m)
+        return RetrievalResult(
+            contexts=compressed_c,
+            metadatas=compressed_m,
+            context_text=context_text,
+        )
+
     def _effective_retrieval_depth(self, workflow_input: ChatWorkflowInput) -> int:
         """Choose retrieval depth through an injected policy."""
         return max(1, int(self._retrieval_depth_policy.resolve_n_results(workflow_input)))

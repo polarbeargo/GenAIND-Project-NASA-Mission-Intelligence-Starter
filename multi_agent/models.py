@@ -36,6 +36,7 @@ class RetrievalResult:
     """Output of the retrieval worker."""
 
     contexts: List[str] = field(default_factory=list)
+    metadatas: List[Dict] = field(default_factory=list)
     context_text: str = ""
 
 

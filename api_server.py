@@ -67,6 +67,22 @@ def _judge_timed_out(judge: Dict[str, Any]) -> bool:
     return explicit or (source == "heuristic" and "timeout" in rationale)
 
 
+def _get_compression_max_tokens() -> int:
+    try:
+        value = int(os.getenv("CONTEXT_MAX_TOKENS", "2000"))
+    except ValueError:
+        value = 2000
+    return max(200, min(value, 8000))
+
+
+def _get_compression_dedup_threshold() -> float:
+    try:
+        value = float(os.getenv("CONTEXT_DEDUP_THRESHOLD", "0.85"))
+    except ValueError:
+        value = 0.85
+    return max(0.5, min(value, 1.0))
+
+
 def _get_depth_threshold(name: str, default: int) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -186,6 +202,8 @@ chat_workflow = MultiAgentChatWorkflow(
     judge_timeout_seconds=_get_judge_timeout_seconds(),
     factoid_n_results=_get_depth_threshold("RETRIEVAL_FACTOID_N_RESULTS", 2),
     broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
+    context_max_tokens=_get_compression_max_tokens(),
+    context_dedup_threshold=_get_compression_dedup_threshold(),
 )
 
 @app.middleware("http")

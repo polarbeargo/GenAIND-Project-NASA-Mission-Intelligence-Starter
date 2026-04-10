@@ -48,11 +48,9 @@ class RetrievalWorker:
             return RetrievalResult(contexts=[], context_text="")
 
         contexts = docs_result["documents"][0]
-        context_text = rag_client.format_context(
-            docs_result["documents"][0],
-            docs_result["metadatas"][0],
-        )
-        return RetrievalResult(contexts=contexts, context_text=context_text)
+        metadatas = docs_result["metadatas"][0]
+        context_text = rag_client.format_context(contexts, metadatas)
+        return RetrievalResult(contexts=contexts, metadatas=metadatas, context_text=context_text)
 
 
 class SafetyWorker:
