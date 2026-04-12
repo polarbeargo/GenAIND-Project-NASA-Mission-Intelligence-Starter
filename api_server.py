@@ -90,6 +90,11 @@ def _get_depth_threshold(name: str, default: int) -> int:
         value = default
     return max(1, min(value, 10))
 
+
+def _get_evaluation_mode() -> str:
+    mode = os.getenv("EVALUATION_MODE", "async").strip().lower()
+    return mode if mode in {"async", "sync", "off"} else "async"
+
 class CacheStats:
     """Track cache performance metrics for monitoring."""
 
@@ -204,6 +209,7 @@ chat_workflow = MultiAgentChatWorkflow(
     broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
     context_max_tokens=_get_compression_max_tokens(),
     context_dedup_threshold=_get_compression_dedup_threshold(),
+    evaluation_mode=_get_evaluation_mode(),
 )
 
 @app.middleware("http")
@@ -403,6 +409,27 @@ def judge_last() -> Dict[str, Any]:
     return {
         "available": bool(last),
         "result": last,
+    }
+
+
+@app.get("/monitoring/evaluation")
+def monitoring_evaluation(limit: int = 20) -> Dict[str, Any]:
+    """Return recent async evaluation jobs from in-memory workflow buffer."""
+    results = chat_workflow.get_recent_evaluation_jobs(limit=limit)
+    return {
+        "count": len(results),
+        "results": results,
+    }
+
+
+@app.get("/evaluation/{job_id}")
+def evaluation_job(job_id: str) -> Dict[str, Any]:
+    """Return one async evaluation job by id."""
+    result = chat_workflow.get_evaluation_job(job_id)
+    return {
+        "available": bool(result),
+        "job_id": job_id,
+        "result": result,
     }
 
 

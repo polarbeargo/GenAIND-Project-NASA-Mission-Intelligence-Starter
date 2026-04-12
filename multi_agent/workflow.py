@@ -6,11 +6,12 @@ import hashlib
 import logging
 import re
 import time
+import uuid
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Lock
-from typing import Any
+from typing import Any, Dict
 
 import rag_client
 from multi_agent.context_compression import (
@@ -59,6 +60,8 @@ class MultiAgentChatWorkflow:
         context_compressor: ContextCompressor | None = None,
         context_max_tokens: int = 2000,
         context_dedup_threshold: float = 0.85,
+        evaluation_mode: str = "async",
+        evaluation_buffer_size: int = 500,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -85,8 +88,11 @@ class MultiAgentChatWorkflow:
         )
         self._io_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nasa-io-worker")
         self._judge_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-judge-worker")
+        self._eval_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-eval-worker")
         self._judge_results = deque(maxlen=200)
+        self._evaluation_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._judge_lock = Lock()
+        self._evaluation_lock = Lock()
         self._retrieval_cache_ttl = max(60, int(retrieval_cache_ttl_seconds))
         self._answer_cache_ttl = max(60, int(answer_cache_ttl_seconds))
         self._retrieval_cache_max_entries = max(100, int(retrieval_cache_max_entries))
@@ -106,6 +112,12 @@ class MultiAgentChatWorkflow:
                 similarity_threshold=max(0.5, min(1.0, float(context_dedup_threshold))),
             )
         )
+        self._evaluation_mode = (
+            evaluation_mode.strip().lower() if evaluation_mode and evaluation_mode.strip() else "async"
+        )
+        if self._evaluation_mode not in {"async", "sync", "off"}:
+            self._evaluation_mode = "async"
+        self._evaluation_buffer_size = max(100, int(evaluation_buffer_size))
 
     def run(self, workflow_input: ChatWorkflowInput, openai_key: str) -> ChatWorkflowResult:
         effective_n_results = self._effective_retrieval_depth(workflow_input)
@@ -223,7 +235,7 @@ class MultiAgentChatWorkflow:
                 contexts=retrieval_result.contexts,
             )
 
-        evaluation = self.analysis_worker.evaluate(
+        evaluation = self._evaluate(
             workflow_input=effective_input,
             answer=answer,
             contexts=retrieval_result.contexts,
@@ -236,6 +248,118 @@ class MultiAgentChatWorkflow:
             judge=judge,
             blocked=False,
         )
+
+    def _evaluate(
+        self,
+        workflow_input: ChatWorkflowInput,
+        answer: str,
+        contexts,
+    ) -> Dict[str, Any]:
+        if not workflow_input.evaluate:
+            return {}
+
+        if self._evaluation_mode == "off":
+            return {
+                "status": "disabled",
+                "source": "disabled",
+                "rationale": "Evaluation disabled by configuration.",
+            }
+
+        if self._evaluation_mode == "sync":
+            started = time.perf_counter()
+            result = self.analysis_worker.evaluate(
+                workflow_input=workflow_input,
+                answer=answer,
+                contexts=contexts,
+            )
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            if isinstance(result, dict):
+                result = dict(result)
+                result.setdefault("status", "completed")
+                result.setdefault("source", "sync")
+                result.setdefault("latency_ms", round(latency_ms, 2))
+            return result
+
+        job_id = str(uuid.uuid4())
+        submitted_at_ms = round(time.time() * 1000)
+        pending = {
+            "job_id": job_id,
+            "status": "pending",
+            "source": "async",
+            "submitted_at_ms": submitted_at_ms,
+            "question": workflow_input.question,
+        }
+        self._record_evaluation_job(job_id, pending)
+        self._eval_executor.submit(
+            self._run_async_evaluation,
+            job_id,
+            workflow_input,
+            answer,
+            contexts,
+        )
+        return pending
+
+    def _run_async_evaluation(
+        self,
+        job_id: str,
+        workflow_input: ChatWorkflowInput,
+        answer: str,
+        contexts,
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            result = self.analysis_worker.evaluate(
+                workflow_input=workflow_input,
+                answer=answer,
+                contexts=contexts,
+            )
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            payload = dict(result) if isinstance(result, dict) else {}
+            payload.update(
+                {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "source": "async",
+                    "latency_ms": round(latency_ms, 2),
+                    "finished_at_ms": round(time.time() * 1000),
+                    "question": workflow_input.question,
+                }
+            )
+            self._record_evaluation_job(job_id, payload)
+        except Exception as error:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            payload = {
+                "job_id": job_id,
+                "status": "error",
+                "source": "async",
+                "latency_ms": round(latency_ms, 2),
+                "finished_at_ms": round(time.time() * 1000),
+                "question": workflow_input.question,
+                "error": str(error)[:200],
+            }
+            self._record_evaluation_job(job_id, payload)
+            logging.getLogger(__name__).warning("Async evaluation failed: %s", str(error)[:120])
+
+    def _record_evaluation_job(self, job_id: str, payload: Dict[str, Any]) -> None:
+        with self._evaluation_lock:
+            self._evaluation_results[job_id] = payload
+            self._evaluation_results.move_to_end(job_id)
+            while len(self._evaluation_results) > self._evaluation_buffer_size:
+                self._evaluation_results.popitem(last=False)
+
+    def get_evaluation_job(self, job_id: str) -> Dict[str, Any] | None:
+        with self._evaluation_lock:
+            payload = self._evaluation_results.get(job_id)
+            if payload is None:
+                return None
+            return dict(payload)
+
+    def get_recent_evaluation_jobs(self, limit: int = 20):
+        safe_limit = max(1, min(limit, self._evaluation_buffer_size))
+        with self._evaluation_lock:
+            values = list(self._evaluation_results.values())
+            tail = values[-safe_limit:]
+            return [dict(item) for item in reversed(tail)]
 
     def _run_async_judge(
         self,
@@ -321,6 +445,7 @@ class MultiAgentChatWorkflow:
         """Stop background executors used by the workflow."""
         self._io_executor.shutdown(wait=False, cancel_futures=False)
         self._judge_executor.shutdown(wait=False, cancel_futures=False)
+        self._eval_executor.shutdown(wait=False, cancel_futures=False)
 
     def __del__(self):
         # Best-effort cleanup for interpreter shutdown paths.
