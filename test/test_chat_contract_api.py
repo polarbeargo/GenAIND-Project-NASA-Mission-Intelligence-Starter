@@ -132,6 +132,19 @@ class TestChatContractAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured_modes[-1], "async")
 
+    def test_monitoring_client_caches_contract(self):
+        response = self.client.get("/monitoring/client-caches")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("openai_client", body)
+        self.assertIn("rag_client", body)
+        self.assertIn("ragas_evaluator", body)
+
+        self.assertIn("current_size", body["openai_client"])
+        self.assertIn("hits", body["openai_client"])
+        self.assertIn("misses", body["openai_client"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
