@@ -1,10 +1,11 @@
 import asyncio
 import inspect
+from threading import Lock
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from openai_config import (
     get_openai_api_key,
@@ -20,6 +21,12 @@ try:
     RAGAS_AVAILABLE = True
 except ImportError:
     RAGAS_AVAILABLE = False
+
+
+_EVALUATOR_CACHE: Dict[tuple[str, str, str, str], tuple[Any, Any]] = {}
+_EVALUATOR_CACHE_LOCK = Lock()
+_EVALUATOR_CACHE_HITS = 0
+_EVALUATOR_CACHE_MISSES = 0
 
 
 def _resolve_result(value):
@@ -67,6 +74,55 @@ def _create_single_turn_sample(question: str, answer: str, contexts: List[str]):
                 retrieved_contexts=contexts,
             )
 
+
+def _get_evaluator_resources(
+    openai_api_key: str,
+    openai_base: str,
+):
+    cache_key = (
+        openai_api_key,
+        openai_base,
+        get_openai_chat_model(),
+        get_openai_embedding_model(),
+    )
+    global _EVALUATOR_CACHE_HITS
+    global _EVALUATOR_CACHE_MISSES
+    with _EVALUATOR_CACHE_LOCK:
+        resources = _EVALUATOR_CACHE.get(cache_key)
+        if resources is not None:
+            _EVALUATOR_CACHE_HITS += 1
+            return resources
+
+        _EVALUATOR_CACHE_MISSES += 1
+        evaluator_llm = LangchainLLMWrapper(
+            ChatOpenAI(
+                model=get_openai_chat_model(),
+                temperature=0,
+                api_key=openai_api_key,
+                base_url=openai_base,
+            )
+        )
+        evaluator_embeddings = LangchainEmbeddingsWrapper(
+            OpenAIEmbeddings(
+                model=get_openai_embedding_model(),
+                api_key=openai_api_key,
+                base_url=openai_base,
+            )
+        )
+        resources = (evaluator_llm, evaluator_embeddings)
+        _EVALUATOR_CACHE[cache_key] = resources
+        return resources
+
+
+def get_evaluator_cache_metrics() -> Dict[str, int]:
+    """Return lightweight cache metrics for RAGAS evaluator resources."""
+    with _EVALUATOR_CACHE_LOCK:
+        return {
+            "current_size": len(_EVALUATOR_CACHE),
+            "hits": _EVALUATOR_CACHE_HITS,
+            "misses": _EVALUATOR_CACHE_MISSES,
+        }
+
 def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -> Dict[str, float]:
     """Evaluate response quality using RAGAS metrics"""
     if not RAGAS_AVAILABLE:
@@ -82,20 +138,9 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
 
     try:
         _openai_base = get_openai_base_url()
-        evaluator_llm = LangchainLLMWrapper(
-            ChatOpenAI(
-                model=get_openai_chat_model(),
-                temperature=0,
-                api_key=openai_api_key,
-                base_url=_openai_base,
-            )
-        )
-        evaluator_embeddings = LangchainEmbeddingsWrapper(
-            OpenAIEmbeddings(
-                model=get_openai_embedding_model(),
-                api_key=openai_api_key,
-                base_url=_openai_base,
-            )
+        evaluator_llm, evaluator_embeddings = _get_evaluator_resources(
+            openai_api_key=openai_api_key,
+            openai_base=_openai_base,
         )
 
         metrics = {

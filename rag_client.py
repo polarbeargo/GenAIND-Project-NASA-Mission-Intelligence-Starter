@@ -1,4 +1,5 @@
 import os
+from threading import Lock
 
 import chromadb
 import logging
@@ -17,6 +18,74 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_CHROMA_CLIENTS: Dict[str, chromadb.PersistentClient] = {}
+_CHROMA_CLIENTS_LOCK = Lock()
+_EMBEDDING_FUNCTIONS: Dict[tuple[str, str, str], OpenAIEmbeddingFunction] = {}
+_EMBEDDING_FUNCTIONS_LOCK = Lock()
+_CHROMA_CLIENT_CACHE_HITS = 0
+_CHROMA_CLIENT_CACHE_MISSES = 0
+_EMBEDDING_FN_CACHE_HITS = 0
+_EMBEDDING_FN_CACHE_MISSES = 0
+
+
+def _get_persistent_client(chroma_dir: str) -> chromadb.PersistentClient:
+    normalized = os.path.normpath(chroma_dir)
+    global _CHROMA_CLIENT_CACHE_HITS
+    global _CHROMA_CLIENT_CACHE_MISSES
+    with _CHROMA_CLIENTS_LOCK:
+        client = _CHROMA_CLIENTS.get(normalized)
+        if client is not None:
+            _CHROMA_CLIENT_CACHE_HITS += 1
+            return client
+
+        _CHROMA_CLIENT_CACHE_MISSES += 1
+        client = chromadb.PersistentClient(
+            path=chroma_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        _CHROMA_CLIENTS[normalized] = client
+        return client
+
+
+def _get_embedding_function(api_key: str, api_base: str, model_name: str) -> OpenAIEmbeddingFunction:
+    cache_key = (api_key, api_base, model_name)
+    global _EMBEDDING_FN_CACHE_HITS
+    global _EMBEDDING_FN_CACHE_MISSES
+    with _EMBEDDING_FUNCTIONS_LOCK:
+        embedding_fn = _EMBEDDING_FUNCTIONS.get(cache_key)
+        if embedding_fn is not None:
+            _EMBEDDING_FN_CACHE_HITS += 1
+            return embedding_fn
+
+        _EMBEDDING_FN_CACHE_MISSES += 1
+        embedding_fn = OpenAIEmbeddingFunction(
+            api_key=api_key,
+            model_name=model_name,
+            api_base=api_base,
+        )
+        _EMBEDDING_FUNCTIONS[cache_key] = embedding_fn
+        return embedding_fn
+
+
+def get_client_cache_metrics() -> Dict[str, Dict[str, int]]:
+    """Return lightweight cache metrics for Chroma/OpenAI embedding resources."""
+    with _CHROMA_CLIENTS_LOCK:
+        chroma_metrics = {
+            "current_size": len(_CHROMA_CLIENTS),
+            "hits": _CHROMA_CLIENT_CACHE_HITS,
+            "misses": _CHROMA_CLIENT_CACHE_MISSES,
+        }
+    with _EMBEDDING_FUNCTIONS_LOCK:
+        embedding_metrics = {
+            "current_size": len(_EMBEDDING_FUNCTIONS),
+            "hits": _EMBEDDING_FN_CACHE_HITS,
+            "misses": _EMBEDDING_FN_CACHE_MISSES,
+        }
+    return {
+        "chroma_persistent_client": chroma_metrics,
+        "openai_embedding_function": embedding_metrics,
+    }
+
 
 def _is_openai_chroma_dir(chroma_dir: str) -> bool:
     """Return True when the selected backend points to chroma_db_openai."""
@@ -29,10 +98,10 @@ def _build_embedding_function():
     if not api_key:
         return None
 
-    return OpenAIEmbeddingFunction(
+    return _get_embedding_function(
         api_key=api_key,
-        model_name=get_openai_embedding_model(),
         api_base=get_openai_base_url(),
+        model_name=get_openai_embedding_model(),
     )
 
 def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
@@ -47,10 +116,7 @@ def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
 
     for directory in chroma_dirs:
         try:
-            client = chromadb.PersistentClient(
-                path=str(directory),
-                settings=Settings(anonymized_telemetry=False)
-            )
+            client = _get_persistent_client(str(directory))
             collections = client.list_collections()
 
             for collection in collections:
@@ -87,10 +153,7 @@ def initialize_rag_system(chroma_dir: str, collection_name: str):
     """Initialize the RAG system with specified backend (cached for performance)"""
 
     try:
-        client = chromadb.PersistentClient(
-            path=chroma_dir,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        client = _get_persistent_client(chroma_dir)
         embedding_function = _build_embedding_function()
         collection = None
 

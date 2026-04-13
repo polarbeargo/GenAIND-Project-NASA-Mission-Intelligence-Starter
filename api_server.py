@@ -16,6 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import rag_client
+import llm_client
+import ragas_evaluator
 from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
@@ -453,6 +455,16 @@ def cache_stats_endpoint() -> Dict[str, Any]:
         "currsize": lru_info.currsize,
     }
     return stats
+
+
+@app.get("/monitoring/client-caches")
+def monitoring_client_caches() -> Dict[str, Any]:
+    """Return lightweight reuse metrics for process-level client/resource caches."""
+    return {
+        "openai_client": llm_client.get_openai_client_cache_metrics(),
+        "rag_client": rag_client.get_client_cache_metrics(),
+        "ragas_evaluator": ragas_evaluator.get_evaluator_cache_metrics(),
+    }
 
 
 @app.post("/collections/warm-cache")

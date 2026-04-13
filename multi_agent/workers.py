@@ -10,8 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import llm_client
 import rag_client
 import ragas_evaluator
-from openai import OpenAI
-from openai_config import get_openai_base_url
 from pydantic import BaseModel, ValidationError
 
 from multi_agent.models import (
@@ -391,7 +389,7 @@ class JudgeWorker:
         )
 
         try:
-            client = OpenAI(base_url=get_openai_base_url(), api_key=openai_key)
+            client = llm_client.get_openai_client(openai_key)
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
