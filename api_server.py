@@ -62,6 +62,30 @@ def _get_judge_timeout_seconds() -> float:
     return max(1.5, min(configured, 10.0))
 
 
+def _get_stage_timeout_seconds(name: str, default: float, min_value: float, max_value: float) -> float:
+    try:
+        configured = float(os.getenv(name, str(default)))
+    except ValueError:
+        configured = default
+    return max(min_value, min(configured, max_value))
+
+
+def _get_breaker_failure_threshold() -> int:
+    try:
+        value = int(os.getenv("STAGE_BREAKER_FAILURE_THRESHOLD", "3"))
+    except ValueError:
+        value = 3
+    return max(1, min(value, 10))
+
+
+def _get_breaker_recovery_seconds() -> float:
+    try:
+        value = float(os.getenv("STAGE_BREAKER_RECOVERY_SECONDS", "20"))
+    except ValueError:
+        value = 20.0
+    return max(1.0, min(value, 120.0))
+
+
 def _judge_timed_out(judge: Dict[str, Any]) -> bool:
     rationale = str(judge.get("rationale", "")).lower()
     source = str(judge.get("source", "")).lower()
@@ -211,6 +235,17 @@ chat_workflow = MultiAgentChatWorkflow(
     broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
     context_max_tokens=_get_compression_max_tokens(),
     context_dedup_threshold=_get_compression_dedup_threshold(),
+    retrieval_timeout_seconds=_get_stage_timeout_seconds(
+        "RETRIEVAL_TIMEOUT_SECONDS", default=1.8, min_value=0.2, max_value=10.0
+    ),
+    generation_timeout_seconds=_get_stage_timeout_seconds(
+        "GENERATION_TIMEOUT_SECONDS", default=8.0, min_value=0.5, max_value=30.0
+    ),
+    evaluation_timeout_seconds=_get_stage_timeout_seconds(
+        "EVALUATION_TIMEOUT_SECONDS", default=3.5, min_value=0.5, max_value=20.0
+    ),
+    breaker_failure_threshold=_get_breaker_failure_threshold(),
+    breaker_recovery_seconds=_get_breaker_recovery_seconds(),
     evaluation_mode=_get_evaluation_mode(),
 )
 

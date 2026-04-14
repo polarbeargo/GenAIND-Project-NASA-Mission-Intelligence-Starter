@@ -8,8 +8,8 @@ import re
 import time
 import uuid
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import Any, Dict
 
@@ -31,6 +31,32 @@ from multi_agent.retrieval_depth import (
     RetrievalDepthPolicy,
 )
 from multi_agent.workers import AnalysisWorker, JudgeWorker, RetrievalWorker, SafetyWorker
+
+
+@dataclass
+class StageCircuitBreaker:
+    """Minimal circuit breaker for stage-level failure isolation."""
+
+    failure_threshold: int
+    recovery_seconds: float
+    consecutive_failures: int = 0
+    opened_until: float = 0.0
+    lock: Lock = field(default_factory=Lock)
+
+    def allow(self) -> bool:
+        with self.lock:
+            return time.time() >= self.opened_until
+
+    def record_success(self) -> None:
+        with self.lock:
+            self.consecutive_failures = 0
+            self.opened_until = 0.0
+
+    def record_failure(self) -> None:
+        with self.lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.failure_threshold:
+                self.opened_until = time.time() + self.recovery_seconds
 
 
 class MultiAgentChatWorkflow:
@@ -60,6 +86,11 @@ class MultiAgentChatWorkflow:
         context_compressor: ContextCompressor | None = None,
         context_max_tokens: int = 2000,
         context_dedup_threshold: float = 0.85,
+        retrieval_timeout_seconds: float = 1.8,
+        generation_timeout_seconds: float = 8.0,
+        evaluation_timeout_seconds: float = 3.5,
+        breaker_failure_threshold: int = 3,
+        breaker_recovery_seconds: float = 20.0,
         evaluation_mode: str = "async",
         evaluation_buffer_size: int = 500,
     ):
@@ -112,6 +143,14 @@ class MultiAgentChatWorkflow:
                 similarity_threshold=max(0.5, min(1.0, float(context_dedup_threshold))),
             )
         )
+        self._retrieval_timeout_seconds = max(0.2, float(retrieval_timeout_seconds))
+        self._generation_timeout_seconds = max(0.5, float(generation_timeout_seconds))
+        self._evaluation_timeout_seconds = max(0.5, float(evaluation_timeout_seconds))
+        threshold = max(1, int(breaker_failure_threshold))
+        recovery_seconds = max(1.0, float(breaker_recovery_seconds))
+        self._retrieval_breaker = StageCircuitBreaker(threshold, recovery_seconds)
+        self._generation_breaker = StageCircuitBreaker(threshold, recovery_seconds)
+        self._evaluation_breaker = StageCircuitBreaker(threshold, recovery_seconds)
         self._evaluation_mode = (
             evaluation_mode.strip().lower() if evaluation_mode and evaluation_mode.strip() else "async"
         )
@@ -127,23 +166,45 @@ class MultiAgentChatWorkflow:
         answer_key = self._answer_cache_key(effective_input)
 
         retrieval_result = self._cache_get(self._retrieval_cache, retrieval_key)
+        retrieval_failed = False
+        retrieval_failure_reason = ""
 
         if retrieval_result is None:
-            retrieval_future = self._io_executor.submit(self.retrieval_worker.run, effective_input)
+            if not self._retrieval_breaker.allow():
+                retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                retrieval_failed = True
+                retrieval_failure_reason = "retrieval circuit breaker open"
+            else:
+                retrieval_future = self._io_executor.submit(self.retrieval_worker.run, effective_input)
             preflight_future = self._io_executor.submit(self.safety_worker.preflight, workflow_input)
 
             preflight_result = preflight_future.result()
-            retrieval_result = retrieval_future.result()
-
-            self._cache_set(
-                self._retrieval_cache,
-                retrieval_key,
-                retrieval_result,
-                ttl_seconds=self._retrieval_cache_ttl,
-                max_entries=self._retrieval_cache_max_entries,
-            )
+            if retrieval_result is None:
+                try:
+                    retrieval_result = retrieval_future.result(timeout=self._retrieval_timeout_seconds)
+                    self._retrieval_breaker.record_success()
+                    self._cache_set(
+                        self._retrieval_cache,
+                        retrieval_key,
+                        retrieval_result,
+                        ttl_seconds=self._retrieval_cache_ttl,
+                        max_entries=self._retrieval_cache_max_entries,
+                    )
+                except TimeoutError:
+                    self._retrieval_breaker.record_failure()
+                    retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                    retrieval_failed = True
+                    retrieval_failure_reason = "retrieval timeout"
+                    logging.getLogger(__name__).warning("Retrieval timed out after %.2fs", self._retrieval_timeout_seconds)
+                except Exception as error:
+                    self._retrieval_breaker.record_failure()
+                    retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                    retrieval_failed = True
+                    retrieval_failure_reason = str(error)[:120]
+                    logging.getLogger(__name__).warning("Retrieval failed, using fallback: %s", retrieval_failure_reason)
         else:
             preflight_result = self.safety_worker.preflight(workflow_input)
+            self._retrieval_breaker.record_success()
 
         # Apply context compression (dedup + mission priority + token cap) on the
         # raw retrieval result before passing context_text to generation.  The raw
@@ -172,13 +233,60 @@ class MultiAgentChatWorkflow:
                 blocked=True,
             )
 
+        if retrieval_failed:
+            return ChatWorkflowResult(
+                answer=(
+                    "I can help with NASA mission questions, but I could not retrieve trusted mission "
+                    "sources right now. Please retry in a moment."
+                ),
+                contexts=[],
+                evaluation={},
+                judge={
+                    "groundedness_score": 0.0,
+                    "safety_score": 1.0,
+                    "task_success_score": 0.0,
+                    "overall_score": 0.3,
+                    "confidence": 0.2,
+                    "passed": True,
+                    "low_confidence": True,
+                    "rationale": f"Degraded response due to retrieval failure: {retrieval_failure_reason}",
+                    "source": "degraded",
+                },
+                blocked=False,
+            )
+
         answer = self._cache_get(self._answer_cache, answer_key)
         if answer is None:
-            answer = self.analysis_worker.generate_answer(
-                openai_key=openai_key,
-                workflow_input=effective_input,
-                context_text=retrieval_result.context_text,
-            )
+            if not self._generation_breaker.allow():
+                answer = (
+                    "I can help with NASA mission questions, but answer generation is temporarily "
+                    "degraded. Please retry shortly."
+                )
+            else:
+                try:
+                    generation_future = self._io_executor.submit(
+                        self.analysis_worker.generate_answer,
+                        openai_key,
+                        effective_input,
+                        retrieval_result.context_text,
+                    )
+                    answer = generation_future.result(timeout=self._generation_timeout_seconds)
+                    self._generation_breaker.record_success()
+                except TimeoutError:
+                    self._generation_breaker.record_failure()
+                    answer = (
+                        "I can help with NASA mission questions, but answer generation timed out. "
+                        "Please retry in a moment."
+                    )
+                except Exception as error:
+                    self._generation_breaker.record_failure()
+                    logging.getLogger(__name__).warning(
+                        "Generation failed, returning fallback: %s", str(error)[:120]
+                    )
+                    answer = (
+                        "I can help with NASA mission questions, but answer generation is temporarily "
+                        "unavailable. Please retry shortly."
+                    )
 
             answer = self.safety_worker.postflight(
                 answer=answer,
@@ -266,19 +374,37 @@ class MultiAgentChatWorkflow:
             }
 
         if self._evaluation_mode == "sync":
+            if not self._evaluation_breaker.allow():
+                return {}
             started = time.perf_counter()
-            result = self.analysis_worker.evaluate(
-                workflow_input=workflow_input,
-                answer=answer,
-                contexts=contexts,
-            )
+            try:
+                eval_future = self._io_executor.submit(
+                    self.analysis_worker.evaluate,
+                    workflow_input,
+                    answer,
+                    contexts,
+                )
+                result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+                self._evaluation_breaker.record_success()
+            except TimeoutError:
+                self._evaluation_breaker.record_failure()
+                logging.getLogger(__name__).warning(
+                    "Synchronous evaluation timed out after %.2fs", self._evaluation_timeout_seconds
+                )
+                return {}
+            except Exception as error:
+                self._evaluation_breaker.record_failure()
+                logging.getLogger(__name__).warning("Synchronous evaluation failed: %s", str(error)[:120])
+                return {}
             latency_ms = (time.perf_counter() - started) * 1000.0
             if isinstance(result, dict):
+                if result.get("error"):
+                    return {}
                 result = dict(result)
                 result.setdefault("status", "completed")
                 result.setdefault("source", "sync")
                 result.setdefault("latency_ms", round(latency_ms, 2))
-            return result
+            return result if isinstance(result, dict) else {}
 
         job_id = str(uuid.uuid4())
         submitted_at_ms = round(time.time() * 1000)
@@ -307,12 +433,28 @@ class MultiAgentChatWorkflow:
         contexts,
     ) -> None:
         started = time.perf_counter()
+        if not self._evaluation_breaker.allow():
+            payload = {
+                "job_id": job_id,
+                "status": "error",
+                "source": "async",
+                "finished_at_ms": round(time.time() * 1000),
+                "question": workflow_input.question,
+                "error": "evaluation circuit breaker open",
+            }
+            self._record_evaluation_job(job_id, payload)
+            return
         try:
-            result = self.analysis_worker.evaluate(
-                workflow_input=workflow_input,
-                answer=answer,
-                contexts=contexts,
+            eval_future = self._io_executor.submit(
+                self.analysis_worker.evaluate,
+                workflow_input,
+                answer,
+                contexts,
             )
+            result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(str(result.get("error")))
+            self._evaluation_breaker.record_success()
             latency_ms = (time.perf_counter() - started) * 1000.0
             payload = dict(result) if isinstance(result, dict) else {}
             payload.update(
@@ -327,6 +469,7 @@ class MultiAgentChatWorkflow:
             )
             self._record_evaluation_job(job_id, payload)
         except Exception as error:
+            self._evaluation_breaker.record_failure()
             latency_ms = (time.perf_counter() - started) * 1000.0
             payload = {
                 "job_id": job_id,
