@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -95,6 +96,38 @@ class TestStageTimeouts(unittest.TestCase):
 
         self.assertEqual(result.answer, "answer")
         self.assertEqual(result.evaluation, {})
+
+    def test_latency_sli_tracks_generation_timeouts(self):
+        workflow = build_workflow()
+
+        workflow.retrieval_worker.run = MagicMock(
+            return_value=RetrievalResult(
+                contexts=["context"],
+                metadatas=[{"mission": "apollo13"}],
+                context_text="context",
+            )
+        )
+        workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response=None)
+        )
+
+        def _slow_generation(_openai_key, _workflow_input, _context_text):
+            time.sleep(0.7)
+            return "answer"
+
+        workflow.analysis_worker.generate_answer = MagicMock(side_effect=_slow_generation)
+        workflow.safety_worker.postflight = MagicMock(
+            side_effect=lambda answer, contexts, client_ip: answer
+        )
+
+        workflow.run(make_input(evaluate=False), openai_key="fake-key")
+        report = workflow.get_latency_sli_report()
+        generation = report["workers"]["generation"]
+
+        self.assertGreaterEqual(generation["total_requests"], 1)
+        self.assertGreaterEqual(generation["timeouts"], 1)
+        self.assertGreater(generation["timeout_rate"], 0.0)
+        self.assertEqual(generation["budget_ms"], 1800.0)
 
 
 if __name__ == "__main__":

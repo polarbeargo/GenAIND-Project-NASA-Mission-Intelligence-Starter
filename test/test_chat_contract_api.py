@@ -145,6 +145,63 @@ class TestChatContractAPI(unittest.TestCase):
         self.assertIn("hits", body["openai_client"])
         self.assertIn("misses", body["openai_client"])
 
+    def test_monitoring_latency_sli_contract(self):
+        response = self.client.get("/monitoring/latency-sli")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("generated_at_ms", body)
+        self.assertIn("workers", body)
+
+        workers = body["workers"]
+        for name in ["preflight", "retrieval", "generation"]:
+            self.assertIn(name, workers)
+            self.assertIn("p50_ms", workers[name])
+            self.assertIn("p95_ms", workers[name])
+            self.assertIn("timeout_rate", workers[name])
+            self.assertIn("budget_ms", workers[name])
+
+    def test_monitoring_latency_sli_timeseries_contract(self):
+        response = self.client.get("/monitoring/latency-sli/timeseries")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("generated_at_ms", body)
+        self.assertIn("window_minutes", body)
+        self.assertIn("bucket_seconds", body)
+        self.assertIn("workers", body)
+
+        workers = body["workers"]
+        for name in ["preflight", "retrieval", "generation", "evaluation"]:
+            self.assertIn(name, workers)
+            self.assertIsInstance(workers[name], list)
+
+    def test_monitoring_latency_sli_timeseries_accepts_filters(self):
+        response = self.client.get(
+            "/monitoring/latency-sli/timeseries",
+            params={
+                "stage": "retrieval",
+                "window_minutes": 60,
+                "bucket_seconds": 300,
+                "mission": "apollo13",
+                "backend": "./chroma_db_openai:nasa_space_missions_text",
+                "model": "gpt-3.5-turbo",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body.get("stage"), "retrieval")
+        self.assertIn("filters", body)
+        self.assertEqual(body["filters"].get("mission"), "apollo13")
+
+    def test_monitoring_latency_sli_timeseries_invalid_stage_returns_400(self):
+        response = self.client.get(
+            "/monitoring/latency-sli/timeseries",
+            params={"stage": "invalid-stage"},
+        )
+        self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
