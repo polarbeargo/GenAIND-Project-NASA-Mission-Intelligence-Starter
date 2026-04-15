@@ -121,6 +121,14 @@ def _get_evaluation_mode() -> str:
     mode = os.getenv("EVALUATION_MODE", "async").strip().lower()
     return mode if mode in {"async", "sync", "off"} else "async"
 
+
+def _get_latency_budget_ms(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1.0, min(value, 30000.0))
+
 class CacheStats:
     """Track cache performance metrics for monitoring."""
 
@@ -246,6 +254,9 @@ chat_workflow = MultiAgentChatWorkflow(
     ),
     breaker_failure_threshold=_get_breaker_failure_threshold(),
     breaker_recovery_seconds=_get_breaker_recovery_seconds(),
+    preflight_budget_ms=_get_latency_budget_ms("PREFLIGHT_BUDGET_MS", 20.0),
+    retrieval_budget_ms=_get_latency_budget_ms("RETRIEVAL_BUDGET_MS", 700.0),
+    generation_budget_ms=_get_latency_budget_ms("GENERATION_BUDGET_MS", 1800.0),
     evaluation_mode=_get_evaluation_mode(),
 )
 
@@ -500,6 +511,12 @@ def monitoring_client_caches() -> Dict[str, Any]:
         "rag_client": rag_client.get_client_cache_metrics(),
         "ragas_evaluator": ragas_evaluator.get_evaluator_cache_metrics(),
     }
+
+
+@app.get("/monitoring/latency-sli")
+def monitoring_latency_sli() -> Dict[str, Any]:
+    """Return per-stage latency SLIs with budget compliance and timeout rate."""
+    return chat_workflow.get_latency_sli_report()
 
 
 @app.post("/collections/warm-cache")

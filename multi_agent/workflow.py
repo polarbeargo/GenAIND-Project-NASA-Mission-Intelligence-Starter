@@ -59,6 +59,63 @@ class StageCircuitBreaker:
                 self.opened_until = time.time() + self.recovery_seconds
 
 
+@dataclass
+class StageSLITracker:
+    """Thread-safe in-memory latency/timeout samples for one workflow stage."""
+
+    max_samples: int = 1000
+    samples: deque[tuple[float, bool]] = field(default_factory=deque)
+    lock: Lock = field(default_factory=Lock)
+    total_requests: int = 0
+    timeout_count: int = 0
+
+    def record(self, latency_ms: float, timed_out: bool = False) -> None:
+        safe_latency = max(0.0, float(latency_ms))
+        with self.lock:
+            self.total_requests += 1
+            if timed_out:
+                self.timeout_count += 1
+            self.samples.append((safe_latency, bool(timed_out)))
+            while len(self.samples) > self.max_samples:
+                self.samples.popleft()
+
+    @staticmethod
+    def _percentile(sorted_values: list[float], percentile: float) -> float:
+        if not sorted_values:
+            return 0.0
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        idx = int(round((percentile / 100.0) * (len(sorted_values) - 1)))
+        idx = max(0, min(idx, len(sorted_values) - 1))
+        return sorted_values[idx]
+
+    def snapshot(self, budget_ms: float) -> Dict[str, Any]:
+        safe_budget = max(0.0, float(budget_ms))
+        with self.lock:
+            sample_copy = list(self.samples)
+            total = self.total_requests
+            timeouts = self.timeout_count
+
+        latencies = sorted(item[0] for item in sample_copy)
+        within_budget = sum(1 for latency, timed_out in sample_copy if (not timed_out and latency <= safe_budget))
+        sample_count = len(sample_copy)
+        timeout_rate = (timeouts / total) if total else 0.0
+        within_budget_rate = (within_budget / sample_count) if sample_count else 0.0
+
+        return {
+            "total_requests": total,
+            "sample_count": sample_count,
+            "timeouts": timeouts,
+            "timeout_rate": round(timeout_rate, 4),
+            "timeout_rate_percent": round(timeout_rate * 100.0, 2),
+            "p50_ms": round(self._percentile(latencies, 50.0), 2),
+            "p95_ms": round(self._percentile(latencies, 95.0), 2),
+            "budget_ms": round(safe_budget, 2),
+            "within_budget_rate": round(within_budget_rate, 4),
+            "within_budget_rate_percent": round(within_budget_rate * 100.0, 2),
+        }
+
+
 class MultiAgentChatWorkflow:
     """Coordinates retrieval, safety, and analysis workers."""
 
@@ -91,6 +148,9 @@ class MultiAgentChatWorkflow:
         evaluation_timeout_seconds: float = 3.5,
         breaker_failure_threshold: int = 3,
         breaker_recovery_seconds: float = 20.0,
+        preflight_budget_ms: float = 20.0,
+        retrieval_budget_ms: float = 700.0,
+        generation_budget_ms: float = 1800.0,
         evaluation_mode: str = "async",
         evaluation_buffer_size: int = 500,
     ):
@@ -151,6 +211,18 @@ class MultiAgentChatWorkflow:
         self._retrieval_breaker = StageCircuitBreaker(threshold, recovery_seconds)
         self._generation_breaker = StageCircuitBreaker(threshold, recovery_seconds)
         self._evaluation_breaker = StageCircuitBreaker(threshold, recovery_seconds)
+        self._stage_sli = {
+            "preflight": StageSLITracker(),
+            "retrieval": StageSLITracker(),
+            "generation": StageSLITracker(),
+            "evaluation": StageSLITracker(),
+        }
+        self._stage_budgets_ms = {
+            "preflight": max(1.0, float(preflight_budget_ms)),
+            "retrieval": max(1.0, float(retrieval_budget_ms)),
+            "generation": max(1.0, float(generation_budget_ms)),
+            "evaluation": max(1.0, float(self._evaluation_timeout_seconds * 1000.0)),
+        }
         self._evaluation_mode = (
             evaluation_mode.strip().lower() if evaluation_mode and evaluation_mode.strip() else "async"
         )
@@ -175,13 +247,19 @@ class MultiAgentChatWorkflow:
                 retrieval_failed = True
                 retrieval_failure_reason = "retrieval circuit breaker open"
             else:
+                retrieval_started = time.perf_counter()
                 retrieval_future = self._io_executor.submit(self.retrieval_worker.run, effective_input)
+            preflight_started = time.perf_counter()
             preflight_future = self._io_executor.submit(self.safety_worker.preflight, workflow_input)
 
             preflight_result = preflight_future.result()
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._stage_sli["preflight"].record(preflight_latency_ms, timed_out=False)
             if retrieval_result is None:
                 try:
                     retrieval_result = retrieval_future.result(timeout=self._retrieval_timeout_seconds)
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=False)
                     self._retrieval_breaker.record_success()
                     self._cache_set(
                         self._retrieval_cache,
@@ -192,18 +270,25 @@ class MultiAgentChatWorkflow:
                     )
                 except TimeoutError:
                     self._retrieval_breaker.record_failure()
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=True)
                     retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                     retrieval_failed = True
                     retrieval_failure_reason = "retrieval timeout"
                     logging.getLogger(__name__).warning("Retrieval timed out after %.2fs", self._retrieval_timeout_seconds)
                 except Exception as error:
                     self._retrieval_breaker.record_failure()
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=False)
                     retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                     retrieval_failed = True
                     retrieval_failure_reason = str(error)[:120]
                     logging.getLogger(__name__).warning("Retrieval failed, using fallback: %s", retrieval_failure_reason)
         else:
+            preflight_started = time.perf_counter()
             preflight_result = self.safety_worker.preflight(workflow_input)
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._stage_sli["preflight"].record(preflight_latency_ms, timed_out=False)
             self._retrieval_breaker.record_success()
 
         # Apply context compression (dedup + mission priority + token cap) on the
@@ -263,6 +348,7 @@ class MultiAgentChatWorkflow:
                     "degraded. Please retry shortly."
                 )
             else:
+                generation_started = time.perf_counter()
                 try:
                     generation_future = self._io_executor.submit(
                         self.analysis_worker.generate_answer,
@@ -271,15 +357,21 @@ class MultiAgentChatWorkflow:
                         retrieval_result.context_text,
                     )
                     answer = generation_future.result(timeout=self._generation_timeout_seconds)
+                    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=False)
                     self._generation_breaker.record_success()
                 except TimeoutError:
                     self._generation_breaker.record_failure()
+                    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=True)
                     answer = (
                         "I can help with NASA mission questions, but answer generation timed out. "
                         "Please retry in a moment."
                     )
                 except Exception as error:
                     self._generation_breaker.record_failure()
+                    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=False)
                     logging.getLogger(__name__).warning(
                         "Generation failed, returning fallback: %s", str(error)[:120]
                     )
@@ -385,18 +477,23 @@ class MultiAgentChatWorkflow:
                     contexts,
                 )
                 result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
                 self._evaluation_breaker.record_success()
             except TimeoutError:
                 self._evaluation_breaker.record_failure()
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                self._stage_sli["evaluation"].record(latency_ms, timed_out=True)
                 logging.getLogger(__name__).warning(
                     "Synchronous evaluation timed out after %.2fs", self._evaluation_timeout_seconds
                 )
                 return {}
             except Exception as error:
                 self._evaluation_breaker.record_failure()
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
                 logging.getLogger(__name__).warning("Synchronous evaluation failed: %s", str(error)[:120])
                 return {}
-            latency_ms = (time.perf_counter() - started) * 1000.0
             if isinstance(result, dict):
                 if result.get("error"):
                     return {}
@@ -452,10 +549,11 @@ class MultiAgentChatWorkflow:
                 contexts,
             )
             result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
             if isinstance(result, dict) and result.get("error"):
                 raise RuntimeError(str(result.get("error")))
             self._evaluation_breaker.record_success()
-            latency_ms = (time.perf_counter() - started) * 1000.0
             payload = dict(result) if isinstance(result, dict) else {}
             payload.update(
                 {
@@ -471,6 +569,8 @@ class MultiAgentChatWorkflow:
         except Exception as error:
             self._evaluation_breaker.record_failure()
             latency_ms = (time.perf_counter() - started) * 1000.0
+            timed_out = isinstance(error, TimeoutError)
+            self._stage_sli["evaluation"].record(latency_ms, timed_out=timed_out)
             payload = {
                 "job_id": job_id,
                 "status": "error",
@@ -564,6 +664,16 @@ class MultiAgentChatWorkflow:
         safe_limit = max(1, min(limit, 200))
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
+
+    def get_latency_sli_report(self) -> Dict[str, Any]:
+        """Return p50/p95 latency and timeout SLI rollups per stage."""
+        workers: Dict[str, Any] = {}
+        for name, tracker in self._stage_sli.items():
+            workers[name] = tracker.snapshot(self._stage_budgets_ms.get(name, 0.0))
+        return {
+            "generated_at_ms": round(time.time() * 1000),
+            "workers": workers,
+        }
     def _compress_retrieval_result(
         self, result: RetrievalResult, mission_filter: str | None
     ) -> RetrievalResult:
