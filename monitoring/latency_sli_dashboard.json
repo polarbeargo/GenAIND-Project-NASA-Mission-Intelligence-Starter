@@ -1,0 +1,535 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_INFINITY",
+      "label": "Infinity",
+      "description": "Grafana Infinity datasource",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.4.0"
+    },
+    {
+      "type": "datasource",
+      "id": "yesoreyeram-infinity-datasource",
+      "name": "Infinity",
+      "version": "2.7.1"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 700
+              },
+              {
+                "color": "red",
+                "value": 1200
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "p95_ms",
+              "text": "p95_ms",
+              "type": "number"
+            },
+            {
+              "selector": "p50_ms",
+              "text": "p50_ms",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
+        }
+      ],
+      "title": "Stage Latency (p50/p95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "timeout_rate_percent",
+              "text": "timeout_rate_percent",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
+        }
+      ],
+      "title": "Timeout Rate (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 95
+              },
+              {
+                "color": "green",
+                "value": 98
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "within_budget_rate_percent",
+              "text": "within_budget_rate_percent",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
+        }
+      ],
+      "title": "Within Budget Rate (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "total_requests",
+              "text": "total_requests",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
+        }
+      ],
+      "title": "Request Volume",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "nasa",
+    "latency",
+    "sli"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "retrieval",
+          "value": "retrieval"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Stage",
+        "multi": false,
+        "name": "stage",
+        "options": [
+          {
+            "selected": false,
+            "text": "preflight",
+            "value": "preflight"
+          },
+          {
+            "selected": true,
+            "text": "retrieval",
+            "value": "retrieval"
+          },
+          {
+            "selected": false,
+            "text": "generation",
+            "value": "generation"
+          },
+          {
+            "selected": false,
+            "text": "evaluation",
+            "value": "evaluation"
+          }
+        ],
+        "query": "preflight,retrieval,generation,evaluation",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "60",
+          "value": "60"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Window (min)",
+        "multi": false,
+        "name": "window_minutes",
+        "options": [
+          {
+            "selected": false,
+            "text": "15",
+            "value": "15"
+          },
+          {
+            "selected": true,
+            "text": "60",
+            "value": "60"
+          },
+          {
+            "selected": false,
+            "text": "360",
+            "value": "360"
+          },
+          {
+            "selected": false,
+            "text": "1440",
+            "value": "1440"
+          }
+        ],
+        "query": "15,60,360,1440",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "300",
+          "value": "300"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Bucket (sec)",
+        "multi": false,
+        "name": "bucket_seconds",
+        "options": [
+          {
+            "selected": false,
+            "text": "60",
+            "value": "60"
+          },
+          {
+            "selected": true,
+            "text": "300",
+            "value": "300"
+          },
+          {
+            "selected": false,
+            "text": "900",
+            "value": "900"
+          }
+        ],
+        "query": "60,300,900",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "",
+          "value": ""
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Mission",
+        "multi": false,
+        "name": "mission",
+        "query": "",
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "",
+          "value": ""
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Backend",
+        "multi": false,
+        "name": "backend",
+        "query": "",
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "",
+          "value": ""
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Model",
+        "multi": false,
+        "name": "model",
+        "query": "",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "NASA Stage Latency SLI",
+  "uid": "nasa-stage-latency-sli",
+  "version": 1,
+  "weekStart": ""
+}

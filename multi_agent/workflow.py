@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Any, Dict
 
 import rag_client
+from monitoring.stage_sli_events import StageLatencyEventStore
 from multi_agent.context_compression import (
     CompressionConfig,
     ContextCompressor,
@@ -153,6 +154,7 @@ class MultiAgentChatWorkflow:
         generation_budget_ms: float = 1800.0,
         evaluation_mode: str = "async",
         evaluation_buffer_size: int = 500,
+        stage_event_store: StageLatencyEventStore | None = None,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -229,10 +231,34 @@ class MultiAgentChatWorkflow:
         if self._evaluation_mode not in {"async", "sync", "off"}:
             self._evaluation_mode = "async"
         self._evaluation_buffer_size = max(100, int(evaluation_buffer_size))
+        self._stage_event_store = stage_event_store or StageLatencyEventStore()
+
+    def _record_stage_metric(
+        self,
+        stage: str,
+        latency_ms: float,
+        timed_out: bool = False,
+        status: str = "ok",
+        mission: str | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self._stage_sli[stage].record(latency_ms, timed_out=timed_out)
+        self._stage_event_store.record(
+            stage=stage,
+            latency_ms=latency_ms,
+            timed_out=timed_out,
+            budget_ms=self._stage_budgets_ms.get(stage, 0.0),
+            status=status,
+            mission=mission,
+            backend=backend,
+            model=model,
+        )
 
     def run(self, workflow_input: ChatWorkflowInput, openai_key: str) -> ChatWorkflowResult:
         effective_n_results = self._effective_retrieval_depth(workflow_input)
         effective_input = replace(workflow_input, n_results=effective_n_results)
+        backend_name = f"{effective_input.chroma_dir}:{effective_input.collection_name}".lower()
 
         retrieval_key = self._retrieval_cache_key(effective_input)
         answer_key = self._answer_cache_key(effective_input)
@@ -254,12 +280,28 @@ class MultiAgentChatWorkflow:
 
             preflight_result = preflight_future.result()
             preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
-            self._stage_sli["preflight"].record(preflight_latency_ms, timed_out=False)
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=False,
+                status="ok",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
             if retrieval_result is None:
                 try:
                     retrieval_result = retrieval_future.result(timeout=self._retrieval_timeout_seconds)
                     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
-                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=False)
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=False,
+                        status="ok",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     self._retrieval_breaker.record_success()
                     self._cache_set(
                         self._retrieval_cache,
@@ -271,7 +313,15 @@ class MultiAgentChatWorkflow:
                 except TimeoutError:
                     self._retrieval_breaker.record_failure()
                     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
-                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=True)
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=True,
+                        status="timeout",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                     retrieval_failed = True
                     retrieval_failure_reason = "retrieval timeout"
@@ -279,7 +329,15 @@ class MultiAgentChatWorkflow:
                 except Exception as error:
                     self._retrieval_breaker.record_failure()
                     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
-                    self._stage_sli["retrieval"].record(retrieval_latency_ms, timed_out=False)
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=False,
+                        status="error",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                     retrieval_failed = True
                     retrieval_failure_reason = str(error)[:120]
@@ -288,7 +346,15 @@ class MultiAgentChatWorkflow:
             preflight_started = time.perf_counter()
             preflight_result = self.safety_worker.preflight(workflow_input)
             preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
-            self._stage_sli["preflight"].record(preflight_latency_ms, timed_out=False)
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=False,
+                status="ok",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
             self._retrieval_breaker.record_success()
 
         # Apply context compression (dedup + mission priority + token cap) on the
@@ -358,12 +424,28 @@ class MultiAgentChatWorkflow:
                     )
                     answer = generation_future.result(timeout=self._generation_timeout_seconds)
                     generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
-                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=False)
+                    self._record_stage_metric(
+                        "generation",
+                        generation_latency_ms,
+                        timed_out=False,
+                        status="ok",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     self._generation_breaker.record_success()
                 except TimeoutError:
                     self._generation_breaker.record_failure()
                     generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
-                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=True)
+                    self._record_stage_metric(
+                        "generation",
+                        generation_latency_ms,
+                        timed_out=True,
+                        status="timeout",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     answer = (
                         "I can help with NASA mission questions, but answer generation timed out. "
                         "Please retry in a moment."
@@ -371,7 +453,15 @@ class MultiAgentChatWorkflow:
                 except Exception as error:
                     self._generation_breaker.record_failure()
                     generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
-                    self._stage_sli["generation"].record(generation_latency_ms, timed_out=False)
+                    self._record_stage_metric(
+                        "generation",
+                        generation_latency_ms,
+                        timed_out=False,
+                        status="error",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
                     logging.getLogger(__name__).warning(
                         "Generation failed, returning fallback: %s", str(error)[:120]
                     )
@@ -478,12 +568,28 @@ class MultiAgentChatWorkflow:
                 )
                 result = eval_future.result(timeout=self._evaluation_timeout_seconds)
                 latency_ms = (time.perf_counter() - started) * 1000.0
-                self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
+                self._record_stage_metric(
+                    "evaluation",
+                    latency_ms,
+                    timed_out=False,
+                    status="ok",
+                    mission=workflow_input.mission_filter,
+                    backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                    model=workflow_input.model,
+                )
                 self._evaluation_breaker.record_success()
             except TimeoutError:
                 self._evaluation_breaker.record_failure()
                 latency_ms = (time.perf_counter() - started) * 1000.0
-                self._stage_sli["evaluation"].record(latency_ms, timed_out=True)
+                self._record_stage_metric(
+                    "evaluation",
+                    latency_ms,
+                    timed_out=True,
+                    status="timeout",
+                    mission=workflow_input.mission_filter,
+                    backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                    model=workflow_input.model,
+                )
                 logging.getLogger(__name__).warning(
                     "Synchronous evaluation timed out after %.2fs", self._evaluation_timeout_seconds
                 )
@@ -491,7 +597,15 @@ class MultiAgentChatWorkflow:
             except Exception as error:
                 self._evaluation_breaker.record_failure()
                 latency_ms = (time.perf_counter() - started) * 1000.0
-                self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
+                self._record_stage_metric(
+                    "evaluation",
+                    latency_ms,
+                    timed_out=False,
+                    status="error",
+                    mission=workflow_input.mission_filter,
+                    backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                    model=workflow_input.model,
+                )
                 logging.getLogger(__name__).warning("Synchronous evaluation failed: %s", str(error)[:120])
                 return {}
             if isinstance(result, dict):
@@ -550,7 +664,15 @@ class MultiAgentChatWorkflow:
             )
             result = eval_future.result(timeout=self._evaluation_timeout_seconds)
             latency_ms = (time.perf_counter() - started) * 1000.0
-            self._stage_sli["evaluation"].record(latency_ms, timed_out=False)
+            self._record_stage_metric(
+                "evaluation",
+                latency_ms,
+                timed_out=False,
+                status="ok",
+                mission=workflow_input.mission_filter,
+                backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                model=workflow_input.model,
+            )
             if isinstance(result, dict) and result.get("error"):
                 raise RuntimeError(str(result.get("error")))
             self._evaluation_breaker.record_success()
@@ -570,7 +692,15 @@ class MultiAgentChatWorkflow:
             self._evaluation_breaker.record_failure()
             latency_ms = (time.perf_counter() - started) * 1000.0
             timed_out = isinstance(error, TimeoutError)
-            self._stage_sli["evaluation"].record(latency_ms, timed_out=timed_out)
+            self._record_stage_metric(
+                "evaluation",
+                latency_ms,
+                timed_out=timed_out,
+                status="timeout" if timed_out else "error",
+                mission=workflow_input.mission_filter,
+                backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                model=workflow_input.model,
+            )
             payload = {
                 "job_id": job_id,
                 "status": "error",
@@ -674,6 +804,26 @@ class MultiAgentChatWorkflow:
             "generated_at_ms": round(time.time() * 1000),
             "workers": workers,
         }
+
+    def get_latency_sli_timeseries(
+        self,
+        stage: str | None = None,
+        window_minutes: int = 60,
+        bucket_seconds: int = 300,
+        mission: str | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return bucketed time-series SLI rollups from persisted stage events."""
+        return self._stage_event_store.get_timeseries(
+            stage=stage,
+            window_minutes=window_minutes,
+            bucket_seconds=bucket_seconds,
+            mission=mission,
+            backend=backend,
+            model=model,
+        )
+
     def _compress_retrieval_result(
         self, result: RetrievalResult, mission_filter: str | None
     ) -> RetrievalResult:

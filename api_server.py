@@ -8,6 +8,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from env_utils import load_project_env
@@ -22,6 +23,7 @@ from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
 from multi_agent import ChatWorkflowInput, MultiAgentChatWorkflow, WorkflowError
+from monitoring.stage_sli_events import StageLatencyEventStore
 
 try:
     from security import (
@@ -128,6 +130,46 @@ def _get_latency_budget_ms(name: str, default: float) -> float:
     except ValueError:
         value = default
     return max(1.0, min(value, 30000.0))
+
+
+def _get_stage_sli_retention_hours() -> float:
+    try:
+        value = float(os.getenv("STAGE_SLI_RETENTION_HOURS", "168"))
+    except ValueError:
+        value = 168.0
+    return max(1.0, min(value, 24.0 * 365.0))
+
+
+def _get_stage_sli_max_file_bytes() -> int:
+    try:
+        value = int(os.getenv("STAGE_SLI_MAX_FILE_BYTES", str(20 * 1024 * 1024)))
+    except ValueError:
+        value = 20 * 1024 * 1024
+    return max(1024 * 1024, min(value, 512 * 1024 * 1024))
+
+
+def _get_stage_sli_max_rotated_files() -> int:
+    try:
+        value = int(os.getenv("STAGE_SLI_MAX_ROTATED_FILES", "10"))
+    except ValueError:
+        value = 10
+    return max(1, min(value, 200))
+
+
+def _get_stage_sli_maintenance_seconds() -> float:
+    try:
+        value = float(os.getenv("STAGE_SLI_MAINTENANCE_SECONDS", "60"))
+    except ValueError:
+        value = 60.0
+    return max(1.0, min(value, 3600.0))
+
+
+def _get_stage_sli_log_path() -> Path:
+    configured = os.getenv("STAGE_SLI_LOG_FILE", "./monitoring/stage_latency_events.jsonl").strip()
+    path = Path(configured) if configured else Path("./monitoring/stage_latency_events.jsonl")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
 
 class CacheStats:
     """Track cache performance metrics for monitoring."""
@@ -258,6 +300,13 @@ chat_workflow = MultiAgentChatWorkflow(
     retrieval_budget_ms=_get_latency_budget_ms("RETRIEVAL_BUDGET_MS", 700.0),
     generation_budget_ms=_get_latency_budget_ms("GENERATION_BUDGET_MS", 1800.0),
     evaluation_mode=_get_evaluation_mode(),
+    stage_event_store=StageLatencyEventStore(
+        log_file=_get_stage_sli_log_path(),
+        retention_hours=_get_stage_sli_retention_hours(),
+        max_file_bytes=_get_stage_sli_max_file_bytes(),
+        max_rotated_files=_get_stage_sli_max_rotated_files(),
+        maintenance_interval_seconds=_get_stage_sli_maintenance_seconds(),
+    ),
 )
 
 @app.middleware("http")
@@ -517,6 +566,29 @@ def monitoring_client_caches() -> Dict[str, Any]:
 def monitoring_latency_sli() -> Dict[str, Any]:
     """Return per-stage latency SLIs with budget compliance and timeout rate."""
     return chat_workflow.get_latency_sli_report()
+
+
+@app.get("/monitoring/latency-sli/timeseries")
+def monitoring_latency_sli_timeseries(
+    stage: Optional[str] = None,
+    window_minutes: int = 60,
+    bucket_seconds: int = 300,
+    mission: Optional[str] = None,
+    backend: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return bucketed time-series stage SLIs from persisted NDJSON events."""
+    try:
+        return chat_workflow.get_latency_sli_timeseries(
+            stage=stage,
+            window_minutes=window_minutes,
+            bucket_seconds=bucket_seconds,
+            mission=mission,
+            backend=backend,
+            model=model,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
 
 
 @app.post("/collections/warm-cache")
