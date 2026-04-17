@@ -23,6 +23,7 @@ from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
 from multi_agent import ChatWorkflowInput, MultiAgentChatWorkflow, WorkflowError
+from monitoring.security_dashboard import get_dashboard
 from monitoring.stage_sli_events import StageLatencyEventStore
 
 try:
@@ -49,6 +50,36 @@ except ImportError:
 load_project_env(__file__)
 
 logger = logging.getLogger(__name__)
+security_dashboard = get_dashboard()
+
+
+class SecurityDashboardAuditorBridge:
+    """Bridge workflow security audit calls into the in-process security dashboard."""
+
+    def __init__(self, dashboard):
+        self._dashboard = dashboard
+
+    def log_security_event(
+        self,
+        event_type: str,
+        severity,
+        user_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        severity_value = getattr(severity, "value", str(severity)).strip().lower() or "medium"
+        try:
+            self._dashboard.log_event(
+                event_type=event_type,
+                severity=severity_value,
+                user_id=user_id,
+                ip_address=user_id,
+                details=details,
+            )
+        except Exception as error:
+            logger.warning("Security dashboard bridge failed: %s", error)
+
+
+security_auditor_bridge = SecurityDashboardAuditorBridge(security_dashboard)
 
 
 def _get_default_judge_mode() -> str:
@@ -278,7 +309,7 @@ chat_workflow = MultiAgentChatWorkflow(
     output_validator=OutputValidator,
     sensitive_info_filter=SensitiveInfoFilter,
     security_violation=SecurityViolation,
-    security_auditor=SecurityAuditor,
+    security_auditor=security_auditor_bridge,
     security_level=SecurityLevel,
     judge_timeout_seconds=_get_judge_timeout_seconds(),
     factoid_n_results=_get_depth_threshold("RETRIEVAL_FACTOID_N_RESULTS", 2),
@@ -439,6 +470,22 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             )
 
         except WorkflowError as error:
+            if error.status_code in {
+                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_403_FORBIDDEN,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            }:
+                security_dashboard.log_event(
+                    event_type="security_violation",
+                    severity="high" if error.status_code == status.HTTP_403_FORBIDDEN else "medium",
+                    user_id=client_ip,
+                    ip_address=client_ip,
+                    details={
+                        "status_code": error.status_code,
+                        "detail": error.detail,
+                        "backend": backend_name,
+                    },
+                )
             raise HTTPException(status_code=error.status_code, detail=error.detail)
         except HTTPException:
             raise
@@ -458,6 +505,17 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                 evaluation={"error": error_msg[:200]},
                 error=True,
                 latency_ms=latency_ms,
+            )
+            security_dashboard.log_event(
+                event_type="api_error",
+                severity="high",
+                user_id=client_ip,
+                ip_address=client_ip,
+                details={
+                    "backend": backend_name,
+                    "error": error_msg[:200],
+                    "route": "/chat",
+                },
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -589,6 +647,44 @@ def monitoring_latency_sli_timeseries(
         )
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+
+
+@app.get("/monitoring/security")
+def monitoring_security_overview() -> Dict[str, Any]:
+    """Return high-level security dashboard telemetry."""
+    return {
+        "statistics": security_dashboard.get_statistics(),
+        "threat_summary": security_dashboard.get_threat_summary(),
+    }
+
+
+@app.get("/monitoring/security/alerts")
+def monitoring_security_alerts() -> Dict[str, Any]:
+    """Return recent security alerts raised by threshold rules."""
+    alerts = security_dashboard.get_alerts()
+    return {
+        "count": len(alerts),
+        "alerts": alerts,
+    }
+
+
+@app.get("/monitoring/security/events")
+def monitoring_security_events(
+    limit: int = 50,
+    severity: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return recent security events with optional severity filtering."""
+    events = security_dashboard.get_events(limit=max(1, min(limit, 500)), severity=severity)
+    return {
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/monitoring/security/coverage")
+def monitoring_security_coverage() -> Dict[str, Any]:
+    """Return OWASP LLM Top 10 coverage based on observed event types."""
+    return security_dashboard.get_vulnerability_coverage()
 
 
 @app.post("/collections/warm-cache")
