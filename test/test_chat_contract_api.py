@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import api_server
-from multi_agent.models import ChatWorkflowResult
+from multi_agent.models import ChatWorkflowResult, WorkflowError
 
 
 class _NoopSpan:
@@ -201,6 +201,37 @@ class TestChatContractAPI(unittest.TestCase):
             params={"stage": "invalid-stage"},
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_monitoring_security_contract(self):
+        response = self.client.get("/monitoring/security")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("statistics", body)
+        self.assertIn("threat_summary", body)
+
+    def test_monitoring_security_events_contract(self):
+        response = self.client.get(
+            "/monitoring/security/events",
+            params={"limit": 10, "severity": "high"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("count", body)
+        self.assertIn("events", body)
+
+    def test_chat_workflow_error_logs_security_event(self):
+        with (
+            patch("api_server.get_openai_api_key", return_value="test-key"),
+            patch("api_server.chat_workflow.run", side_effect=WorkflowError(status_code=429, detail="Rate limit exceeded")),
+            patch("api_server.security_dashboard.log_event", return_value=None) as log_event_mock,
+            patch("api_server.tracer.start_as_current_span", side_effect=_noop_span_context),
+        ):
+            response = self.client.post("/chat", json=self.base_payload)
+
+        self.assertEqual(response.status_code, 429)
+        log_event_mock.assert_called_once()
 
 
 if __name__ == "__main__":
