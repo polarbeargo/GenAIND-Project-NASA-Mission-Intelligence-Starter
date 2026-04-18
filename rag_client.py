@@ -5,7 +5,7 @@ import chromadb
 import logging
 from chromadb.config import Settings
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from openai_config import get_openai_api_key, get_openai_base_url, get_openai_embedding_model
@@ -218,6 +218,30 @@ def retrieve_documents(
             logger.warning(f"Potentially poisoned results detected: {poisoning_check}")
 
     return results
+
+def warm_collection_index(collection) -> Dict[str, Any]:
+    """Prime ChromaDB index metadata for *collection* during server startup.
+
+    Calls `count()` and `peek(limit=1)` so the underlying HNSW index and
+    SQLite metadata tables are loaded into the process cache before the first
+    real request arrives.  Both calls are fast (no embedding round-trip) and
+    idempotent, which is safe to run on every startup.
+
+    Returns:
+    A dict containing:
+    - `count`: document count when available, otherwise -1
+    - `index_primed`: whether minimal index data was loaded
+    - `error`: optional truncated error message on failure
+    """
+
+    try:
+        doc_count = collection.count()
+        peek = collection.peek(limit=1)
+        index_primed = len(peek.get("ids", [])) > 0
+        return {"count": doc_count, "index_primed": index_primed}
+    except Exception as exc:
+        return {"count": -1, "index_primed": False, "error": str(exc)[:80]}
+
 
 def format_context(documents: List[str], metadatas: List[Dict]) -> str:
     """Format retrieved documents into context"""

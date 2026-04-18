@@ -263,19 +263,64 @@ def _get_cached_rag_init(chroma_dir: str, collection_name: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle: startup (pre-warm cache) and shutdown."""
-    logger.info("Pre-warming RAG collection cache...")
+    """Application lifecycle: startup (mission-scoped warmup) and shutdown.
+
+    Warmup phases (executed in order):
+    1. Security rule compilation — confirm all regex patterns are pre-compiled
+       at module-import time so the first request incurs zero JIT cost.
+    2. Collection cache — open each target ChromaDB collection and prime the
+       LRU cache so every request hits immediately.
+    3. Index metadata — call count()+peek() on each collection to load the
+       HNSW index and SQLite metadata tables into the process cache before any
+       real traffic arrives.
+    """
+
+    if PromptInjectionDetector is not None:
+        n_injection = len(PromptInjectionDetector.INJECTION_PATTERNS)
+        n_doc = len(PromptInjectionDetector.RETRIEVED_DOC_PATTERNS)
+        n_sanitize = len(PromptInjectionDetector._SANITIZE_PATTERNS)
+        n_sensitive = len(SensitiveInfoFilter.SENSITIVE_PATTERNS)
+        n_strict = len(SensitiveInfoFilter.STRICT_SENSITIVE_PATTERNS)
+        n_harmful = len(OutputValidator._HARMFUL_PATTERNS)
+        total = n_injection + n_doc + n_sanitize + n_sensitive + n_strict + n_harmful
+        logger.info(
+            "Security patterns pre-compiled: %d total "
+            "(injection=%d, doc=%d, sanitize=%d, sensitive=%d, strict=%d, harmful=%d)",
+            total, n_injection, n_doc, n_sanitize, n_sensitive, n_strict, n_harmful,
+        )
+    else:
+        logger.warning("Security module unavailable — pattern precompilation skipped")
+
+    logger.info("Pre-warming RAG collection cache and index metadata...")
     backends_to_warm = [
         ("./chroma_db", "nasa_space_missions_test"),
         ("./chroma_db_openai", "nasa_space_missions_text"),
     ]
     for chroma_dir, collection_name in backends_to_warm:
         try:
-            _cached_rag_init(chroma_dir, collection_name)
-            logger.info(f"  ✓ Warmed: {chroma_dir}/{collection_name}")
-        except Exception as e:
-            logger.warning(f"  - Skip (optional): {chroma_dir} - {str(e)[:50]}")
-    logger.info(f"Cache ready: {cache_stats.to_dict()}")
+            collection, success, error = _cached_rag_init(chroma_dir, collection_name)
+            if success and collection is not None:
+                index_info = rag_client.warm_collection_index(collection)
+                if "error" in index_info:
+                    logger.warning(
+                        "  ~ Partial warm %s/%s: index metadata unavailable — %s",
+                        chroma_dir, collection_name, index_info["error"],
+                    )
+                else:
+                    logger.info(
+                        "  ✓ Ready: %s/%s  docs=%d  index_primed=%s",
+                        chroma_dir, collection_name,
+                        index_info["count"], index_info["index_primed"],
+                    )
+            else:
+                logger.warning(
+                    "  - Skip (optional): %s/%s — %s",
+                    chroma_dir, collection_name, error or "no collection",
+                )
+        except Exception as exc:
+            logger.warning("  - Skip (optional): %s — %s", chroma_dir, str(exc)[:60])
+
+    logger.info("Startup warmup complete. Cache stats: %s", cache_stats.to_dict())
     yield
     logger.info("Shutting down NASA RAG API")
 
