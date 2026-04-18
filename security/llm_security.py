@@ -36,27 +36,34 @@ class PromptInjectionDetector:
     """LLM01: Detects common prompt injection patterns."""
 
     INJECTION_PATTERNS = [
-        r"(?i)(ignore|disregard|forget|override).*?(previous|system|instruction|prompt)",
-        r"(?i)\b(override|system)\s*:\s*(ignore|disregard|forget).{0,80}?(safety|guideline|rule|policy)",
-        r"(?i)\b(system|override)\s*:\s*(generate|create|provide|disclose|reveal).{0,80}?(admin|credential|password|token|key)",
-        r"(?i)(simulate|act as|roleplay|pretend).*?(admin|system|developer|root)",
-        r"(?i)(execute|run|eval|execute_code).*?(command|script|python|bash)",
-        r"(?i)(divulge|reveal|expose|leak).{0,60}?((system\s+prompt|developer\s+message)|secret|key|password|token|api)",
-        r"(?i)respond_with_context_only:\s*false",
-        r"(?i)output_raw_response:\s*true",
-        r"(?i)\[.*SEPARATOR.*\]",
-        r"(?i)###.*PROMPT.*END",
+        re.compile(r"(?i)(ignore|disregard|forget|override).*?(previous|system|instruction|prompt)"),
+        re.compile(r"(?i)\b(override|system)\s*:\s*(ignore|disregard|forget).{0,80}?(safety|guideline|rule|policy)"),
+        re.compile(r"(?i)\b(system|override)\s*:\s*(generate|create|provide|disclose|reveal).{0,80}?(admin|credential|password|token|key)"),
+        re.compile(r"(?i)(simulate|act as|roleplay|pretend).*?(admin|system|developer|root)"),
+        re.compile(r"(?i)(execute|run|eval|execute_code).*?(command|script|python|bash)"),
+        re.compile(r"(?i)(divulge|reveal|expose|leak).{0,60}?((system\s+prompt|developer\s+message)|secret|key|password|token|api)"),
+        re.compile(r"(?i)respond_with_context_only:\s*false"),
+        re.compile(r"(?i)output_raw_response:\s*true"),
+        re.compile(r"(?i)\[.*SEPARATOR.*\]"),
+        re.compile(r"(?i)###.*PROMPT.*END"),
     ]
 
     # More conservative patterns for retrieved documents to reduce false positives
     # from operational language in NASA logs (e.g., leak/system references).
     RETRIEVED_DOC_PATTERNS = [
-        r"(?i)(ignore|disregard|forget|override).{0,80}?(instruction|prompt|system)",
-        r"(?i)(act as|simulate|roleplay|pretend).{0,80}?(admin|developer|system|root)",
-        r"(?i)(show|reveal|print|dump).{0,80}?(system\s+prompt|developer\s+message)",
-        r"(?i)respond_with_context_only:\s*false",
-        r"(?i)output_raw_response:\s*true",
-        r"(?i)###.*PROMPT.*END",
+        re.compile(r"(?i)(ignore|disregard|forget|override).{0,80}?(instruction|prompt|system)"),
+        re.compile(r"(?i)(act as|simulate|roleplay|pretend).{0,80}?(admin|developer|system|root)"),
+        re.compile(r"(?i)(show|reveal|print|dump).{0,80}?(system\s+prompt|developer\s+message)"),
+        re.compile(r"(?i)respond_with_context_only:\s*false"),
+        re.compile(r"(?i)output_raw_response:\s*true"),
+        re.compile(r"(?i)###.*PROMPT.*END"),
+    ]
+
+    _SANITIZE_PATTERNS = [
+        re.compile(r"(?i)<script[^>]*>.*?</script>"),
+        re.compile(r"(?i)onclick\s*="),
+        re.compile(r"(?i)onerror\s*="),
+        re.compile(r"(?i)onload\s*="),
     ]
     
     @staticmethod
@@ -72,56 +79,48 @@ class PromptInjectionDetector:
             else PromptInjectionDetector.INJECTION_PATTERNS
         )
 
-        for pattern in patterns:
-            if re.search(pattern, text):
-                logger.warning(f"Potential prompt injection detected: pattern={pattern}")
+        for cpat in patterns:
+            if cpat.search(text):
+                logger.warning(f"Potential prompt injection detected: pattern={cpat.pattern}")
                 return SecurityViolation(
                     level=SecurityLevel.HIGH,
                     message="Potential prompt injection attack detected",
-                    details={"pattern": pattern, "text_sample": text[:100]}
+                    details={"pattern": cpat.pattern, "text_sample": text[:100]}
                 )
         return None
     
     @staticmethod
     def sanitize_input(text: str, max_length: int = 2000) -> str:
         """Sanitize user input for prompt injection."""
-        
         text = text[:max_length]
-        
-        suspicious = [
-            r"(?i)<script[^>]*>.*?</script>",
-            r"(?i)onclick\s*=",
-            r"(?i)onerror\s*=",
-            r"(?i)onload\s*=",
-        ]
-        
-        for pattern in suspicious:
-            text = re.sub(pattern, "", text)
-        
+        for cpat in PromptInjectionDetector._SANITIZE_PATTERNS:
+            text = cpat.sub("", text)
         return text.strip()
 
 
 class SensitiveInfoFilter:
     """LLM02 & LLM07: Filters sensitive information from responses."""
-    
+
     SENSITIVE_PATTERNS = [
-        r"(?i)(api[\s_-]?key|apikey)\s*[=:]\s*(['\"]?)([a-zA-Z0-9\-_]{20,})\2",
-        r"(?i)(password|passwd|pwd)\s*[=:]\s*(['\"]?)(\S+)\2",
-        r"(?i)(secret|token|bearer)\s*[=:]\s*(['\"]?)([a-zA-Z0-9\-_]{20,})\2",
-        r"(?i)openai[_-]?key\s*[=:]\s*sk-[a-zA-Z0-9]{40,}",
-        r"(?i)(private[_-]?)?key\s*[=:]\s*-----BEGIN.*?-----END",
-        r"(?i)system[_-]?prompt\s*[=:]\s*['\"]?(.{50,})['\"]?",
-        r"\bsk-[A-Za-z0-9]{16,}\b",
-        r"\bghp_[A-Za-z0-9]{20,}\b",
-        r"\beyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]*\b",
+        re.compile(r"(?i)(api[\s_-]?key|apikey)\s*[=:]\s*(['\"]?)([a-zA-Z0-9\-_]{20,})\2"),
+        re.compile(r"(?i)(password|passwd|pwd)\s*[=:]\s*(['\"]?)(\S+)\2"),
+        re.compile(r"(?i)(secret|token|bearer)\s*[=:]\s*(['\"]?)([a-zA-Z0-9\-_]{20,})\2"),
+        re.compile(r"(?i)openai[_-]?key\s*[=:]\s*sk-[a-zA-Z0-9]{40,}"),
+        re.compile(r"(?i)(private[_-]?)?key\s*[=:]\s*-----BEGIN.*?-----END"),
+        re.compile(r"(?i)system[_-]?prompt\s*[=:]\s*['\"]?(.{50,})['\"]?"),
+        re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),
+        re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+        re.compile(r"\beyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]*\b"),
     ]
 
     STRICT_SENSITIVE_PATTERNS = [
-        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-        r"\b\d{3}-\d{2}-\d{4}\b",
-        r"\b(?:\d[ -]*?){13,16}\b",
-        r"\b(?:\+?1[ -]?)?(?:\(?\d{3}\)?[ -]?)\d{3}[ -]?\d{4}\b",
+        re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+        re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
+        re.compile(r"\b(?:\+?1[ -]?)?(?:\(?\d{3}\)?[ -]?)\d{3}[ -]?\d{4}\b"),
     ]
+
+    _SYSTEM_PROMPT_PATTERN = re.compile(r"(?i)system\s*prompt.*?[\n:]", re.DOTALL)
     
     REDACTION = "[REDACTED]"
     
@@ -129,11 +128,10 @@ class SensitiveInfoFilter:
     def detect_sensitive_info(text: str) -> List[Dict[str, Any]]:
         """Detect sensitive information patterns."""
         findings = []
-        for pattern in SensitiveInfoFilter.SENSITIVE_PATTERNS:
-            matches = re.finditer(pattern, text)
-            for match in matches:
+        for cpat in SensitiveInfoFilter.SENSITIVE_PATTERNS:
+            for match in cpat.finditer(text):
                 findings.append({
-                    "type": pattern[:30],
+                    "type": cpat.pattern[:30],
                     "position": (match.start(), match.end()),
                     "content_sample": text[match.start():min(match.end(), match.start() + 50)]
                 })
@@ -143,15 +141,12 @@ class SensitiveInfoFilter:
     def filter_response(text: str, strict: bool = False) -> str:
         """Remove or redact sensitive information from LLM output."""
         filtered = text
-        
-        for pattern in SensitiveInfoFilter.SENSITIVE_PATTERNS:
-            filtered = re.sub(pattern, f" {SensitiveInfoFilter.REDACTION} ", filtered)
-        
+        for cpat in SensitiveInfoFilter.SENSITIVE_PATTERNS:
+            filtered = cpat.sub(f" {SensitiveInfoFilter.REDACTION} ", filtered)
         if strict:
-            filtered = re.sub(r"(?i)system\s*prompt.*?[\n:]", "[SYSTEM PROMPT HIDDEN]", filtered)
-            for pattern in SensitiveInfoFilter.STRICT_SENSITIVE_PATTERNS:
-                filtered = re.sub(pattern, SensitiveInfoFilter.REDACTION, filtered)
-        
+            filtered = SensitiveInfoFilter._SYSTEM_PROMPT_PATTERN.sub("[SYSTEM PROMPT HIDDEN]", filtered)
+            for cpat in SensitiveInfoFilter.STRICT_SENSITIVE_PATTERNS:
+                filtered = cpat.sub(SensitiveInfoFilter.REDACTION, filtered)
         return filtered
     
     @staticmethod
@@ -179,33 +174,35 @@ class SensitiveInfoFilter:
 
 class OutputValidator:
     """LLM05: Validates and sanitizes LLM outputs."""
-    
+
+    _HARMFUL_PATTERNS = [
+        (re.compile(r"(?i)(jailbreak|hack|exploit|malware)"), "harmful_code_reference"),
+        (re.compile(r"(?i)(illegal|banned|forbidden)"), "restricted_content"),
+    ]
+    _STRONG_CLAIMS_PATTERN = re.compile(r"(?i)(definitely|certainly|absolutely|proven|fact[:]?)")
+
     @staticmethod
     def validate_response(response: str, context_used: List[str]) -> Dict[str, Any]:
         """Validate LLM response for safety and coherence.
-        
+
         Returns:
             Dict with validation results and any issues found.
         """
         issues = []
-        
+
         if len(response) < 10:
             issues.append({"type": "too_short", "message": "Response is suspiciously short"})
         elif len(response) > 5000:
             issues.append({"type": "too_long", "message": "Response exceeds length limit"})
-        
-        harmful_patterns = [
-            (r"(?i)(jailbreak|hack|exploit|malware)", "harmful_code_reference"),
-            (r"(?i)(illegal|banned|forbidden)", "restricted_content"),
-        ]
-        for pattern, label in harmful_patterns:
-            if re.search(pattern, response):
-                issues.append({"type": label, "message": f"Potential harmful content detected"})
-        
+
+        for cpat, label in OutputValidator._HARMFUL_PATTERNS:
+            if cpat.search(response):
+                issues.append({"type": label, "message": "Potential harmful content detected"})
+
         if context_used:
             context_str = " ".join(context_used).lower()
             response_lower = response.lower()
-            strong_claims = re.findall(r"(?i)(definitely|certainly|absolutely|proven|fact[:]?)", response)
+            strong_claims = OutputValidator._STRONG_CLAIMS_PATTERN.findall(response)
             context_overlap = sum(1 for word in response_lower.split() if word in context_str.split())
             
             if strong_claims and context_overlap < len(response.split()) * 0.1:
