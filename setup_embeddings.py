@@ -34,7 +34,7 @@ try:
         chunk_overlap=100
     )
     
-    stats = pipeline.process_all_text_data('./data_text', update_mode='skip')
+    stats = pipeline.process_all_text_data('./data_text', update_mode='incremental')
     
     print("\n" + "="*60)
     print("✓ PROCESSING COMPLETE")

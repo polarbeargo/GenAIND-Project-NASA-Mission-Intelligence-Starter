@@ -18,7 +18,7 @@ import json
 import logging
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 import chromadb
 from chromadb.config import Settings
 import openai
@@ -112,6 +112,97 @@ class ChromaEmbeddingPipelineTextOnly:
                 "embedding_model": embedding_model,
             }
         )
+        self.manifest_path = Path(chroma_persist_directory) / f"{collection_name}_content_manifest.json"
+        self.manifest = self._load_manifest()
+
+    def _load_manifest(self) -> Dict[str, Any]:
+        """Load persistent content hash manifest used for incremental embedding updates."""
+        if not self.manifest_path.exists():
+            return {
+                "version": 1,
+                "collection": self.collection_name,
+                "chunk_size": self.chunk_size,
+                "chunk_overlap": self.chunk_overlap,
+                "embedding_model": self.embedding_model,
+                "files": {},
+            }
+
+        try:
+            with self.manifest_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            files = data.get("files")
+            if not isinstance(files, dict):
+                data["files"] = {}
+            return data
+        except Exception as exc:
+            logger.warning("Unable to load manifest %s (%s). Starting fresh.", self.manifest_path, exc)
+            return {
+                "version": 1,
+                "collection": self.collection_name,
+                "chunk_size": self.chunk_size,
+                "chunk_overlap": self.chunk_overlap,
+                "embedding_model": self.embedding_model,
+                "files": {},
+            }
+
+    def _save_manifest(self) -> None:
+        """Persist manifest atomically to avoid partial writes during failures."""
+        self.manifest["collection"] = self.collection_name
+        self.manifest["chunk_size"] = self.chunk_size
+        self.manifest["chunk_overlap"] = self.chunk_overlap
+        self.manifest["embedding_model"] = self.embedding_model
+        self.manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+        temp_path = self.manifest_path.with_suffix(self.manifest_path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.manifest, handle, ensure_ascii=True, indent=2, sort_keys=True)
+        temp_path.replace(self.manifest_path)
+
+    @staticmethod
+    def _hash_text(value: str) -> str:
+        """Return deterministic SHA256 hash for UTF-8 text."""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _manifest_file_key(file_path: Path) -> str:
+        """Return deterministic manifest key for a file path."""
+        return str(file_path.resolve()).replace("\\", "/")
+
+    def _read_text_with_hash(self, file_path: Path) -> Tuple[str, str]:
+        """Read text file and compute content hash in one pass."""
+        with file_path.open("r", encoding="utf-8") as handle:
+            content = handle.read()
+        return content, self._hash_text(content)
+
+    def _documents_from_content(self, file_path: Path, content: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """Build chunked documents from already-loaded content."""
+        if not content.strip():
+            return []
+
+        metadata = {
+            'source': file_path.stem,
+            'file_path': str(file_path),
+            'file_type': 'text',
+            'content_type': 'full_text',
+            'mission': self.extract_mission_from_path(file_path),
+            'data_type': self.extract_data_type_from_path(file_path),
+            'document_category': self.extract_document_category_from_filename(file_path.name),
+            'file_size': len(content),
+            'processed_timestamp': datetime.now().isoformat(),
+        }
+        return self.chunk_text(content, metadata)
+
+    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings for a list of text inputs in one API call for throughput efficiency."""
+        if not texts:
+            return []
+        response = self.openai_client.embeddings.create(
+            model=self.embedding_model,
+            input=texts,
+        )
+        if not response.data:
+            raise ValueError("No embeddings returned from OpenAI")
+        return [item.embedding for item in response.data]
     
     def chunk_text(self, text: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
         """
@@ -331,29 +422,109 @@ class ChromaEmbeddingPipelineTextOnly:
             List of (text, metadata) tuples
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if not content.strip():
-                return []
-            
-            metadata = {
-                'source': file_path.stem,
-                'file_path': str(file_path),
-                'file_type': 'text',
-                'content_type': 'full_text',
-                'mission': self.extract_mission_from_path(file_path),
-                'data_type': self.extract_data_type_from_path(file_path),
-                'document_category': self.extract_document_category_from_filename(file_path.name),
-                'file_size': len(content),
-                'processed_timestamp': datetime.now().isoformat()
-            }
-            
-            return self.chunk_text(content, metadata)
+            content, _ = self._read_text_with_hash(file_path)
+            return self._documents_from_content(file_path, content)
             
         except Exception as e:
             logger.error(f"Error processing text file {file_path}: {e}")
             return []
+
+    def _process_file_incremental(
+        self,
+        file_path: Path,
+        batch_size: int,
+    ) -> Dict[str, Any]:
+        """Incrementally process one file based on manifest content and chunk hashes."""
+        stats = {
+            'chunks': 0,
+            'added': 0,
+            'updated': 0,
+            'skipped': 0,
+            'deleted': 0,
+            'status': 'pending',
+            'error': '',
+        }
+
+        content, file_hash = self._read_text_with_hash(file_path)
+        file_key = self._manifest_file_key(file_path)
+        old_entry = self.manifest.get('files', {}).get(file_key, {})
+
+        old_file_hash = str(old_entry.get('file_hash', ''))
+        old_chunk_hashes = old_entry.get('chunk_hashes', {}) or {}
+        old_doc_ids = set(old_entry.get('doc_ids', []) or [])
+
+        if old_file_hash and old_file_hash == file_hash:
+            stats['status'] = 'unchanged_file'
+            stats['chunks'] = int(old_entry.get('chunk_count', len(old_chunk_hashes)))
+            stats['skipped'] = stats['chunks']
+            return stats
+
+        documents = self._documents_from_content(file_path, content)
+        if not documents:
+            if old_doc_ids:
+                self.collection.delete(ids=list(old_doc_ids))
+                stats['deleted'] = len(old_doc_ids)
+            self.manifest.setdefault('files', {})[file_key] = {
+                'file_hash': file_hash,
+                'chunk_count': 0,
+                'chunk_hashes': {},
+                'doc_ids': [],
+                'updated_at': datetime.utcnow().isoformat() + 'Z',
+            }
+            stats['status'] = 'empty'
+            return stats
+
+        upsert_payload: List[Tuple[str, str, Dict[str, Any], str]] = []
+        new_chunk_hashes: Dict[str, str] = {}
+        new_doc_ids: Set[str] = set()
+
+        for text, metadata in documents:
+            doc_id = self.generate_document_id(file_path, metadata)
+            chunk_hash = self._hash_text(text)
+            new_chunk_hashes[doc_id] = chunk_hash
+            new_doc_ids.add(doc_id)
+
+            if old_chunk_hashes.get(doc_id) == chunk_hash:
+                stats['skipped'] += 1
+                continue
+            upsert_payload.append((doc_id, text, metadata, chunk_hash))
+
+        stale_ids = list(old_doc_ids - new_doc_ids)
+        if stale_ids:
+            self.collection.delete(ids=stale_ids)
+            stats['deleted'] += len(stale_ids)
+
+        for batch_start in range(0, len(upsert_payload), batch_size):
+            batch = upsert_payload[batch_start:batch_start + batch_size]
+            ids = [item[0] for item in batch]
+            texts = [item[1] for item in batch]
+            metadatas = [item[2] for item in batch]
+            embeddings = self.get_embeddings_batch(texts)
+
+            self.collection.upsert(
+                ids=ids,
+                documents=texts,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
+
+            for doc_id in ids:
+                if doc_id in old_doc_ids:
+                    stats['updated'] += 1
+                else:
+                    stats['added'] += 1
+
+        self.manifest.setdefault('files', {})[file_key] = {
+            'file_hash': file_hash,
+            'chunk_count': len(documents),
+            'chunk_hashes': new_chunk_hashes,
+            'doc_ids': sorted(new_doc_ids),
+            'updated_at': datetime.utcnow().isoformat() + 'Z',
+        }
+
+        stats['chunks'] = len(documents)
+        stats['status'] = 'processed'
+        return stats
     
     def extract_mission_from_path(self, file_path: Path) -> str:
         """Extract mission name from file path"""
@@ -521,7 +692,12 @@ class ChromaEmbeddingPipelineTextOnly:
 
         return stats
     
-    def process_all_text_data(self, base_path: str, update_mode: str = 'skip') -> Dict[str, int]:
+    def process_all_text_data(
+        self,
+        base_path: str,
+        update_mode: str = 'skip',
+        batch_size: int = 50,
+    ) -> Dict[str, int]:
         """
         Process all text files and add to ChromaDB
         
@@ -547,6 +723,22 @@ class ChromaEmbeddingPipelineTextOnly:
         run_rows: List[Dict[str, Any]] = []
 
         files_to_process = self.scan_text_files_only(base_path)
+        use_incremental = update_mode == 'incremental'
+
+        if use_incremental:
+            manifest_files = self.manifest.setdefault('files', {})
+            existing_keys = set(manifest_files.keys())
+            seen_keys = {self._manifest_file_key(path) for path in files_to_process}
+            missing_keys = sorted(existing_keys - seen_keys)
+            for missing_key in missing_keys:
+                entry = manifest_files.get(missing_key, {})
+                old_ids = entry.get('doc_ids', []) or []
+                if old_ids:
+                    try:
+                        self.collection.delete(ids=list(old_ids))
+                    except Exception as exc:
+                        logger.warning("Failed deleting stale file docs from %s: %s", missing_key, exc)
+                manifest_files.pop(missing_key, None)
 
         for file_path in files_to_process:
             mission = self.extract_mission_from_path(file_path)
@@ -570,25 +762,32 @@ class ChromaEmbeddingPipelineTextOnly:
                 'skipped': 0,
                 'status': 'pending',
                 'error': '',
+                'deleted': 0,
             }
 
             try:
-                documents = self.process_text_file(file_path)
-
                 stats['files_processed'] += 1
                 stats['missions'][mission]['files'] += 1
 
-                if not documents:
-                    run_row['status'] = 'empty'
-                    continue
+                if use_incremental:
+                    file_stats = self._process_file_incremental(
+                        file_path=file_path,
+                        batch_size=batch_size,
+                    )
+                    chunk_count = int(file_stats['chunks'])
+                else:
+                    documents = self.process_text_file(file_path)
+                    if not documents:
+                        run_row['status'] = 'empty'
+                        continue
+                    file_stats = self.add_documents_to_collection(
+                        documents=documents,
+                        file_path=file_path,
+                        batch_size=batch_size,
+                        update_mode=update_mode,
+                    )
+                    chunk_count = len(documents)
 
-                file_stats = self.add_documents_to_collection(
-                    documents=documents,
-                    file_path=file_path,
-                    update_mode=update_mode,
-                )
-
-                chunk_count = len(documents)
                 stats['total_chunks'] += chunk_count
                 stats['documents_added'] += file_stats['added']
                 stats['documents_updated'] += file_stats['updated']
@@ -602,7 +801,8 @@ class ChromaEmbeddingPipelineTextOnly:
                 run_row['added'] = file_stats['added']
                 run_row['updated'] = file_stats['updated']
                 run_row['skipped'] = file_stats['skipped']
-                run_row['status'] = 'processed'
+                run_row['deleted'] = int(file_stats.get('deleted', 0))
+                run_row['status'] = str(file_stats.get('status', 'processed'))
             except Exception as e:
                 stats['errors'] += 1
                 logger.error(f"Error processing file {file_path}: {e}")
@@ -610,6 +810,9 @@ class ChromaEmbeddingPipelineTextOnly:
                 run_row['error'] = str(e)[:500]
             finally:
                 run_rows.append(run_row)
+
+        if use_incremental:
+            self._save_manifest()
 
         stats['run_summary_artifacts'] = self._persist_run_summary_artifacts(
             run_rows=run_rows,
@@ -835,8 +1038,8 @@ def main():
     parser.add_argument('--chunk-size', type=int, default=500, help='Text chunk size')
     parser.add_argument('--chunk-overlap', type=int, default=100, help='Chunk overlap size')
     parser.add_argument('--batch-size', type=int, default=50, help='Batch size for processing')
-    parser.add_argument('--update-mode', choices=['skip', 'update', 'replace'], default='skip',
-                       help='How to handle existing documents: skip, update, or replace')
+    parser.add_argument('--update-mode', choices=['skip', 'update', 'replace', 'incremental'], default='incremental',
+                       help='How to handle existing documents: skip, update, replace, or incremental (manifest-based)')
     parser.add_argument('--test-query', help='Test query after processing')
     parser.add_argument('--stats-only', action='store_true', help='Only show collection statistics')
     parser.add_argument('--delete-source', help='Delete all documents from a specific source pattern')
@@ -873,7 +1076,11 @@ def main():
     logger.info(f"Starting text data processing with update mode: {args.update_mode}")
     start_time = time.time()
     
-    stats = pipeline.process_all_text_data(args.data_path, update_mode=args.update_mode)
+    stats = pipeline.process_all_text_data(
+        args.data_path,
+        update_mode=args.update_mode,
+        batch_size=args.batch_size,
+    )
     
     end_time = time.time()
     processing_time = end_time - start_time
