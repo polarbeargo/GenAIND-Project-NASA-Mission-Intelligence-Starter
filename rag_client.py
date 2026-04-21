@@ -1,5 +1,6 @@
 import os
 from threading import Lock
+import re
 
 import chromadb
 import logging
@@ -26,6 +27,89 @@ _CHROMA_CLIENT_CACHE_HITS = 0
 _CHROMA_CLIENT_CACHE_MISSES = 0
 _EMBEDDING_FN_CACHE_HITS = 0
 _EMBEDDING_FN_CACHE_MISSES = 0
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+def _get_first_pass_multiplier() -> int:
+    """Return candidate expansion factor for first-pass retrieval."""
+    try:
+        value = int(os.getenv("RETRIEVAL_FIRST_PASS_MULTIPLIER", "4"))
+    except ValueError:
+        value = 4
+    return max(1, min(value, 8))
+
+
+def _get_first_pass_max_candidates() -> int:
+    """Return hard cap for first-pass candidate set size."""
+    try:
+        value = int(os.getenv("RETRIEVAL_FIRST_PASS_MAX_CANDIDATES", "24"))
+    except ValueError:
+        value = 24
+    return max(1, min(value, 100))
+
+
+def _tokenize_for_rerank(text: str) -> set[str]:
+    """Tokenize text into lowercase alphanumeric terms for overlap scoring."""
+    return set(_TOKEN_PATTERN.findall((text or "").lower()))
+
+
+def _rerank_documents(query: str, results: Dict[str, Any], keep_n: int) -> Dict[str, Any]:
+    """Rerank first-pass candidates using lexical overlap + vector distance signal."""
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    distances = (results.get("distances") or [[]])[0]
+    ids = (results.get("ids") or [[]])[0]
+
+    if not documents or keep_n <= 0 or len(documents) <= keep_n:
+        return results
+
+    query_tokens = _tokenize_for_rerank(query)
+    safe_query_size = max(1, len(query_tokens))
+
+    numeric_distances = [float(distance) for distance in distances[: len(documents)]] if distances else []
+    if numeric_distances:
+        min_distance = min(numeric_distances)
+        max_distance = max(numeric_distances)
+        denom = max(max_distance - min_distance, 1e-12)
+    else:
+        min_distance = 0.0
+        max_distance = 0.0
+        denom = 1.0
+
+    scored: List[tuple[float, int]] = []
+    for idx, document in enumerate(documents):
+        doc_tokens = _tokenize_for_rerank(document)
+        lexical_overlap = len(query_tokens & doc_tokens) / safe_query_size
+
+        phrase_bonus = 0.1 if (query and query.lower() in (document or "").lower()) else 0.0
+        lexical_score = min(1.0, lexical_overlap + phrase_bonus)
+
+        if numeric_distances and idx < len(numeric_distances):
+            # Lower vector distance means better semantic match.
+            distance_similarity = (max_distance - numeric_distances[idx]) / denom
+        else:
+            distance_similarity = 0.5
+
+        # Favor lexical precision slightly to improve groundedness on mission fact queries.
+        final_score = (0.65 * lexical_score) + (0.35 * distance_similarity)
+        scored.append((final_score, idx))
+
+    # Stable deterministic ordering: score desc, original index asc.
+    ranked_indices = [idx for _, idx in sorted(scored, key=lambda item: (-item[0], item[1]))[:keep_n]]
+
+    reranked_documents = [documents[idx] for idx in ranked_indices]
+    reranked_metadatas = [metadatas[idx] if idx < len(metadatas) else {} for idx in ranked_indices]
+    reranked_distances = [distances[idx] for idx in ranked_indices] if distances else []
+    reranked_ids = [ids[idx] for idx in ranked_indices] if ids else []
+
+    updated = dict(results)
+    updated["documents"] = [reranked_documents]
+    updated["metadatas"] = [reranked_metadatas]
+    if distances:
+        updated["distances"] = [reranked_distances]
+    if ids:
+        updated["ids"] = [reranked_ids]
+    return updated
 
 
 def _get_persistent_client(chroma_dir: str) -> chromadb.PersistentClient:
@@ -182,7 +266,7 @@ def retrieve_documents(
     mission_filter: Optional[str] = None,
     chroma_dir: Optional[str] = None,
 ) -> Optional[Dict]:
-    """Retrieve relevant documents from ChromaDB with security validation (LLM08)."""
+    """Retrieve documents with two-stage retrieval + local reranking (LLM08-aware)."""
     
 
 
@@ -203,16 +287,24 @@ def retrieve_documents(
         normalized_mission = mission_filter.strip().lower().replace(" ", "_")
         where_filter = {"mission": normalized_mission}
 
+    requested_n = max(1, int(n_results))
+    first_pass_n = max(
+        requested_n,
+        min(requested_n * _get_first_pass_multiplier(), _get_first_pass_max_candidates()),
+    )
+
     results = collection.query(
         query_texts=[query],
-        n_results=n_results,
+        n_results=first_pass_n,
         where=where_filter
     )
+
+    results = _rerank_documents(query=query, results=results, keep_n=requested_n)
     
     if VectorSecurityValidator and results and results.get("documents"):
         poisoning_check = VectorSecurityValidator.detect_poisoned_results(
             results["documents"][0] if results.get("documents") else [],
-            results["metadatas"][0] if results.get("metadatas") else [{} for _ in range(n_results)],
+            results["metadatas"][0] if results.get("metadatas") else [{} for _ in range(requested_n)],
         )
         if poisoning_check:
             logger.warning(f"Potentially poisoned results detected: {poisoning_check}")
