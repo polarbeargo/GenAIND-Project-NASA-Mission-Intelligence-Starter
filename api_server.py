@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from env_utils import load_project_env
-from fastapi import FastAPI, HTTPException, status, Request
+from fastapi import FastAPI, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -225,6 +225,71 @@ def _get_stage_sli_log_path() -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path
+
+
+def _prometheus_escape_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
+    """Render worker-pool saturation metrics in Prometheus exposition format."""
+    lines: List[str] = [
+        "# HELP nasa_worker_pool_max_workers Configured max workers per stage.",
+        "# TYPE nasa_worker_pool_max_workers gauge",
+        "# HELP nasa_worker_pool_queue_limit Configured queue size limit per stage.",
+        "# TYPE nasa_worker_pool_queue_limit gauge",
+        "# HELP nasa_worker_pool_capacity Total bounded capacity (workers + queue) per stage.",
+        "# TYPE nasa_worker_pool_capacity gauge",
+        "# HELP nasa_worker_pool_inflight Current in-flight tasks per stage.",
+        "# TYPE nasa_worker_pool_inflight gauge",
+        "# HELP nasa_worker_pool_queued_estimate Estimated queued tasks per stage.",
+        "# TYPE nasa_worker_pool_queued_estimate gauge",
+        "# HELP nasa_worker_pool_submitted_total Cumulative submitted tasks per stage.",
+        "# TYPE nasa_worker_pool_submitted_total counter",
+        "# HELP nasa_worker_pool_completed_total Cumulative completed tasks per stage.",
+        "# TYPE nasa_worker_pool_completed_total counter",
+        "# HELP nasa_worker_pool_rejected_total Cumulative rejected submissions per stage.",
+        "# TYPE nasa_worker_pool_rejected_total counter",
+        "# HELP nasa_worker_pool_queue_depth_ratio Queue depth ratio (queued_estimate / queue_limit).",
+        "# TYPE nasa_worker_pool_queue_depth_ratio gauge",
+        "# HELP nasa_worker_pool_utilization_ratio Capacity utilization ratio (inflight / capacity).",
+        "# TYPE nasa_worker_pool_utilization_ratio gauge",
+        "# HELP nasa_worker_pool_generated_at_ms Report generation epoch milliseconds.",
+        "# TYPE nasa_worker_pool_generated_at_ms gauge",
+    ]
+
+    workers = report.get("workers", {})
+    for stage, snapshot in workers.items():
+        label = _prometheus_escape_label(str(stage))
+        max_workers = float(snapshot.get("max_workers", 0))
+        queue_limit = float(snapshot.get("queue_limit", 0))
+        capacity = float(snapshot.get("capacity", 0))
+        inflight = float(snapshot.get("inflight", 0))
+        queued_estimate = float(snapshot.get("queued_estimate", 0))
+        submitted = float(snapshot.get("submitted", 0))
+        completed = float(snapshot.get("completed", 0))
+        rejected = float(snapshot.get("rejected", 0))
+        queue_ratio = (queued_estimate / queue_limit) if queue_limit > 0 else 0.0
+        util_ratio = (inflight / capacity) if capacity > 0 else 0.0
+
+        lines.extend(
+            [
+                f'nasa_worker_pool_max_workers{{stage="{label}"}} {max_workers}',
+                f'nasa_worker_pool_queue_limit{{stage="{label}"}} {queue_limit}',
+                f'nasa_worker_pool_capacity{{stage="{label}"}} {capacity}',
+                f'nasa_worker_pool_inflight{{stage="{label}"}} {inflight}',
+                f'nasa_worker_pool_queued_estimate{{stage="{label}"}} {queued_estimate}',
+                f'nasa_worker_pool_submitted_total{{stage="{label}"}} {submitted}',
+                f'nasa_worker_pool_completed_total{{stage="{label}"}} {completed}',
+                f'nasa_worker_pool_rejected_total{{stage="{label}"}} {rejected}',
+                f'nasa_worker_pool_queue_depth_ratio{{stage="{label}"}} {queue_ratio:.6f}',
+                f'nasa_worker_pool_utilization_ratio{{stage="{label}"}} {util_ratio:.6f}',
+            ]
+        )
+
+    generated_at_ms = float(report.get("generated_at_ms", 0))
+    lines.append(f"nasa_worker_pool_generated_at_ms {generated_at_ms}")
+    return "\n".join(lines) + "\n"
 
 class CacheStats:
     """Track cache performance metrics for monitoring."""
@@ -710,6 +775,14 @@ def monitoring_latency_sli() -> Dict[str, Any]:
 def monitoring_worker_pools() -> Dict[str, Any]:
     """Return bounded stage worker-pool utilization and saturation counters."""
     return chat_workflow.get_worker_pool_report()
+
+
+@app.get("/monitoring/worker-pools/prometheus", response_class=Response)
+def monitoring_worker_pools_prometheus() -> Response:
+    """Return worker-pool saturation metrics in Prometheus text format."""
+    report = chat_workflow.get_worker_pool_report()
+    payload = _format_worker_pool_prometheus(report)
+    return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/monitoring/latency-sli/timeseries")
