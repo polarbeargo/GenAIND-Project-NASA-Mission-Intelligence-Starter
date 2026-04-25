@@ -103,6 +103,30 @@ def _get_stage_timeout_seconds(name: str, default: float, min_value: float, max_
     return max(min_value, min(configured, max_value))
 
 
+def _get_stage_worker_count(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, 64))
+
+
+def _get_stage_queue_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, 5000))
+
+
+def _get_stage_submit_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("STAGE_QUEUE_SUBMIT_TIMEOUT_SECONDS", "0.05"))
+    except ValueError:
+        value = 0.05
+    return max(0.0, min(value, 5.0))
+
+
 def _get_breaker_failure_threshold() -> int:
     try:
         value = int(os.getenv("STAGE_BREAKER_FAILURE_THRESHOLD", "3"))
@@ -376,6 +400,17 @@ chat_workflow = MultiAgentChatWorkflow(
     retrieval_budget_ms=_get_latency_budget_ms("RETRIEVAL_BUDGET_MS", 700.0),
     generation_budget_ms=_get_latency_budget_ms("GENERATION_BUDGET_MS", 1800.0),
     evaluation_mode=_get_evaluation_mode(),
+    safety_workers=_get_stage_worker_count("SAFETY_WORKERS", 2),
+    retrieval_workers=_get_stage_worker_count("RETRIEVAL_WORKERS", 4),
+    generation_workers=_get_stage_worker_count("GENERATION_WORKERS", 4),
+    judge_workers=_get_stage_worker_count("JUDGE_WORKERS", 2),
+    evaluation_workers=_get_stage_worker_count("EVALUATION_WORKERS", 2),
+    safety_queue_limit=_get_stage_queue_limit("SAFETY_QUEUE_LIMIT", 200),
+    retrieval_queue_limit=_get_stage_queue_limit("RETRIEVAL_QUEUE_LIMIT", 200),
+    generation_queue_limit=_get_stage_queue_limit("GENERATION_QUEUE_LIMIT", 200),
+    judge_queue_limit=_get_stage_queue_limit("JUDGE_QUEUE_LIMIT", 100),
+    evaluation_queue_limit=_get_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 200),
+    queue_submit_timeout_seconds=_get_stage_submit_timeout_seconds(),
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),
         retention_hours=_get_stage_sli_retention_hours(),
@@ -669,6 +704,12 @@ def monitoring_client_caches() -> Dict[str, Any]:
 def monitoring_latency_sli() -> Dict[str, Any]:
     """Return per-stage latency SLIs with budget compliance and timeout rate."""
     return chat_workflow.get_latency_sli_report()
+
+
+@app.get("/monitoring/worker-pools")
+def monitoring_worker_pools() -> Dict[str, Any]:
+    """Return bounded stage worker-pool utilization and saturation counters."""
+    return chat_workflow.get_worker_pool_report()
 
 
 @app.get("/monitoring/latency-sli/timeseries")

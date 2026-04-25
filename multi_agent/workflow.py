@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
-from threading import Lock
+from threading import Lock, Semaphore
 from typing import Any, Dict
 
 import rag_client
@@ -117,6 +117,80 @@ class StageSLITracker:
         }
 
 
+class StageOverloadError(RuntimeError):
+    """Raised when a stage queue is saturated and cannot accept more work."""
+
+
+class BoundedExecutor:
+    """ThreadPoolExecutor wrapper with bounded in-flight + queued tasks.
+
+    The semaphore enforces backpressure so high-latency downstream calls cannot
+    create unbounded queue growth under burst traffic.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        queue_limit: int,
+        submit_timeout_seconds: float,
+        thread_name_prefix: str,
+    ):
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix=thread_name_prefix,
+        )
+        self.max_workers = max(1, int(max_workers))
+        self.queue_limit = max(1, int(queue_limit))
+        self.capacity = self.max_workers + self.queue_limit
+        self.submit_timeout_seconds = max(0.0, float(submit_timeout_seconds))
+        self._permits = Semaphore(self.capacity)
+        self._inflight = 0
+        self._submitted = 0
+        self._completed = 0
+        self._rejected = 0
+        self._lock = Lock()
+
+    def submit(self, fn, *args, **kwargs):
+        acquired = self._permits.acquire(timeout=self.submit_timeout_seconds)
+        if not acquired:
+            with self._lock:
+                self._rejected += 1
+            raise StageOverloadError("stage queue is saturated")
+
+        with self._lock:
+            self._submitted += 1
+            self._inflight += 1
+
+        future = self._executor.submit(fn, *args, **kwargs)
+
+        def _release(_future):
+            self._permits.release()
+            with self._lock:
+                self._inflight = max(0, self._inflight - 1)
+                self._completed += 1
+
+        future.add_done_callback(_release)
+        return future
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            queued = max(0, self._inflight - self.max_workers)
+            return {
+                "max_workers": self.max_workers,
+                "queue_limit": self.queue_limit,
+                "capacity": self.capacity,
+                "inflight": self._inflight,
+                "queued_estimate": queued,
+                "submitted": self._submitted,
+                "completed": self._completed,
+                "rejected": self._rejected,
+            }
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
 class MultiAgentChatWorkflow:
     """Coordinates retrieval, safety, and analysis workers."""
 
@@ -155,6 +229,17 @@ class MultiAgentChatWorkflow:
         evaluation_mode: str = "async",
         evaluation_buffer_size: int = 500,
         stage_event_store: StageLatencyEventStore | None = None,
+        safety_workers: int = 2,
+        retrieval_workers: int = 4,
+        generation_workers: int = 4,
+        judge_workers: int = 2,
+        evaluation_workers: int = 2,
+        safety_queue_limit: int = 200,
+        retrieval_queue_limit: int = 200,
+        generation_queue_limit: int = 200,
+        judge_queue_limit: int = 100,
+        evaluation_queue_limit: int = 200,
+        queue_submit_timeout_seconds: float = 0.05,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -179,9 +264,36 @@ class MultiAgentChatWorkflow:
             sensitive_info_filter=sensitive_info_filter,
             judge_timeout_seconds=judge_timeout_seconds,
         )
-        self._io_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nasa-io-worker")
-        self._judge_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-judge-worker")
-        self._eval_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nasa-eval-worker")
+        self._safety_executor = BoundedExecutor(
+            max_workers=safety_workers,
+            queue_limit=safety_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-safety-worker",
+        )
+        self._retrieval_executor = BoundedExecutor(
+            max_workers=retrieval_workers,
+            queue_limit=retrieval_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-retrieval-worker",
+        )
+        self._generation_executor = BoundedExecutor(
+            max_workers=generation_workers,
+            queue_limit=generation_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-generation-worker",
+        )
+        self._judge_executor = BoundedExecutor(
+            max_workers=judge_workers,
+            queue_limit=judge_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-judge-worker",
+        )
+        self._eval_executor = BoundedExecutor(
+            max_workers=evaluation_workers,
+            queue_limit=evaluation_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-eval-worker",
+        )
         self._judge_results = deque(maxlen=200)
         self._evaluation_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._judge_lock = Lock()
@@ -274,11 +386,28 @@ class MultiAgentChatWorkflow:
                 retrieval_failure_reason = "retrieval circuit breaker open"
             else:
                 retrieval_started = time.perf_counter()
-                retrieval_future = self._io_executor.submit(self.retrieval_worker.run, effective_input)
+                try:
+                    retrieval_future = self._retrieval_executor.submit(self.retrieval_worker.run, effective_input)
+                except StageOverloadError:
+                    retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                    retrieval_failed = True
+                    retrieval_failure_reason = "retrieval queue saturated"
+                    self._record_stage_metric(
+                        "retrieval",
+                        latency_ms=0.0,
+                        timed_out=False,
+                        status="overload",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
             preflight_started = time.perf_counter()
-            preflight_future = self._io_executor.submit(self.safety_worker.preflight, workflow_input)
+            try:
+                preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
+            except StageOverloadError as error:
+                raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
 
-            preflight_result = preflight_future.result()
+            preflight_result = self._await_result(preflight_future)
             preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
             self._record_stage_metric(
                 "preflight",
@@ -291,7 +420,7 @@ class MultiAgentChatWorkflow:
             )
             if retrieval_result is None:
                 try:
-                    retrieval_result = retrieval_future.result(timeout=self._retrieval_timeout_seconds)
+                    retrieval_result = self._await_result(retrieval_future, timeout=self._retrieval_timeout_seconds)
                     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
                     self._record_stage_metric(
                         "retrieval",
@@ -344,7 +473,11 @@ class MultiAgentChatWorkflow:
                     logging.getLogger(__name__).warning("Retrieval failed, using fallback: %s", retrieval_failure_reason)
         else:
             preflight_started = time.perf_counter()
-            preflight_result = self.safety_worker.preflight(workflow_input)
+            try:
+                preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
+                preflight_result = self._await_result(preflight_future)
+            except StageOverloadError as error:
+                raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
             preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
             self._record_stage_metric(
                 "preflight",
@@ -416,13 +549,13 @@ class MultiAgentChatWorkflow:
             else:
                 generation_started = time.perf_counter()
                 try:
-                    generation_future = self._io_executor.submit(
+                    generation_future = self._generation_executor.submit(
                         self.analysis_worker.generate_answer,
                         openai_key,
                         effective_input,
                         retrieval_result.context_text,
                     )
-                    answer = generation_future.result(timeout=self._generation_timeout_seconds)
+                    answer = self._await_result(generation_future, timeout=self._generation_timeout_seconds)
                     generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
                     self._record_stage_metric(
                         "generation",
@@ -451,24 +584,40 @@ class MultiAgentChatWorkflow:
                         "Please retry in a moment."
                     )
                 except Exception as error:
-                    self._generation_breaker.record_failure()
-                    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
-                    self._record_stage_metric(
-                        "generation",
-                        generation_latency_ms,
-                        timed_out=False,
-                        status="error",
-                        mission=effective_input.mission_filter,
-                        backend=backend_name,
-                        model=effective_input.model,
-                    )
-                    logging.getLogger(__name__).warning(
-                        "Generation failed, returning fallback: %s", str(error)[:120]
-                    )
-                    answer = (
-                        "I can help with NASA mission questions, but answer generation is temporarily "
-                        "unavailable. Please retry shortly."
-                    )
+                    if isinstance(error, StageOverloadError):
+                        self._record_stage_metric(
+                            "generation",
+                            latency_ms=0.0,
+                            timed_out=False,
+                            status="overload",
+                            mission=effective_input.mission_filter,
+                            backend=backend_name,
+                            model=effective_input.model,
+                        )
+                        answer = (
+                            "I can help with NASA mission questions, but generation capacity is saturated. "
+                            "Please retry shortly."
+                        )
+                        self._generation_breaker.record_failure()
+                    else:
+                        self._generation_breaker.record_failure()
+                        generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+                        self._record_stage_metric(
+                            "generation",
+                            generation_latency_ms,
+                            timed_out=False,
+                            status="error",
+                            mission=effective_input.mission_filter,
+                            backend=backend_name,
+                            model=effective_input.model,
+                        )
+                        logging.getLogger(__name__).warning(
+                            "Generation failed, returning fallback: %s", str(error)[:120]
+                        )
+                        answer = (
+                            "I can help with NASA mission questions, but answer generation is temporarily "
+                            "unavailable. Please retry shortly."
+                        )
 
             answer = self.safety_worker.postflight(
                 answer=answer,
@@ -498,25 +647,39 @@ class MultiAgentChatWorkflow:
                 "source": "disabled",
             }
         elif judge_mode == "async":
-            self._judge_executor.submit(
-                self._run_async_judge,
-                openai_key,
-                effective_input,
-                answer,
-                retrieval_result.contexts,
-            )
-            judge = {
-                "status": "pending",
-                "groundedness_score": None,
-                "safety_score": None,
-                "task_success_score": None,
-                "overall_score": None,
-                "confidence": None,
-                "passed": True,
-                "low_confidence": True,
-                "source": "async",
-                "rationale": "Judge running asynchronously.",
-            }
+            try:
+                self._judge_executor.submit(
+                    self._run_async_judge,
+                    openai_key,
+                    effective_input,
+                    answer,
+                    retrieval_result.contexts,
+                )
+                judge = {
+                    "status": "pending",
+                    "groundedness_score": None,
+                    "safety_score": None,
+                    "task_success_score": None,
+                    "overall_score": None,
+                    "confidence": None,
+                    "passed": True,
+                    "low_confidence": True,
+                    "source": "async",
+                    "rationale": "Judge running asynchronously.",
+                }
+            except StageOverloadError:
+                judge = {
+                    "status": "skipped",
+                    "groundedness_score": None,
+                    "safety_score": None,
+                    "task_success_score": None,
+                    "overall_score": None,
+                    "confidence": None,
+                    "passed": True,
+                    "low_confidence": True,
+                    "source": "overload",
+                    "rationale": "Judge skipped due to queue saturation.",
+                }
         else:
             judge = self.judge_worker.judge(
                 openai_key=openai_key,
@@ -560,13 +723,13 @@ class MultiAgentChatWorkflow:
                 return {}
             started = time.perf_counter()
             try:
-                eval_future = self._io_executor.submit(
+                eval_future = self._eval_executor.submit(
                     self.analysis_worker.evaluate,
                     workflow_input,
                     answer,
                     contexts,
                 )
-                result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+                result = self._await_result(eval_future, timeout=self._evaluation_timeout_seconds)
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 self._record_stage_metric(
                     "evaluation",
@@ -656,13 +819,13 @@ class MultiAgentChatWorkflow:
             self._record_evaluation_job(job_id, payload)
             return
         try:
-            eval_future = self._io_executor.submit(
+            eval_future = self._eval_executor.submit(
                 self.analysis_worker.evaluate,
                 workflow_input,
                 answer,
                 contexts,
             )
-            result = eval_future.result(timeout=self._evaluation_timeout_seconds)
+            result = self._await_result(eval_future, timeout=self._evaluation_timeout_seconds)
             latency_ms = (time.perf_counter() - started) * 1000.0
             self._record_stage_metric(
                 "evaluation",
@@ -846,9 +1009,24 @@ class MultiAgentChatWorkflow:
 
     def shutdown(self) -> None:
         """Stop background executors used by the workflow."""
-        self._io_executor.shutdown(wait=False, cancel_futures=False)
+        self._safety_executor.shutdown(wait=False, cancel_futures=False)
+        self._retrieval_executor.shutdown(wait=False, cancel_futures=False)
+        self._generation_executor.shutdown(wait=False, cancel_futures=False)
         self._judge_executor.shutdown(wait=False, cancel_futures=False)
         self._eval_executor.shutdown(wait=False, cancel_futures=False)
+
+    def get_worker_pool_report(self) -> Dict[str, Any]:
+        """Return bounded worker-pool saturation metrics for autoscaling decisions."""
+        return {
+            "generated_at_ms": round(time.time() * 1000),
+            "workers": {
+                "safety": self._safety_executor.snapshot(),
+                "retrieval": self._retrieval_executor.snapshot(),
+                "generation": self._generation_executor.snapshot(),
+                "judge": self._judge_executor.snapshot(),
+                "evaluation": self._eval_executor.snapshot(),
+            },
+        }
 
     def __del__(self):
         # Best-effort cleanup for interpreter shutdown paths.
@@ -862,6 +1040,14 @@ class MultiAgentChatWorkflow:
         """Normalize query text for cache keys."""
         collapsed = re.sub(r"\s+", " ", (text or "").strip().lower())
         return collapsed
+
+    @staticmethod
+    def _await_result(submission: Any, timeout: float | None = None):
+        """Return executor submission result, supporting direct-value test stubs."""
+        result_fn = getattr(submission, "result", None)
+        if callable(result_fn):
+            return result_fn(timeout=timeout)
+        return submission
 
     def _retrieval_cache_key(self, workflow_input: ChatWorkflowInput) -> str:
         normalized_question = self._normalize_query(workflow_input.question)
