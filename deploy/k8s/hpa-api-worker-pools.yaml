@@ -1,0 +1,75 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nasa-mission-intelligence-api
+  labels:
+    app.kubernetes.io/name: nasa-mission-intelligence-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nasa-mission-intelligence-api
+  minReplicas: 2
+  maxReplicas: 20
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+      - type: Percent
+        value: 30
+        periodSeconds: 60
+  metrics:
+  # Requires Prometheus Adapter custom metrics API mapping.
+  # Example metric mapping target:
+  # nasa_worker_pool_queue_depth_ratio{stage="retrieval"}
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_queue_depth_ratio
+        selector:
+          matchLabels:
+            stage: retrieval
+      target:
+        type: AverageValue
+        averageValue: "0.60"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_queue_depth_ratio
+        selector:
+          matchLabels:
+            stage: generation
+      target:
+        type: AverageValue
+        averageValue: "0.60"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_utilization_ratio
+        selector:
+          matchLabels:
+            stage: retrieval
+      target:
+        type: AverageValue
+        averageValue: "0.75"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_rejected_total
+        selector:
+          matchLabels:
+            stage: retrieval
+      target:
+        type: AverageValue
+        averageValue: "1"
