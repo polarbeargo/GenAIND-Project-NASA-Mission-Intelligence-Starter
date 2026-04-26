@@ -161,6 +161,17 @@ class TestChatContractAPI(unittest.TestCase):
             self.assertIn("timeout_rate", workers[name])
             self.assertIn("budget_ms", workers[name])
 
+    def test_monitoring_worker_pools_prometheus_contract(self):
+        response = self.client.get("/monitoring/worker-pools/prometheus")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/plain", response.headers.get("content-type", ""))
+        body = response.text
+        self.assertIn("# TYPE nasa_worker_pool_inflight gauge", body)
+        self.assertIn('nasa_worker_pool_inflight{stage="retrieval"}', body)
+        self.assertIn('nasa_worker_pool_queue_depth_ratio{stage="generation"}', body)
+        self.assertIn("nasa_worker_pool_generated_at_ms", body)
+
     def test_monitoring_latency_sli_timeseries_contract(self):
         response = self.client.get("/monitoring/latency-sli/timeseries")
 
