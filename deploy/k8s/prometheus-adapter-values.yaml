@@ -1,0 +1,53 @@
+prometheus:
+  # Adjust if your Prometheus service name/namespace differs.
+  url: http://prometheus-kube-prometheus-prometheus.monitoring.svc
+  port: 9090
+  path: ""
+
+rules:
+  default: false
+  custom:
+    - seriesQuery: 'nasa_worker_pool_queue_depth_ratio{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_queue_depth_ratio$"
+        as: "nasa_worker_pool_queue_depth_ratio"
+      metricsQuery: >-
+        avg by (<<.GroupBy>>, stage) (
+          nasa_worker_pool_queue_depth_ratio{<<.LabelMatchers>>}
+        )
+
+    - seriesQuery: 'nasa_worker_pool_utilization_ratio{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_utilization_ratio$"
+        as: "nasa_worker_pool_utilization_ratio"
+      metricsQuery: >-
+        avg by (<<.GroupBy>>, stage) (
+          nasa_worker_pool_utilization_ratio{<<.LabelMatchers>>}
+        )
+
+    - seriesQuery: 'nasa_worker_pool_rejected_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_rejected_total$"
+        as: "nasa_worker_pool_rejected_total"
+      metricsQuery: >-
+        sum by (<<.GroupBy>>, stage) (
+          increase(nasa_worker_pool_rejected_total{<<.LabelMatchers>>}[2m])
+        )
