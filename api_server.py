@@ -785,6 +785,12 @@ def monitoring_worker_pools_prometheus() -> Response:
     return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+@app.get("/monitoring/cache/stats")
+def monitoring_cache_stats() -> Dict[str, Any]:
+    """Return workflow L1 and L2 cache statistics."""
+    return chat_workflow.get_cache_stats()
+
+
 @app.get("/monitoring/latency-sli/timeseries")
 def monitoring_latency_sli_timeseries(
     stage: Optional[str] = None,

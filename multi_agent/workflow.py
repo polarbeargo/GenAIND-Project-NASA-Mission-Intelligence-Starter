@@ -11,10 +11,13 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
 from threading import Lock, Semaphore
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import rag_client
 from monitoring.stage_sli_events import StageLatencyEventStore
+from infra.redis_cache import RedisL2Cache
+from infra.redis_job_store import RedisAsyncJobStore
+from infra.redis_client import get_redis_client
 from multi_agent.context_compression import (
     CompressionConfig,
     ContextCompressor,
@@ -305,6 +308,17 @@ class MultiAgentChatWorkflow:
         self._retrieval_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
         self._answer_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_lock = Lock()
+        
+        # Redis L2 cache: shared across pods, fallback gracefully if unavailable
+        redis_client = get_redis_client()
+        self._redis_l2_cache = RedisL2Cache(
+            redis_client,
+            retrieval_ttl_seconds=self._retrieval_cache_ttl,
+            response_ttl_seconds=self._answer_cache_ttl,
+        )
+        
+        # Redis async job store: track judge/evaluation results shared across pods
+        self._redis_job_store = RedisAsyncJobStore(redis_client, retention_ttl_seconds=3600)
         self._retrieval_depth_policy = retrieval_depth_policy or HeuristicRetrievalDepthPolicy(
             HeuristicRetrievalDepthConfig(
                 factoid_n_results=max(1, int(factoid_n_results)),
@@ -375,7 +389,26 @@ class MultiAgentChatWorkflow:
         retrieval_key = self._retrieval_cache_key(effective_input)
         answer_key = self._answer_cache_key(effective_input)
 
+        # L1 cache (in-process):
         retrieval_result = self._cache_get(self._retrieval_cache, retrieval_key)
+        
+        # L2 cache (Redis) if L1 miss:
+        if retrieval_result is None:
+            retrieval_result = self._redis_l2_cache.get_retrieval(
+                effective_input.question,
+                effective_input.mission_filter,
+                effective_input.collection_name,
+            )
+            if retrieval_result is not None:
+                # Populate L1 on L2 hit
+                self._cache_set(
+                    self._retrieval_cache,
+                    retrieval_key,
+                    retrieval_result,
+                    ttl_seconds=self._retrieval_cache_ttl,
+                    max_entries=self._retrieval_cache_max_entries,
+                )
+        
         retrieval_failed = False
         retrieval_failure_reason = ""
 
@@ -438,6 +471,16 @@ class MultiAgentChatWorkflow:
                         retrieval_result,
                         ttl_seconds=self._retrieval_cache_ttl,
                         max_entries=self._retrieval_cache_max_entries,
+                    )
+                    # Also set in L2 (Redis) for cross-pod sharing
+                    self._redis_l2_cache.set_retrieval(
+                        effective_input.question,
+                        effective_input.mission_filter,
+                        effective_input.collection_name,
+                        [
+                            {"context": c, "metadata": m}
+                            for c, m in zip(retrieval_result.contexts, retrieval_result.metadatas)
+                        ],
                     )
                 except TimeoutError:
                     self._retrieval_breaker.record_failure()
@@ -541,6 +584,24 @@ class MultiAgentChatWorkflow:
 
         answer = self._cache_get(self._answer_cache, answer_key)
         if answer is None:
+            # L2 cache (Redis) if L1 miss:
+            answer = self._redis_l2_cache.get_response(
+                effective_input.question,
+                effective_input.mission_filter,
+                effective_input.model,
+                effective_input.evaluate,
+            )
+            if answer is not None:
+                # Populate L1 on L2 hit
+                self._cache_set(
+                    self._answer_cache,
+                    answer_key,
+                    answer,
+                    ttl_seconds=self._answer_cache_ttl,
+                    max_entries=self._answer_cache_max_entries,
+                )
+        
+        if answer is None:
             if not self._generation_breaker.allow():
                 answer = (
                     "I can help with NASA mission questions, but answer generation is temporarily "
@@ -631,6 +692,15 @@ class MultiAgentChatWorkflow:
                 answer,
                 ttl_seconds=self._answer_cache_ttl,
                 max_entries=self._answer_cache_max_entries,
+            )
+            
+            # Also set in L2 (Redis) for cross-pod sharing
+            self._redis_l2_cache.set_response(
+                effective_input.question,
+                effective_input.mission_filter,
+                effective_input.model,
+                effective_input.evaluate,
+                answer,
             )
 
         judge_mode = (workflow_input.judge_mode or "async").lower()
@@ -877,18 +947,25 @@ class MultiAgentChatWorkflow:
             logging.getLogger(__name__).warning("Async evaluation failed: %s", str(error)[:120])
 
     def _record_evaluation_job(self, job_id: str, payload: Dict[str, Any]) -> None:
+        # Store in L1 (in-process)
         with self._evaluation_lock:
             self._evaluation_results[job_id] = payload
             self._evaluation_results.move_to_end(job_id)
             while len(self._evaluation_results) > self._evaluation_buffer_size:
                 self._evaluation_results.popitem(last=False)
+        
+        # Also store in L2 (Redis) for cross-pod access
+        self._redis_job_store.set_result(job_id, payload)
 
     def get_evaluation_job(self, job_id: str) -> Dict[str, Any] | None:
+        # Try L1 first
         with self._evaluation_lock:
             payload = self._evaluation_results.get(job_id)
-            if payload is None:
-                return None
-            return dict(payload)
+            if payload is not None:
+                return dict(payload)
+        
+        # Fall back to L2 (Redis)
+        return self._redis_job_store.get_result(job_id)
 
     def get_recent_evaluation_jobs(self, limit: int = 20):
         safe_limit = max(1, min(limit, self._evaluation_buffer_size))
@@ -905,6 +982,11 @@ class MultiAgentChatWorkflow:
         contexts,
     ) -> None:
         started = time.perf_counter()
+        judge_job_id = str(uuid.uuid4())
+        
+        # Create job entry in Redis
+        self._redis_job_store.create_job(judge_job_id, "judge", str(uuid.uuid4()))
+        
         try:
             result = self.judge_worker.judge(
                 openai_key=openai_key,
@@ -914,14 +996,21 @@ class MultiAgentChatWorkflow:
             )
             latency_ms = (time.perf_counter() - started) * 1000.0
             payload = {
+                "job_id": judge_job_id,
                 "timestamp_ms": round(time.time() * 1000),
                 "question": workflow_input.question,
                 "client_ip": workflow_input.client_ip,
                 "judge": result,
                 "latency_ms": round(latency_ms, 2),
             }
+            
+            # Store in L1 (in-process)
             with self._judge_lock:
                 self._judge_results.appendleft(payload)
+            
+            # Store in L2 (Redis)
+            self._redis_job_store.set_result(judge_job_id, payload)
+            
             logging.getLogger(__name__).info(
                 "Async judge completed: passed=%s low_confidence=%s overall=%s",
                 result.get("passed"),
@@ -931,6 +1020,7 @@ class MultiAgentChatWorkflow:
         except Exception as error:
             latency_ms = (time.perf_counter() - started) * 1000.0
             payload = {
+                "job_id": judge_job_id,
                 "timestamp_ms": round(time.time() * 1000),
                 "question": workflow_input.question,
                 "client_ip": workflow_input.client_ip,
@@ -943,8 +1033,14 @@ class MultiAgentChatWorkflow:
                 },
                 "latency_ms": round(latency_ms, 2),
             }
+            
+            # Store in L1 (in-process)
             with self._judge_lock:
                 self._judge_results.appendleft(payload)
+            
+            # Store in L2 (Redis)
+            self._redis_job_store.set_result(judge_job_id, payload)
+            
             logging.getLogger(__name__).warning("Async judge failed: %s", str(error)[:120])
 
     def get_last_judge_result(self):
@@ -1026,6 +1122,21 @@ class MultiAgentChatWorkflow:
                 "judge": self._judge_executor.snapshot(),
                 "evaluation": self._eval_executor.snapshot(),
             },
+        }
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return cache performance metrics for both L1 and L2."""
+        return {
+            "generated_at_ms": round(time.time() * 1000),
+            "l1_retrieval": {
+                "entries": len(self._retrieval_cache),
+                "max_entries": self._retrieval_cache_max_entries,
+            },
+            "l1_answer": {
+                "entries": len(self._answer_cache),
+                "max_entries": self._answer_cache_max_entries,
+            },
+            "l2_redis": self._redis_l2_cache.stats(),
         }
 
     def __del__(self):
