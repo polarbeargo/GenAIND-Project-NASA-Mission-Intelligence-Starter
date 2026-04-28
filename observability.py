@@ -25,10 +25,11 @@ try:
 except Exception:
     OpenAIInstrumentor = None
 
-try:
-    from phoenix.otel import register as phoenix_register
-except Exception:
-    phoenix_register = None
+# phoenix.otel is imported lazily inside init_telemetry() only when PHOENIX_ENDPOINT
+# is configured.  A module-level import triggers Phoenix's SQLite/Alembic setup as a
+# side effect even when no Phoenix endpoint is in use (e.g. during tests).
+import importlib.util as _importlib_util
+_PHOENIX_AVAILABLE = _importlib_util.find_spec("phoenix") is not None
 
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ _TELEMETRY_STATE: Dict[str, Any] = {
     "endpoint": None,
     "project": None,
     "openinference_openai_available": OpenAIInstrumentor is not None,
-    "phoenix_available": phoenix_register is not None,
+    "phoenix_available": _PHOENIX_AVAILABLE,
     "requests_instrumented": False,
     "fastapi_instrumented": False,
     "openai_instrumented": False,
@@ -95,8 +96,16 @@ def init_telemetry(app: FastAPI, service_name: str = "nasa-rag-api"):
     chosen_endpoint = phoenix_endpoint or otlp_endpoint
     console_fallback = _as_bool(os.getenv("TELEMETRY_CONSOLE_FALLBACK", "false"), default=False)
 
-    if phoenix_endpoint and phoenix_register is not None:
-        provider = phoenix_register(
+    if phoenix_endpoint and _PHOENIX_AVAILABLE:
+        try:
+            from phoenix.otel import register as _phoenix_register
+        except Exception:
+            _phoenix_register = None
+    else:
+        _phoenix_register = None
+
+    if _phoenix_register is not None:
+        provider = _phoenix_register(
             endpoint=phoenix_endpoint,
             project_name=project_name,
             batch=True,
