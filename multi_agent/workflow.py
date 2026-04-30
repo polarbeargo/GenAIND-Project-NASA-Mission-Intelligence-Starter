@@ -17,6 +17,7 @@ import rag_client
 from monitoring.stage_sli_events import StageLatencyEventStore
 from infra.redis_cache import RedisL2Cache
 from infra.redis_job_store import RedisAsyncJobStore
+from infra.redis_evaluation_broker import RedisEvaluationBroker
 from infra.redis_client import get_redis_client
 from multi_agent.context_compression import (
     CompressionConfig,
@@ -243,6 +244,9 @@ class MultiAgentChatWorkflow:
         judge_queue_limit: int = 100,
         evaluation_queue_limit: int = 200,
         queue_submit_timeout_seconds: float = 0.05,
+        evaluation_broker_enabled: bool = False,
+        evaluation_broker_stream: str = "eval:jobs",
+        evaluation_broker_group: str = "eval-workers",
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -319,6 +323,12 @@ class MultiAgentChatWorkflow:
         
         # Redis async job store: track judge/evaluation results shared across pods
         self._redis_job_store = RedisAsyncJobStore(redis_client, retention_ttl_seconds=3600)
+        self._evaluation_broker = RedisEvaluationBroker(
+            redis_client,
+            stream_name=evaluation_broker_stream,
+            consumer_group=evaluation_broker_group,
+            enabled=evaluation_broker_enabled,
+        )
         self._retrieval_depth_policy = retrieval_depth_policy or HeuristicRetrievalDepthPolicy(
             HeuristicRetrievalDepthConfig(
                 factoid_n_results=max(1, int(factoid_n_results)),
@@ -860,13 +870,32 @@ class MultiAgentChatWorkflow:
             "question": workflow_input.question,
         }
         self._record_evaluation_job(job_id, pending)
-        self._eval_executor.submit(
-            self._run_async_evaluation,
-            job_id,
-            workflow_input,
-            answer,
-            contexts,
-        )
+
+        enqueue_payload = {
+            "job_id": job_id,
+            "question": workflow_input.question,
+            "mission_filter": workflow_input.mission_filter,
+            "chroma_dir": workflow_input.chroma_dir,
+            "collection_name": workflow_input.collection_name,
+            "model": workflow_input.model,
+            "evaluate": workflow_input.evaluate,
+            "answer": answer,
+            "contexts": contexts,
+            "submitted_at_ms": submitted_at_ms,
+            "evaluation_timeout_seconds": self._evaluation_timeout_seconds,
+        }
+
+        # Phase 1 externalization: enqueue to Redis broker for dedicated workers.
+        # If broker is disabled/unavailable, fall back to local bounded async executor.
+        queued = self._evaluation_broker.enqueue(job_id, enqueue_payload)
+        if not queued:
+            self._eval_executor.submit(
+                self._run_async_evaluation,
+                job_id,
+                workflow_input,
+                answer,
+                contexts,
+            )
         return pending
 
     def _run_async_evaluation(

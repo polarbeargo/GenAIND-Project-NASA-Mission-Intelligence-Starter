@@ -127,6 +127,23 @@ def _get_stage_submit_timeout_seconds() -> float:
     return max(0.0, min(value, 5.0))
 
 
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_evaluation_broker_stream() -> str:
+    value = os.getenv("EVALUATION_BROKER_STREAM", "eval:jobs").strip()
+    return value or "eval:jobs"
+
+
+def _get_evaluation_broker_group() -> str:
+    value = os.getenv("EVALUATION_BROKER_GROUP", "eval-workers").strip()
+    return value or "eval-workers"
+
+
 def _get_breaker_failure_threshold() -> int:
     try:
         value = int(os.getenv("STAGE_BREAKER_FAILURE_THRESHOLD", "3"))
@@ -476,6 +493,9 @@ chat_workflow = MultiAgentChatWorkflow(
     judge_queue_limit=_get_stage_queue_limit("JUDGE_QUEUE_LIMIT", 100),
     evaluation_queue_limit=_get_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 200),
     queue_submit_timeout_seconds=_get_stage_submit_timeout_seconds(),
+    evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
+    evaluation_broker_stream=_get_evaluation_broker_stream(),
+    evaluation_broker_group=_get_evaluation_broker_group(),
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),
         retention_hours=_get_stage_sli_retention_hours(),
