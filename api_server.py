@@ -144,6 +144,16 @@ def _get_evaluation_broker_group() -> str:
     return value or "eval-workers"
 
 
+def _get_judge_broker_stream() -> str:
+    value = os.getenv("JUDGE_BROKER_STREAM", "judge:jobs").strip()
+    return value or "judge:jobs"
+
+
+def _get_judge_broker_group() -> str:
+    value = os.getenv("JUDGE_BROKER_GROUP", "judge-workers").strip()
+    return value or "judge-workers"
+
+
 def _get_breaker_failure_threshold() -> int:
     try:
         value = int(os.getenv("STAGE_BREAKER_FAILURE_THRESHOLD", "3"))
@@ -496,6 +506,9 @@ chat_workflow = MultiAgentChatWorkflow(
     evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
     evaluation_broker_stream=_get_evaluation_broker_stream(),
     evaluation_broker_group=_get_evaluation_broker_group(),
+    judge_broker_enabled=_get_bool_env("JUDGE_BROKER_ENABLED", default=False),
+    judge_broker_stream=_get_judge_broker_stream(),
+    judge_broker_group=_get_judge_broker_group(),
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),
         retention_hours=_get_stage_sli_retention_hours(),

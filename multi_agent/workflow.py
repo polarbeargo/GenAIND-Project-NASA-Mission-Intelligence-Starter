@@ -18,6 +18,7 @@ from monitoring.stage_sli_events import StageLatencyEventStore
 from infra.redis_cache import RedisL2Cache
 from infra.redis_job_store import RedisAsyncJobStore
 from infra.redis_evaluation_broker import RedisEvaluationBroker
+from infra.redis_judge_broker import RedisJudgeBroker
 from infra.redis_client import get_redis_client
 from multi_agent.context_compression import (
     CompressionConfig,
@@ -247,6 +248,9 @@ class MultiAgentChatWorkflow:
         evaluation_broker_enabled: bool = False,
         evaluation_broker_stream: str = "eval:jobs",
         evaluation_broker_group: str = "eval-workers",
+        judge_broker_enabled: bool = False,
+        judge_broker_stream: str = "judge:jobs",
+        judge_broker_group: str = "judge-workers",
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -328,6 +332,12 @@ class MultiAgentChatWorkflow:
             stream_name=evaluation_broker_stream,
             consumer_group=evaluation_broker_group,
             enabled=evaluation_broker_enabled,
+        )
+        self._judge_broker = RedisJudgeBroker(
+            redis_client,
+            stream_name=judge_broker_stream,
+            consumer_group=judge_broker_group,
+            enabled=judge_broker_enabled,
         )
         self._retrieval_depth_policy = retrieval_depth_policy or HeuristicRetrievalDepthPolicy(
             HeuristicRetrievalDepthConfig(
@@ -727,28 +737,36 @@ class MultiAgentChatWorkflow:
                 "source": "disabled",
             }
         elif judge_mode == "async":
-            try:
-                self._judge_executor.submit(
-                    self._run_async_judge,
-                    openai_key,
-                    effective_input,
-                    answer,
-                    retrieval_result.contexts,
-                )
+            judge_job_id = str(uuid.uuid4())
+            enqueue_payload = {
+                "job_id": judge_job_id,
+                "question": effective_input.question,
+                "mission_filter": effective_input.mission_filter,
+                "chroma_dir": effective_input.chroma_dir,
+                "collection_name": effective_input.collection_name,
+                "model": effective_input.model,
+                "answer": answer,
+                "contexts": retrieval_result.contexts,
+                "client_ip": effective_input.client_ip,
+            }
+            # Phase 2: try broker first; fall back to in-process executor.
+            queued = self._judge_broker.enqueue(judge_job_id, enqueue_payload)
+            judge_overloaded = False
+            if not queued:
+                try:
+                    self._judge_executor.submit(
+                        self._run_async_judge,
+                        judge_job_id,
+                        openai_key,
+                        effective_input,
+                        answer,
+                        retrieval_result.contexts,
+                    )
+                except StageOverloadError:
+                    judge_overloaded = True
+            if judge_overloaded:
                 judge = {
-                    "status": "pending",
-                    "groundedness_score": None,
-                    "safety_score": None,
-                    "task_success_score": None,
-                    "overall_score": None,
-                    "confidence": None,
-                    "passed": True,
-                    "low_confidence": True,
-                    "source": "async",
-                    "rationale": "Judge running asynchronously.",
-                }
-            except StageOverloadError:
-                judge = {
+                    "job_id": judge_job_id,
                     "status": "skipped",
                     "groundedness_score": None,
                     "safety_score": None,
@@ -759,6 +777,20 @@ class MultiAgentChatWorkflow:
                     "low_confidence": True,
                     "source": "overload",
                     "rationale": "Judge skipped due to queue saturation.",
+                }
+            else:
+                judge = {
+                    "job_id": judge_job_id,
+                    "status": "pending",
+                    "groundedness_score": None,
+                    "safety_score": None,
+                    "task_success_score": None,
+                    "overall_score": None,
+                    "confidence": None,
+                    "passed": True,
+                    "low_confidence": True,
+                    "source": "async",
+                    "rationale": "Judge running asynchronously.",
                 }
         else:
             judge = self.judge_worker.judge(
@@ -1005,16 +1037,13 @@ class MultiAgentChatWorkflow:
 
     def _run_async_judge(
         self,
+        judge_job_id: str,
         openai_key: str,
         workflow_input: ChatWorkflowInput,
         answer: str,
         contexts,
     ) -> None:
         started = time.perf_counter()
-        judge_job_id = str(uuid.uuid4())
-        
-        # Create job entry in Redis
-        self._redis_job_store.create_job(judge_job_id, "judge", str(uuid.uuid4()))
         
         try:
             result = self.judge_worker.judge(
