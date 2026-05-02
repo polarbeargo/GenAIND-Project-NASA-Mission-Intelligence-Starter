@@ -154,6 +154,8 @@ class BoundedExecutor:
         self._submitted = 0
         self._completed = 0
         self._rejected = 0
+        self._failed = 0
+        self._queued_submitted_at: deque[float] = deque()
         self._lock = Lock()
 
     def submit(self, fn, *args, **kwargs):
@@ -166,6 +168,8 @@ class BoundedExecutor:
         with self._lock:
             self._submitted += 1
             self._inflight += 1
+            if self._inflight > self.max_workers:
+                self._queued_submitted_at.append(time.time())
 
         future = self._executor.submit(fn, *args, **kwargs)
 
@@ -174,13 +178,37 @@ class BoundedExecutor:
             with self._lock:
                 self._inflight = max(0, self._inflight - 1)
                 self._completed += 1
+                if self._queued_submitted_at:
+                    # Each completion allows one queued task to start running.
+                    self._queued_submitted_at.popleft()
+                try:
+                    if _future.exception() is not None:
+                        self._failed += 1
+                except Exception:
+                    # Cancelled futures can raise here; treat as non-success.
+                    self._failed += 1
 
         future.add_done_callback(_release)
         return future
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            now = time.time()
             queued = max(0, self._inflight - self.max_workers)
+            # Keep queue timestamp tracking bounded to active queued tasks.
+            while len(self._queued_submitted_at) > queued:
+                self._queued_submitted_at.popleft()
+            if queued == 0:
+                self._queued_submitted_at.clear()
+
+            oldest_queue_age_seconds = 0.0
+            if self._queued_submitted_at:
+                oldest_queue_age_seconds = max(0.0, now - self._queued_submitted_at[0])
+
+            submission_total = self._submitted + self._rejected
+            rejected_rate = (self._rejected / submission_total) if submission_total else 0.0
+            error_rate = (self._failed / self._completed) if self._completed else 0.0
+
             return {
                 "max_workers": self.max_workers,
                 "queue_limit": self.queue_limit,
@@ -190,6 +218,10 @@ class BoundedExecutor:
                 "submitted": self._submitted,
                 "completed": self._completed,
                 "rejected": self._rejected,
+                "failed": self._failed,
+                "oldest_queue_age_seconds": round(oldest_queue_age_seconds, 4),
+                "rejected_rate": round(rejected_rate, 6),
+                "error_rate": round(error_rate, 6),
             }
 
     def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:

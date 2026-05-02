@@ -277,6 +277,14 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
         "# TYPE nasa_worker_pool_completed_total counter",
         "# HELP nasa_worker_pool_rejected_total Cumulative rejected submissions per stage.",
         "# TYPE nasa_worker_pool_rejected_total counter",
+        "# HELP nasa_worker_pool_failed_total Cumulative task execution failures per stage.",
+        "# TYPE nasa_worker_pool_failed_total counter",
+        "# HELP nasa_worker_pool_oldest_queue_age_seconds Age in seconds of oldest queued task per stage.",
+        "# TYPE nasa_worker_pool_oldest_queue_age_seconds gauge",
+        "# HELP nasa_worker_pool_rejected_rate Rejected submissions ratio per stage.",
+        "# TYPE nasa_worker_pool_rejected_rate gauge",
+        "# HELP nasa_worker_pool_error_rate Task execution error ratio per stage.",
+        "# TYPE nasa_worker_pool_error_rate gauge",
         "# HELP nasa_worker_pool_queue_depth_ratio Queue depth ratio (queued_estimate / queue_limit).",
         "# TYPE nasa_worker_pool_queue_depth_ratio gauge",
         "# HELP nasa_worker_pool_utilization_ratio Capacity utilization ratio (inflight / capacity).",
@@ -296,6 +304,10 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
         submitted = float(snapshot.get("submitted", 0))
         completed = float(snapshot.get("completed", 0))
         rejected = float(snapshot.get("rejected", 0))
+        failed = float(snapshot.get("failed", 0))
+        oldest_queue_age = float(snapshot.get("oldest_queue_age_seconds", 0.0))
+        rejected_rate = float(snapshot.get("rejected_rate", 0.0))
+        error_rate = float(snapshot.get("error_rate", 0.0))
         queue_ratio = (queued_estimate / queue_limit) if queue_limit > 0 else 0.0
         util_ratio = (inflight / capacity) if capacity > 0 else 0.0
 
@@ -309,6 +321,10 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
                 f'nasa_worker_pool_submitted_total{{stage="{label}"}} {submitted}',
                 f'nasa_worker_pool_completed_total{{stage="{label}"}} {completed}',
                 f'nasa_worker_pool_rejected_total{{stage="{label}"}} {rejected}',
+                f'nasa_worker_pool_failed_total{{stage="{label}"}} {failed}',
+                f'nasa_worker_pool_oldest_queue_age_seconds{{stage="{label}"}} {oldest_queue_age:.6f}',
+                f'nasa_worker_pool_rejected_rate{{stage="{label}"}} {rejected_rate:.6f}',
+                f'nasa_worker_pool_error_rate{{stage="{label}"}} {error_rate:.6f}',
                 f'nasa_worker_pool_queue_depth_ratio{{stage="{label}"}} {queue_ratio:.6f}',
                 f'nasa_worker_pool_utilization_ratio{{stage="{label}"}} {util_ratio:.6f}',
             ]

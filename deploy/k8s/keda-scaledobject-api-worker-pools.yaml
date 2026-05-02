@@ -48,6 +48,30 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: nasa_worker_pool_oldest_queue_age_seconds_retrieval
+      query: max(nasa_worker_pool_oldest_queue_age_seconds{stage="retrieval"})
+      threshold: "15"
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: nasa_worker_pool_oldest_queue_age_seconds_generation
+      query: max(nasa_worker_pool_oldest_queue_age_seconds{stage="generation"})
+      threshold: "15"
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: nasa_worker_pool_rejected_rate_retrieval
+      query: max(nasa_worker_pool_rejected_rate{stage="retrieval"})
+      threshold: "0.02"
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: nasa_worker_pool_error_rate_generation
+      query: max(nasa_worker_pool_error_rate{stage="generation"})
+      threshold: "0.05"
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
       metricName: nasa_worker_pool_rejected_total_retrieval
       query: increase(nasa_worker_pool_rejected_total{stage="retrieval"}[2m])
       threshold: "1"

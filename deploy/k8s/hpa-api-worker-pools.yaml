@@ -56,6 +56,46 @@ spec:
   - type: Pods
     pods:
       metric:
+        name: nasa_worker_pool_oldest_queue_age_seconds
+        selector:
+          matchLabels:
+            stage: retrieval
+      target:
+        type: AverageValue
+        averageValue: "15"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_oldest_queue_age_seconds
+        selector:
+          matchLabels:
+            stage: generation
+      target:
+        type: AverageValue
+        averageValue: "15"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_rejected_rate
+        selector:
+          matchLabels:
+            stage: retrieval
+      target:
+        type: AverageValue
+        averageValue: "0.02"
+  - type: Pods
+    pods:
+      metric:
+        name: nasa_worker_pool_error_rate
+        selector:
+          matchLabels:
+            stage: generation
+      target:
+        type: AverageValue
+        averageValue: "0.05"
+  - type: Pods
+    pods:
+      metric:
         name: nasa_worker_pool_utilization_ratio
         selector:
           matchLabels:

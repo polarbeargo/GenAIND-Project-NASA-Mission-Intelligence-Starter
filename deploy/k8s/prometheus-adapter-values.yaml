@@ -37,6 +37,51 @@ rules:
           nasa_worker_pool_utilization_ratio{<<.LabelMatchers>>}
         )
 
+    - seriesQuery: 'nasa_worker_pool_oldest_queue_age_seconds{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_oldest_queue_age_seconds$"
+        as: "nasa_worker_pool_oldest_queue_age_seconds"
+      metricsQuery: >-
+        max by (<<.GroupBy>>, stage) (
+          nasa_worker_pool_oldest_queue_age_seconds{<<.LabelMatchers>>}
+        )
+
+    - seriesQuery: 'nasa_worker_pool_rejected_rate{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_rejected_rate$"
+        as: "nasa_worker_pool_rejected_rate"
+      metricsQuery: >-
+        avg by (<<.GroupBy>>, stage) (
+          nasa_worker_pool_rejected_rate{<<.LabelMatchers>>}
+        )
+
+    - seriesQuery: 'nasa_worker_pool_error_rate{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^nasa_worker_pool_error_rate$"
+        as: "nasa_worker_pool_error_rate"
+      metricsQuery: >-
+        avg by (<<.GroupBy>>, stage) (
+          nasa_worker_pool_error_rate{<<.LabelMatchers>>}
+        )
+
     - seriesQuery: 'nasa_worker_pool_rejected_total{namespace!="",pod!=""}'
       resources:
         overrides:
