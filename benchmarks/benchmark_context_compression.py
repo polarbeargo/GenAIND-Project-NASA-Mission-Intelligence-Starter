@@ -2,7 +2,7 @@
 """Micro-benchmark for context dedup optimization.
 
 Run:
-    python test/benchmark_context_compression.py --runs 30 --sizes 512,1024,2048,4096
+    python benchmarks/benchmark_context_compression.py --runs 30 --sizes 512,1024,2048,4096 --equivalence once --warmup 2
 """
 
 from __future__ import annotations
@@ -140,7 +140,78 @@ def _assert_equivalent_outputs(
         )
 
 
-def run_once(dataset_size: int, run_idx: int) -> tuple[float, float]:
+def _compress_baseline(
+    contexts: List[str], metas: List[Dict], config: CompressionConfig
+) -> Tuple[List[str], List[Dict]]:
+    return _baseline_compress(contexts, metas, config=config, mission_filter="apollo13")
+
+
+def _compress_optimized(
+    contexts: List[str], metas: List[Dict], compressor: DeduplicatingCompressor
+) -> Tuple[List[str], List[Dict]]:
+    return compressor.compress(contexts, metas, mission_filter="apollo13")
+
+
+def _benchmark_once(
+    contexts: List[str], metas: List[Dict], config: CompressionConfig, compressor: DeduplicatingCompressor
+) -> tuple[float, float]:
+    start_baseline = time.perf_counter()
+    _compress_baseline(contexts, metas, config=config)
+    baseline_ms = (time.perf_counter() - start_baseline) * 1000.0
+
+    start = time.perf_counter()
+    _compress_optimized(contexts, metas, compressor=compressor)
+    optimized_ms = (time.perf_counter() - start) * 1000.0
+
+    return baseline_ms, optimized_ms
+
+
+def _verify_equivalence(
+    datasets: Sequence[Tuple[List[str], List[Dict]]],
+    config: CompressionConfig,
+    compressor: DeduplicatingCompressor,
+    dataset_size: int,
+    mode: str,
+) -> None:
+    if mode == "off":
+        return
+
+    pairs_to_check = datasets[:1] if mode == "once" else datasets
+    for run_idx, (contexts, metas) in enumerate(pairs_to_check, start=1):
+        baseline_result = _compress_baseline(contexts, metas, config=config)
+        optimized_result = _compress_optimized(contexts, metas, compressor=compressor)
+        _assert_equivalent_outputs(
+            baseline_result,
+            optimized_result,
+            dataset_size=dataset_size,
+            run_idx=run_idx,
+        )
+
+
+def _build_datasets(dataset_size: int, runs: int) -> List[Tuple[List[str], List[Dict]]]:
+    return [_build_dataset(n=dataset_size) for _ in range(runs)]
+
+
+def _run_warmup(
+    datasets: Sequence[Tuple[List[str], List[Dict]]],
+    warmup_runs: int,
+    config: CompressionConfig,
+    compressor: DeduplicatingCompressor,
+) -> None:
+    if warmup_runs <= 0:
+        return
+
+    for contexts, metas in datasets[:warmup_runs]:
+        _compress_baseline(contexts, metas, config=config)
+        _compress_optimized(contexts, metas, compressor=compressor)
+
+
+def run_suite(
+    dataset_size: int,
+    runs: int,
+    equivalence_mode: str,
+    warmup_runs: int,
+) -> tuple[list[float], list[float]]:
     config = CompressionConfig(
         max_tokens=2000,
         similarity_threshold=0.85,
@@ -148,18 +219,22 @@ def run_once(dataset_size: int, run_idx: int) -> tuple[float, float]:
         use_optimized_dedup=True,
     )
     compressor = DeduplicatingCompressor(config)
-    contexts, metas = _build_dataset(n=dataset_size)
+    datasets = _build_datasets(dataset_size=dataset_size, runs=runs)
+    _verify_equivalence(
+        datasets,
+        config=config,
+        compressor=compressor,
+        dataset_size=dataset_size,
+        mode=equivalence_mode,
+    )
+    _run_warmup(datasets, warmup_runs=warmup_runs, config=config, compressor=compressor)
 
-    start_baseline = time.perf_counter()
-    baseline_result = _baseline_compress(contexts, metas, config=config, mission_filter="apollo13")
-    baseline_ms = (time.perf_counter() - start_baseline) * 1000.0
-
-    start = time.perf_counter()
-    optimized_result = compressor.compress(contexts, metas, mission_filter="apollo13")
-    optimized_ms = (time.perf_counter() - start) * 1000.0
-
-    _assert_equivalent_outputs(baseline_result, optimized_result, dataset_size=dataset_size, run_idx=run_idx)
-
+    results = [
+        _benchmark_once(contexts, metas, config=config, compressor=compressor)
+        for contexts, metas in datasets
+    ]
+    baseline_ms = [item[0] for item in results]
+    optimized_ms = [item[1] for item in results]
     return baseline_ms, optimized_ms
 
 
@@ -189,6 +264,18 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated dataset sizes to benchmark",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--equivalence",
+        choices=("once", "per-run", "off"),
+        default="once",
+        help="When to run baseline-vs-optimized output parity checks outside the timed region",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Number of untimed warmup iterations to run per dataset size before collecting samples",
+    )
     return parser.parse_args()
 
 
@@ -196,17 +283,25 @@ def main() -> None:
     args = _parse_args()
     if args.runs <= 0:
         raise ValueError(f"runs must be > 0, got {args.runs}")
+    if args.warmup < 0:
+        raise ValueError(f"warmup must be >= 0, got {args.warmup}")
 
     random.seed(args.seed)
     sizes = _parse_sizes(args.sizes)
 
     print("context_compression benchmark")
-    print(f"runs_per_size={args.runs} sizes={','.join(str(s) for s in sizes)} seed={args.seed}")
+    print(
+        f"runs_per_size={args.runs} sizes={','.join(str(s) for s in sizes)} "
+        f"seed={args.seed} equivalence={args.equivalence} warmup={args.warmup}"
+    )
 
     for dataset_size in sizes:
-        results = [run_once(dataset_size=dataset_size, run_idx=idx) for idx in range(1, args.runs + 1)]
-        baseline_ms = [item[0] for item in results]
-        optimized_ms = [item[1] for item in results]
+        baseline_ms, optimized_ms = run_suite(
+            dataset_size=dataset_size,
+            runs=args.runs,
+            equivalence_mode=args.equivalence,
+            warmup_runs=args.warmup,
+        )
         baseline_avg = sum(baseline_ms) / len(baseline_ms)
         optimized_avg = sum(optimized_ms) / len(optimized_ms)
         baseline_p95 = _p95(baseline_ms)
