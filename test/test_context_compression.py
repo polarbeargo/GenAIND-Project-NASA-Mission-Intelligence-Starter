@@ -8,7 +8,9 @@ import unittest
 from multi_agent.context_compression import (
     CompressionConfig,
     DeduplicatingCompressor,
+    _candidate_size_bounds,
     _jaccard,
+    _jaccard_meets_threshold,
 )
 
 
@@ -30,6 +32,36 @@ class TestJaccardSimilarity(unittest.TestCase):
 
     def test_empty_sets_score_one(self):
         self.assertAlmostEqual(_jaccard(frozenset(), frozenset()), 1.0)
+
+
+class TestJaccardThresholdShortCircuit(unittest.TestCase):
+    def test_candidate_size_bounds_basic(self):
+        # For size=10 and threshold=0.8, candidate sizes in [8,12].
+        self.assertEqual(_candidate_size_bounds(10, 0.8), (8, 12))
+
+    def test_candidate_size_bounds_threshold_one(self):
+        self.assertEqual(_candidate_size_bounds(7, 1.0), (7, 7))
+
+    def test_threshold_matcher_equivalent_to_full_jaccard(self):
+        a = frozenset(["apollo", "13", "oxygen", "tank", "failure", "mission"])
+        b = frozenset(["apollo", "13", "oxygen", "tank", "anomaly"])
+        c = frozenset(["challenger", "launch", "1986"])
+
+        for threshold in (0.1, 0.5, 0.8, 0.9):
+            self.assertEqual(
+                _jaccard_meets_threshold(a, b, threshold),
+                _jaccard(a, b) >= threshold,
+            )
+            self.assertEqual(
+                _jaccard_meets_threshold(a, c, threshold),
+                _jaccard(a, c) >= threshold,
+            )
+
+    def test_threshold_matcher_handles_empty(self):
+        empty = frozenset()
+        full = frozenset(["apollo"])
+        self.assertTrue(_jaccard_meets_threshold(empty, empty, 0.5))
+        self.assertFalse(_jaccard_meets_threshold(empty, full, 0.5))
 
 
 class TestDeduplicatingCompressor(unittest.TestCase):
@@ -149,6 +181,9 @@ class TestCompressionConfigDefaults(unittest.TestCase):
 
     def test_default_mission_boost_enabled(self):
         self.assertTrue(CompressionConfig().mission_boost)
+
+    def test_default_optimized_dedup_disabled(self):
+        self.assertFalse(CompressionConfig().use_optimized_dedup)
 
 
 class TestCompressionIntegrationWithWorkflow(unittest.TestCase):
