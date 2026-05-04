@@ -238,6 +238,60 @@ class TestRedisJudgeIntegration(unittest.TestCase):
         self.assertEqual(result.get("job_id"), job_id)
         self.assertEqual(result.get("judge", {}).get("source"), "async")
 
+    def test_job_store_processing_lock_and_completion_marker(self):
+        job_store = RedisAsyncJobStore(self.redis, retention_ttl_seconds=120)
+        job_id = f"job-{uuid.uuid4()}"
+
+        self.assertTrue(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
+        self.assertFalse(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
+
+        self.assertTrue(
+            job_store.set_result(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "judge": {"status": "completed", "source": "async"},
+                },
+            )
+        )
+        self.assertTrue(job_store.is_completed(job_id))
+
+    def test_broker_dead_letter_writes_dlq_entry(self):
+        stream_name = f"test:judge:jobs:{uuid.uuid4()}"
+        group_name = f"test-judge-workers-{uuid.uuid4().hex[:8]}"
+        dlq_stream = f"{stream_name}:dlq"
+        broker = RedisJudgeBroker(
+            self.redis,
+            stream_name=stream_name,
+            consumer_group=group_name,
+            dead_letter_stream=dlq_stream,
+            enabled=True,
+        )
+
+        payload = {
+            "job_id": f"job-{uuid.uuid4()}",
+            "question": "bad message",
+            "_attempt": 2,
+        }
+        self.assertTrue(
+            broker.dead_letter(
+                message_id="1-0",
+                payload=payload,
+                reason="max_retries_exhausted",
+                consumer_name="test-consumer",
+                attempt=2,
+            )
+        )
+
+        rows = self.redis._client.xread({dlq_stream: "0-0"}, count=1, block=100)
+        self.assertTrue(rows)
+        _stream, entries = rows[0]
+        _message_id, fields = entries[0]
+        self.assertEqual(fields.get("reason"), "max_retries_exhausted")
+        self.assertEqual(fields.get("attempt"), "2")
+        self.assertEqual(fields.get("consumer"), "test-consumer")
+
     def test_broker_enabled_async_judge_end_to_end_with_external_worker_process(self):
         stream_name = f"test:judge:e2e:{uuid.uuid4()}"
         group_name = f"test-judge-e2e-{uuid.uuid4().hex[:8]}"
