@@ -17,6 +17,7 @@ import os
 import signal
 import socket
 import time
+from typing import Any, Dict
 
 from env_utils import load_project_env
 from infra.redis_client import get_redis_client
@@ -71,6 +72,18 @@ def _coerce_workflow_input(payload: dict) -> ChatWorkflowInput:
     )
 
 
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _backoff_seconds(base: float, max_backoff: float, attempt: int) -> float:
+    safe_attempt = max(0, int(attempt))
+    return min(max_backoff, base * (2 ** safe_attempt))
+
+
 def run() -> int:
     signal.signal(signal.SIGINT, _stop_worker)
     signal.signal(signal.SIGTERM, _stop_worker)
@@ -92,6 +105,7 @@ def run() -> int:
         redis_client,
         stream_name=os.getenv("JUDGE_BROKER_STREAM", "judge:jobs"),
         consumer_group=os.getenv("JUDGE_BROKER_GROUP", "judge-workers"),
+        dead_letter_stream=os.getenv("JUDGE_BROKER_DLQ_STREAM", "judge:jobs:dlq"),
         enabled=True,
     )
     job_store = RedisAsyncJobStore(
@@ -104,6 +118,11 @@ def run() -> int:
         sensitive_info_filter=SensitiveInfoFilter,
     )
 
+    max_retries = max(0, int(os.getenv("JUDGE_WORKER_MAX_RETRIES", "3")))
+    backoff_base = max(0.0, float(os.getenv("JUDGE_WORKER_BACKOFF_BASE_SECONDS", "0.5")))
+    backoff_max = max(backoff_base, float(os.getenv("JUDGE_WORKER_BACKOFF_MAX_SECONDS", "8.0")))
+    processing_ttl = max(30, int(os.getenv("JUDGE_WORKER_PROCESSING_TTL_SECONDS", "300")))
+
     consumer_name = _consumer_name()
     logger.info("Judge worker started as consumer=%s", consumer_name)
 
@@ -114,7 +133,37 @@ def run() -> int:
 
         for message_id, payload in messages:
             job_id = str(payload.get("job_id", ""))
+            attempt = max(0, _to_int(payload.get("_attempt", 0), 0))
+
+            if payload.get("_decode_error"):
+                broker.dead_letter(
+                    message_id=message_id,
+                    payload=payload,
+                    reason="payload_decode_error",
+                    consumer_name=consumer_name,
+                    attempt=attempt,
+                )
+                broker.ack(message_id)
+                continue
+
             if not job_id:
+                broker.dead_letter(
+                    message_id=message_id,
+                    payload=payload,
+                    reason="missing_job_id",
+                    consumer_name=consumer_name,
+                    attempt=attempt,
+                )
+                broker.ack(message_id)
+                continue
+
+            if job_store.is_completed(job_id):
+                logger.info("Skipping already-completed judge job_id=%s", job_id)
+                broker.ack(message_id)
+                continue
+
+            if not job_store.acquire_processing(job_id, processing_ttl_seconds=processing_ttl):
+                logger.info("Skipping duplicate in-flight judge job_id=%s", job_id)
                 broker.ack(message_id)
                 continue
 
@@ -123,6 +172,8 @@ def run() -> int:
                 workflow_input = _coerce_workflow_input(payload)
                 answer = str(payload.get("answer", ""))
                 contexts = payload.get("contexts") or []
+                if not workflow_input.question:
+                    raise ValueError("missing question")
                 if not isinstance(contexts, list):
                     contexts = []
 
@@ -148,31 +199,111 @@ def run() -> int:
                     result.get("overall_score", 0.0),
                     latency_ms,
                 )
+                job_store.set_result(job_id, final_payload)
+                broker.ack(message_id)
             except Exception as error:
                 latency_ms = (time.perf_counter() - started) * 1000.0
-                final_payload = {
-                    "job_id": job_id,
-                    "timestamp_ms": round(time.time() * 1000),
-                    "question": str(payload.get("question", "")),
-                    "client_ip": str(payload.get("client_ip", "worker")),
-                    "judge": {
-                        "status": "error",
-                        "passed": False,
-                        "low_confidence": True,
-                        "source": "async",
-                        "rationale": str(error)[:200],
-                        "overall_score": 0.0,
-                        "groundedness_score": 0.0,
-                        "safety_score": 0.0,
-                        "task_success_score": 0.0,
-                        "confidence": 0.0,
-                    },
-                    "latency_ms": round(latency_ms, 2),
-                }
-                logger.warning("Judge job failed job_id=%s: %s", job_id, str(error)[:120])
+                retry_error = str(error)[:200]
 
-            job_store.set_result(job_id, final_payload)
-            broker.ack(message_id)
+                if attempt < max_retries:
+                    next_attempt = attempt + 1
+                    backoff = _backoff_seconds(backoff_base, backoff_max, attempt)
+                    retry_payload: Dict[str, Any] = dict(payload)
+                    retry_payload["_attempt"] = next_attempt
+                    retry_payload["_last_error"] = retry_error
+
+                    job_store.set_result(
+                        job_id,
+                        {
+                            "job_id": job_id,
+                            "status": "retrying",
+                            "source": "async",
+                            "timestamp_ms": round(time.time() * 1000),
+                            "question": str(payload.get("question", "")),
+                            "client_ip": str(payload.get("client_ip", "worker")),
+                            "judge": {
+                                "status": "retrying",
+                                "passed": False,
+                                "low_confidence": True,
+                                "source": "async",
+                                "rationale": retry_error,
+                            },
+                            "latency_ms": round(latency_ms, 2),
+                            "attempt": next_attempt,
+                            "max_retries": max_retries,
+                            "next_retry_in_seconds": round(backoff, 3),
+                        },
+                    )
+
+                    if backoff > 0.0:
+                        time.sleep(backoff)
+
+                    if broker.enqueue(job_id, retry_payload):
+                        broker.ack(message_id)
+                        job_store.release_processing(job_id)
+                        logger.warning(
+                            "Judge job retry scheduled job_id=%s attempt=%s/%s",
+                            job_id,
+                            next_attempt,
+                            max_retries,
+                        )
+                    else:
+                        terminal = {
+                            "job_id": job_id,
+                            "status": "dead_lettered",
+                            "source": "async",
+                            "timestamp_ms": round(time.time() * 1000),
+                            "question": str(payload.get("question", "")),
+                            "client_ip": str(payload.get("client_ip", "worker")),
+                            "judge": {
+                                "status": "dead_lettered",
+                                "passed": False,
+                                "low_confidence": True,
+                                "source": "async",
+                                "rationale": "retry enqueue failed",
+                            },
+                            "latency_ms": round(latency_ms, 2),
+                            "attempt": next_attempt,
+                            "max_retries": max_retries,
+                        }
+                        job_store.set_result(job_id, terminal)
+                        broker.dead_letter(
+                            message_id=message_id,
+                            payload=payload,
+                            reason="retry_enqueue_failed",
+                            consumer_name=consumer_name,
+                            attempt=next_attempt,
+                        )
+                        broker.ack(message_id)
+                else:
+                    terminal = {
+                        "job_id": job_id,
+                        "status": "dead_lettered",
+                        "source": "async",
+                        "timestamp_ms": round(time.time() * 1000),
+                        "question": str(payload.get("question", "")),
+                        "client_ip": str(payload.get("client_ip", "worker")),
+                        "judge": {
+                            "status": "dead_lettered",
+                            "passed": False,
+                            "low_confidence": True,
+                            "source": "async",
+                            "rationale": retry_error,
+                        },
+                        "latency_ms": round(latency_ms, 2),
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                    }
+                    job_store.set_result(job_id, terminal)
+                    broker.dead_letter(
+                        message_id=message_id,
+                        payload=payload,
+                        reason="max_retries_exhausted",
+                        consumer_name=consumer_name,
+                        attempt=attempt,
+                    )
+                    broker.ack(message_id)
+                    logger.warning("Judge job dead-lettered job_id=%s: %s", job_id, str(error)[:120])
 
     logger.info("Judge worker stopped")
     return 0

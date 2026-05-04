@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Tuple
 
 from infra.redis_client import RedisClient
@@ -19,11 +20,13 @@ class RedisJudgeBroker:
         redis_client: RedisClient,
         stream_name: str = "judge:jobs",
         consumer_group: str = "judge-workers",
+        dead_letter_stream: str | None = None,
         enabled: bool = False,
     ):
         self.redis = redis_client
         self.stream_name = stream_name
         self.consumer_group = consumer_group
+        self.dead_letter_stream = dead_letter_stream or f"{stream_name}:dlq"
         self.enabled = bool(enabled)
         self._group_initialized = False
 
@@ -99,12 +102,45 @@ class RedisJudgeBroker:
                     continue
                 try:
                     payload = json.loads(payload_text)
-                except Exception:
-                    payload = {}
+                except Exception as error:
+                    payload = {
+                        "_decode_error": str(error)[:160],
+                        "_raw_payload": str(payload_text)[:500],
+                    }
                 if "job_id" not in payload and fields.get("job_id"):
                     payload["job_id"] = fields.get("job_id")
                 messages.append((message_id, payload))
         return messages
+
+    def dead_letter(
+        self,
+        *,
+        message_id: str,
+        payload: Dict[str, Any],
+        reason: str,
+        consumer_name: str,
+        attempt: int,
+    ) -> bool:
+        """Write an unprocessable message to DLQ for later inspection."""
+        if not self.is_available():
+            return False
+        try:
+            job_id = str(payload.get("job_id", ""))
+            message = {
+                "job_id": job_id,
+                "source_stream": self.stream_name,
+                "source_message_id": message_id,
+                "consumer": consumer_name,
+                "reason": reason[:200],
+                "attempt": str(max(0, int(attempt))),
+                "timestamp_ms": str(round(time.time() * 1000)),
+                "payload": json.dumps(payload),
+            }
+            self.redis._client.xadd(self.dead_letter_stream, message)
+            return True
+        except Exception as error:
+            logger.warning("Failed to dead-letter judge message %s: %s", message_id, error)
+            return False
 
     def ack(self, message_id: str) -> bool:
         """Acknowledge one stream message as processed."""
