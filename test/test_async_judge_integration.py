@@ -11,6 +11,8 @@ import unittest
 import uuid
 from unittest.mock import MagicMock
 
+import pytest
+
 from infra.redis_client import RedisClient
 from infra.redis_job_store import RedisAsyncJobStore
 from infra.redis_judge_broker import RedisJudgeBroker
@@ -159,14 +161,19 @@ class TestAsyncJudgeFallback(unittest.TestCase):
         self.assertEqual(latest["judge"].get("source"), "llm")
 
 
+@pytest.mark.redis
 class TestRedisJudgeIntegration(unittest.TestCase):
-    """Broker/job-store integration tests that run only when Redis is available."""
+    """Broker/job-store integration tests that require a live Redis instance.
+
+    Each test is decorated via the class-level ``@pytest.mark.redis`` marker so
+    that redis-absent CI shows every skipped test individually (``s`` per test)
+    rather than silently dropping the whole class via a ``setUpClass`` exception.
+    Use ``--require-redis`` to turn skips into failures in CI with a Redis service.
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.redis = RedisClient(enabled=True)
-        if not cls.redis.is_available():
-            raise unittest.SkipTest("Redis is not available; skipping Redis integration tests")
 
     def test_broker_enqueue_consume_ack_cycle(self):
         stream_name = f"test:judge:jobs:{uuid.uuid4()}"
