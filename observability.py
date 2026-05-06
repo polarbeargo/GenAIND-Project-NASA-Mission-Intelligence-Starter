@@ -8,12 +8,20 @@ from typing import Any, Dict
 
 from fastapi import FastAPI
 from opentelemetry import trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # type: ignore[import-not-found]
+except Exception:
+    FastAPIInstrumentor = None
+
+try:
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor  # type: ignore[import-not-found]
+except Exception:
+    RequestsInstrumentor = None
 
 try:
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -24,6 +32,11 @@ try:
     from openinference.instrumentation.openai import OpenAIInstrumentor
 except Exception:
     OpenAIInstrumentor = None
+
+try:
+    from openinference.instrumentation import TraceConfig
+except Exception:
+    TraceConfig = None
 
 # phoenix.otel is imported lazily inside init_telemetry() only when PHOENIX_ENDPOINT
 # is configured.  A module-level import triggers Phoenix's SQLite/Alembic setup as a
@@ -45,6 +58,7 @@ _TELEMETRY_STATE: Dict[str, Any] = {
     "requests_instrumented": False,
     "fastapi_instrumented": False,
     "openai_instrumented": False,
+    "openai_hide_embedding_vectors": True,
 }
 
 
@@ -156,21 +170,36 @@ def init_telemetry(app: FastAPI, service_name: str = "nasa-rag-api"):
     if _TELEMETRY_STATE["exporter"] != "phoenix":
         trace.set_tracer_provider(provider)
 
-    try:
-        RequestsInstrumentor().instrument()
-    except Exception:
-        logger.debug("Requests instrumentation already active")
-    _TELEMETRY_STATE["requests_instrumented"] = True
+    if RequestsInstrumentor is not None:
+        try:
+            RequestsInstrumentor().instrument()
+        except Exception:
+            logger.debug("Requests instrumentation already active")
+        _TELEMETRY_STATE["requests_instrumented"] = True
 
-    try:
-        FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
-    except Exception:
-        logger.debug("FastAPI instrumentation already active")
-    _TELEMETRY_STATE["fastapi_instrumented"] = True
+    if FastAPIInstrumentor is not None:
+        try:
+            FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
+        except Exception:
+            logger.debug("FastAPI instrumentation already active")
+        _TELEMETRY_STATE["fastapi_instrumented"] = True
 
     if OpenAIInstrumentor is not None:
         try:
-            OpenAIInstrumentor().instrument()
+            hide_embedding_vectors = _as_bool(
+                os.getenv("OTEL_OPENAI_HIDE_EMBEDDING_VECTORS", "true"),
+                default=True,
+            )
+            if TraceConfig is not None:
+                OpenAIInstrumentor().instrument(
+                    config=TraceConfig(
+                        hide_embedding_vectors=hide_embedding_vectors,
+                        hide_embeddings_vectors=hide_embedding_vectors,
+                    )
+                )
+            else:
+                OpenAIInstrumentor().instrument()
+            _TELEMETRY_STATE["openai_hide_embedding_vectors"] = hide_embedding_vectors
         except Exception:
             logger.debug("OpenAI instrumentation already active")
         _TELEMETRY_STATE["openai_instrumented"] = True
@@ -195,6 +224,7 @@ def telemetry_status() -> Dict[str, Any]:
         "requests_instrumented": _TELEMETRY_STATE["requests_instrumented"],
         "fastapi_instrumented": _TELEMETRY_STATE["fastapi_instrumented"],
         "openai_instrumented": _TELEMETRY_STATE["openai_instrumented"],
+        "openai_hide_embedding_vectors": _TELEMETRY_STATE["openai_hide_embedding_vectors"],
         "sample_rate": _float_env("OTEL_TRACES_SAMPLE_RATE", 1.0),
         "otlp_exporter_available": OTLPSpanExporter is not None,
     }
