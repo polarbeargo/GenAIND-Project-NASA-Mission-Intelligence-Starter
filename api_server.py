@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import logging
+from numbers import Number
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -51,6 +53,11 @@ load_project_env(__file__)
 
 logger = logging.getLogger(__name__)
 security_dashboard = get_dashboard()
+
+try:
+    from phoenix.client import Client as PhoenixClient
+except ImportError:  # pragma: no cover - optional dependency
+    PhoenixClient = None
 
 
 class SecurityDashboardAuditorBridge:
@@ -252,6 +259,62 @@ def _get_stage_sli_log_path() -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path
+
+
+def _phoenix_base_url() -> str:
+    configured = (os.getenv("PHOENIX_BASE_URL") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+
+    endpoint = (os.getenv("PHOENIX_ENDPOINT") or "http://localhost:6006/v1/traces").strip()
+    if endpoint.endswith("/v1/traces"):
+        return endpoint[:-len("/v1/traces")].rstrip("/")
+    return endpoint.rstrip("/")
+
+
+@lru_cache(maxsize=2)
+def _get_phoenix_client(base_url: str):
+    if PhoenixClient is None:
+        return None
+    return PhoenixClient(base_url=base_url)
+
+
+def _collect_numeric_scores(*payloads: Any) -> Dict[str, float]:
+    scores: Dict[str, float] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key, value in payload.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, Number):
+                score = float(value)
+                if 0.0 <= score <= 1.0:
+                    scores[str(key)] = score
+    return scores
+
+
+def _post_phoenix_annotations(span_id: str, scores: Dict[str, float]) -> None:
+    if not span_id or not scores or PhoenixClient is None:
+        return
+
+    try:
+        client = _get_phoenix_client(_phoenix_base_url())
+        if client is None:
+            return
+
+        span_annotations = [
+            {
+                "span_id": span_id,
+                "name": name,
+                "annotator_kind": "CODE",
+                "score": score,
+            }
+            for name, score in scores.items()
+        ]
+        client.spans.log_span_annotations(span_annotations=span_annotations, sync=False)
+    except Exception as error:  # pragma: no cover - telemetry must not break API responses
+        logger.warning("Failed to post Phoenix annotations for span %s: %s", span_id, error)
 
 
 def _prometheus_escape_label(value: str) -> str:
@@ -563,6 +626,8 @@ class ChatRequest(BaseModel):
     evaluate: bool = True
     judge_mode: str = Field(default_factory=_get_default_judge_mode, pattern="^(sync|async|off)$")
     conversation_history: List[Dict[str, str]] = Field(default_factory=list)
+    # Optional session id for Phoenix Sessions grouping; auto-generated when absent
+    session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -572,6 +637,7 @@ class ChatResponse(BaseModel):
     judge: Dict[str, Any]
     latency_ms: float
     backend: str
+    session_id: str
 
 
 @app.get("/health")
@@ -608,11 +674,16 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     started = time.perf_counter()
     error_msg = None
     client_ip = http_request.client.host if http_request.client else "unknown"
+    session_id = (request.session_id or "").strip() or str(uuid.uuid4())
 
     with tracer.start_as_current_span("nasa.rag.chat") as span:
         span.set_attribute("model", request.model)
         span.set_attribute("n_results", request.n_results)
         span.set_attribute("backend", backend_name)
+        # OpenInference attributes required for Phoenix Sessions page
+        span.set_attribute("session.id", session_id)
+        span.set_attribute("user.id", client_ip)
+        span.set_attribute("openinference.span.kind", "CHAIN")
 
         workflow_input = ChatWorkflowInput(
             question=request.question,
@@ -642,6 +713,17 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             span.set_attribute("judge_passed", bool(workflow_result.judge.get("passed", True)))
             span.set_attribute("error", False)
 
+            span_context = span.get_span_context()
+            if span_context and span_context.is_valid:
+                annotation_scores = _collect_numeric_scores(
+                    workflow_result.evaluation,
+                    workflow_result.judge,
+                )
+                _post_phoenix_annotations(
+                    span_id=format(span_context.span_id, "016x"),
+                    scores=annotation_scores,
+                )
+
             monitor.log_interaction(
                 question=request.question,
                 answer=workflow_result.answer,
@@ -661,6 +743,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                 judge=workflow_result.judge,
                 latency_ms=latency_ms,
                 backend=backend_name,
+                session_id=session_id,
             )
 
         except WorkflowError as error:
