@@ -28,6 +28,40 @@ _CHROMA_CLIENT_CACHE_MISSES = 0
 _EMBEDDING_FN_CACHE_HITS = 0
 _EMBEDDING_FN_CACHE_MISSES = 0
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "did",
+    "do",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "in",
+    "is",
+    "it",
+    "mission",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
+}
 
 
 def _get_first_pass_multiplier() -> int:
@@ -48,9 +82,145 @@ def _get_first_pass_max_candidates() -> int:
     return max(1, min(value, 100))
 
 
+def _hybrid_enabled() -> bool:
+    return os.getenv("RETRIEVAL_HYBRID_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_keyword_term_limit() -> int:
+    try:
+        value = int(os.getenv("RETRIEVAL_KEYWORD_TERM_LIMIT", "3"))
+    except ValueError:
+        value = 3
+    return max(1, min(value, 8))
+
+
+def _get_keyword_candidates_per_term() -> int:
+    try:
+        value = int(os.getenv("RETRIEVAL_KEYWORD_CANDIDATES_PER_TERM", "4"))
+    except ValueError:
+        value = 4
+    return max(1, min(value, 16))
+
+
 def _tokenize_for_rerank(text: str) -> set[str]:
     """Tokenize text into lowercase alphanumeric terms for overlap scoring."""
     return set(_TOKEN_PATTERN.findall((text or "").lower()))
+
+
+def _extract_keyword_terms(query: str) -> List[str]:
+    terms: List[str] = []
+    seen = set()
+    for token in _TOKEN_PATTERN.findall((query or "").lower()):
+        if len(token) < 3 or token in _STOP_WORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+    return terms
+
+
+def _flatten_results(results: Dict[str, Any]) -> tuple[list[str], list[Dict[str, Any]], list[Any], list[Any]]:
+    documents = list(((results.get("documents") or [[]])[0] or []))
+    metadatas = list(((results.get("metadatas") or [[]])[0] or []))
+    distances = list(((results.get("distances") or [[]])[0] or []))
+    ids = list(((results.get("ids") or [[]])[0] or []))
+    return documents, metadatas, distances, ids
+
+
+def _merge_candidate_results(
+    semantic_results: Dict[str, Any],
+    keyword_results: List[Dict[str, Any]],
+    max_candidates: int,
+) -> Dict[str, Any]:
+    documents, metadatas, distances, ids = _flatten_results(semantic_results)
+
+    merged_docs: List[str] = []
+    merged_metas: List[Dict[str, Any]] = []
+    merged_distances: List[Any] = []
+    merged_ids: List[Any] = []
+    seen_keys = set()
+
+    def _append(docs: list[str], metas: list[Dict[str, Any]], dists: list[Any], row_ids: list[Any]) -> None:
+        for idx, doc in enumerate(docs):
+            row_id = row_ids[idx] if idx < len(row_ids) else None
+            key = ("id", str(row_id)) if row_id is not None else ("doc", doc)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged_docs.append(doc)
+            merged_metas.append(metas[idx] if idx < len(metas) else {})
+            merged_distances.append(dists[idx] if idx < len(dists) else None)
+            merged_ids.append(row_id)
+            if len(merged_docs) >= max_candidates:
+                return
+
+    _append(documents, metadatas, distances, ids)
+    if len(merged_docs) < max_candidates:
+        for keyword_result in keyword_results:
+            k_docs, k_metas, k_dists, k_ids = _flatten_results(keyword_result)
+            _append(k_docs, k_metas, k_dists, k_ids)
+            if len(merged_docs) >= max_candidates:
+                break
+
+    merged = {
+        "documents": [merged_docs],
+        "metadatas": [merged_metas],
+    }
+    if any(distance is not None for distance in merged_distances):
+        merged["distances"] = [merged_distances]
+    if any(row_id is not None for row_id in merged_ids):
+        merged["ids"] = [merged_ids]
+    return merged
+
+
+def _run_hybrid_first_pass(
+    collection,
+    query: str,
+    first_pass_n: int,
+    where_filter: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    semantic_results = collection.query(
+        query_texts=[query],
+        n_results=first_pass_n,
+        where=where_filter,
+    )
+
+    if not _hybrid_enabled():
+        return semantic_results
+
+    keyword_terms = _extract_keyword_terms(query)[: _get_keyword_term_limit()]
+    if not keyword_terms:
+        return semantic_results
+
+    keyword_results: List[Dict[str, Any]] = []
+    keyword_n = min(first_pass_n, _get_keyword_candidates_per_term())
+
+    for term in keyword_terms:
+        try:
+            keyword_results.append(
+                collection.query(
+                    query_texts=[query],
+                    n_results=keyword_n,
+                    where=where_filter,
+                    where_document={"$contains": term},
+                )
+            )
+        except TypeError:
+            # Some test doubles or older collection wrappers may not expose where_document.
+            logger.debug("Keyword probe skipped: collection.query has no where_document support")
+            break
+        except Exception as error:
+            logger.debug("Keyword probe failed for term '%s': %s", term, error)
+
+    if not keyword_results:
+        return semantic_results
+
+    return _merge_candidate_results(
+        semantic_results=semantic_results,
+        keyword_results=keyword_results,
+        max_candidates=first_pass_n,
+    )
 
 
 def _rerank_documents(query: str, results: Dict[str, Any], keep_n: int) -> Dict[str, Any]:
@@ -293,10 +463,11 @@ def retrieve_documents(
         min(requested_n * _get_first_pass_multiplier(), _get_first_pass_max_candidates()),
     )
 
-    results = collection.query(
-        query_texts=[query],
-        n_results=first_pass_n,
-        where=where_filter
+    results = _run_hybrid_first_pass(
+        collection=collection,
+        query=query,
+        first_pass_n=first_pass_n,
+        where_filter=where_filter,
     )
 
     results = _rerank_documents(query=query, results=results, keep_n=requested_n)
