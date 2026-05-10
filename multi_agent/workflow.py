@@ -11,7 +11,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
 from threading import Lock, Semaphore
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import rag_client
 from monitoring.stage_sli_events import StageLatencyEventStore
@@ -441,30 +441,94 @@ class MultiAgentChatWorkflow:
         retrieval_key = self._retrieval_cache_key(effective_input)
         answer_key = self._answer_cache_key(effective_input)
 
-        # L1 cache (in-process):
-        retrieval_result = self._cache_get(self._retrieval_cache, retrieval_key)
-        
-        # L2 cache (Redis) if L1 miss:
-        if retrieval_result is None:
-            retrieval_result = self._redis_l2_cache.get_retrieval(
+        preflight_started = time.perf_counter()
+        try:
+            preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
+            preflight_result = self._await_result(preflight_future)
+        except StageOverloadError as error:
+            raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
+        preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+        self._record_stage_metric(
+            "preflight",
+            preflight_latency_ms,
+            timed_out=False,
+            status="ok",
+            mission=effective_input.mission_filter,
+            backend=backend_name,
+            model=effective_input.model,
+        )
+
+        if preflight_result.blocked_response:
+            return ChatWorkflowResult(
+                answer=preflight_result.blocked_response,
+                contexts=[],
+                evaluation={},
+                judge={
+                    "groundedness_score": 0.0,
+                    "safety_score": 1.0,
+                    "task_success_score": 0.0,
+                    "overall_score": 0.35,
+                    "confidence": 1.0,
+                    "passed": True,
+                    "low_confidence": True,
+                    "rationale": "Blocked by safety preflight before LLM generation.",
+                    "source": "policy",
+                },
+                blocked=True,
+            )
+
+        # Check answer cache before retrieval to avoid unnecessary query embeddings.
+        answer = self._cache_get(self._answer_cache, answer_key)
+        if answer is None:
+            # L2 cache (Redis) if L1 miss:
+            answer = self._redis_l2_cache.get_response(
                 effective_input.question,
                 effective_input.mission_filter,
-                effective_input.collection_name,
+                effective_input.model,
+                effective_input.evaluate,
             )
-            if retrieval_result is not None:
+            if answer is not None:
                 # Populate L1 on L2 hit
                 self._cache_set(
-                    self._retrieval_cache,
-                    retrieval_key,
-                    retrieval_result,
-                    ttl_seconds=self._retrieval_cache_ttl,
-                    max_entries=self._retrieval_cache_max_entries,
+                    self._answer_cache,
+                    answer_key,
+                    answer,
+                    ttl_seconds=self._answer_cache_ttl,
+                    max_entries=self._answer_cache_max_entries,
                 )
+
+        cached_answer_hit = answer is not None
+
+        retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+        if not cached_answer_hit:
+            # L1 cache (in-process):
+            retrieval_result = self._normalize_retrieval_payload(
+                self._cache_get(self._retrieval_cache, retrieval_key)
+            )
+
+            # L2 cache (Redis) if L1 miss:
+            if retrieval_result is None:
+                retrieval_result = self._normalize_retrieval_payload(
+                    self._redis_l2_cache.get_retrieval(
+                        effective_input.question,
+                        effective_input.mission_filter,
+                        effective_input.collection_name,
+                    )
+                )
+                if retrieval_result is not None:
+                    # Populate L1 on L2 hit
+                    self._cache_set(
+                        self._retrieval_cache,
+                        retrieval_key,
+                        retrieval_result,
+                        ttl_seconds=self._retrieval_cache_ttl,
+                        max_entries=self._retrieval_cache_max_entries,
+                    )
         
         retrieval_failed = False
         retrieval_failure_reason = ""
 
-        if retrieval_result is None:
+        if not cached_answer_hit and retrieval_result is None:
             if not self._retrieval_breaker.allow():
                 retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                 retrieval_failed = True
@@ -486,23 +550,6 @@ class MultiAgentChatWorkflow:
                         backend=backend_name,
                         model=effective_input.model,
                     )
-            preflight_started = time.perf_counter()
-            try:
-                preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
-            except StageOverloadError as error:
-                raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
-
-            preflight_result = self._await_result(preflight_future)
-            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
-            self._record_stage_metric(
-                "preflight",
-                preflight_latency_ms,
-                timed_out=False,
-                status="ok",
-                mission=effective_input.mission_filter,
-                backend=backend_name,
-                model=effective_input.model,
-            )
             if retrieval_result is None:
                 try:
                     retrieval_result = self._await_result(retrieval_future, timeout=self._retrieval_timeout_seconds)
@@ -567,23 +614,10 @@ class MultiAgentChatWorkflow:
                     retrieval_failure_reason = str(error)[:120]
                     logging.getLogger(__name__).warning("Retrieval failed, using fallback: %s", retrieval_failure_reason)
         else:
-            preflight_started = time.perf_counter()
-            try:
-                preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
-                preflight_result = self._await_result(preflight_future)
-            except StageOverloadError as error:
-                raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
-            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
-            self._record_stage_metric(
-                "preflight",
-                preflight_latency_ms,
-                timed_out=False,
-                status="ok",
-                mission=effective_input.mission_filter,
-                backend=backend_name,
-                model=effective_input.model,
-            )
             self._retrieval_breaker.record_success()
+
+        if retrieval_result is None:
+            retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
 
         # Apply context compression (dedup + mission priority + token cap) on the
         # raw retrieval result before passing context_text to generation.  The raw
@@ -593,24 +627,9 @@ class MultiAgentChatWorkflow:
             retrieval_result, effective_input.mission_filter
         )
 
-        if preflight_result.blocked_response:
-            return ChatWorkflowResult(
-                answer=preflight_result.blocked_response,
-                contexts=[],
-                evaluation={},
-                judge={
-                    "groundedness_score": 0.0,
-                    "safety_score": 1.0,
-                    "task_success_score": 0.0,
-                    "overall_score": 0.35,
-                    "confidence": 1.0,
-                    "passed": True,
-                    "low_confidence": True,
-                    "rationale": "Blocked by safety preflight before LLM generation.",
-                    "source": "policy",
-                },
-                blocked=True,
-            )
+        # Keep cached-answer behavior explicit: no retrieval contexts are relied on
+        # for judge/evaluation when answer cache satisfies the request.
+        contexts_for_quality = [] if cached_answer_hit else retrieval_result.contexts
 
         if retrieval_failed:
             return ChatWorkflowResult(
@@ -633,25 +652,6 @@ class MultiAgentChatWorkflow:
                 },
                 blocked=False,
             )
-
-        answer = self._cache_get(self._answer_cache, answer_key)
-        if answer is None:
-            # L2 cache (Redis) if L1 miss:
-            answer = self._redis_l2_cache.get_response(
-                effective_input.question,
-                effective_input.mission_filter,
-                effective_input.model,
-                effective_input.evaluate,
-            )
-            if answer is not None:
-                # Populate L1 on L2 hit
-                self._cache_set(
-                    self._answer_cache,
-                    answer_key,
-                    answer,
-                    ttl_seconds=self._answer_cache_ttl,
-                    max_entries=self._answer_cache_max_entries,
-                )
         
         if answer is None:
             if not self._generation_breaker.allow():
@@ -734,7 +734,7 @@ class MultiAgentChatWorkflow:
 
             answer = self.safety_worker.postflight(
                 answer=answer,
-                contexts=retrieval_result.contexts,
+                contexts=contexts_for_quality,
                 client_ip=workflow_input.client_ip,
             )
 
@@ -778,7 +778,7 @@ class MultiAgentChatWorkflow:
                 "collection_name": effective_input.collection_name,
                 "model": effective_input.model,
                 "answer": answer,
-                "contexts": retrieval_result.contexts,
+                "contexts": contexts_for_quality,
                 "client_ip": effective_input.client_ip,
             }
             # Phase 2: try broker first; fall back to in-process executor.
@@ -792,7 +792,7 @@ class MultiAgentChatWorkflow:
                         openai_key,
                         effective_input,
                         answer,
-                        retrieval_result.contexts,
+                        contexts_for_quality,
                     )
                 except StageOverloadError:
                     judge_overloaded = True
@@ -829,18 +829,18 @@ class MultiAgentChatWorkflow:
                 openai_key=openai_key,
                 workflow_input=effective_input,
                 answer=answer,
-                contexts=retrieval_result.contexts,
+                contexts=contexts_for_quality,
             )
 
         evaluation = self._evaluate(
             workflow_input=effective_input,
             answer=answer,
-            contexts=retrieval_result.contexts,
+            contexts=contexts_for_quality,
         )
 
         return ChatWorkflowResult(
             answer=answer,
-            contexts=retrieval_result.contexts,
+            contexts=contexts_for_quality,
             evaluation=evaluation,
             judge=judge,
             blocked=False,
@@ -1299,3 +1299,48 @@ class MultiAgentChatWorkflow:
             # Evict until size is within capacity.
             while len(cache) > max_entries:
                 cache.popitem(last=False)
+
+    def _normalize_retrieval_payload(self, payload: Any) -> RetrievalResult | None:
+        """Normalize retrieval payloads from L1/L2 caches into RetrievalResult."""
+        if payload is None:
+            return None
+        if isinstance(payload, RetrievalResult):
+            return payload
+
+        contexts: list[str] = []
+        metadatas: list[Dict[str, Any]] = []
+
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                context = item.get("context")
+                if not isinstance(context, str) or not context:
+                    continue
+                metadata = item.get("metadata")
+                contexts.append(context)
+                metadatas.append(metadata if isinstance(metadata, dict) else {})
+        elif isinstance(payload, dict):
+            raw_contexts = payload.get("contexts")
+            raw_metadatas = payload.get("metadatas")
+            if isinstance(raw_contexts, list):
+                for idx, context in enumerate(raw_contexts):
+                    if not isinstance(context, str) or not context:
+                        continue
+                    metadata = {}
+                    if isinstance(raw_metadatas, list) and idx < len(raw_metadatas):
+                        candidate = raw_metadatas[idx]
+                        if isinstance(candidate, dict):
+                            metadata = candidate
+                    contexts.append(context)
+                    metadatas.append(metadata)
+            elif isinstance(payload.get("context"), str):
+                context = payload.get("context")
+                metadata = payload.get("metadata")
+                contexts.append(context)
+                metadatas.append(metadata if isinstance(metadata, dict) else {})
+        else:
+            return None
+
+        context_text = rag_client.format_context(contexts, metadatas) if contexts else ""
+        return RetrievalResult(contexts=contexts, metadatas=metadatas, context_text=context_text)
