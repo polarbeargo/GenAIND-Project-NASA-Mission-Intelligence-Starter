@@ -303,16 +303,14 @@ def _post_phoenix_annotations(span_id: str, scores: Dict[str, float]) -> None:
         if client is None:
             return
 
-        span_annotations = [
-            {
-                "span_id": span_id,
-                "name": name,
-                "annotator_kind": "CODE",
-                "score": score,
-            }
-            for name, score in scores.items()
-        ]
-        client.spans.log_span_annotations(span_annotations=span_annotations, sync=False)
+        for name, score in scores.items():
+            client.spans.add_span_annotation(
+                span_id=span_id,
+                annotation_name=name,
+                annotator_kind="CODE",
+                score=score,
+                sync=False,
+            )
     except Exception as error:  # pragma: no cover - telemetry must not break API responses
         logger.warning("Failed to post Phoenix annotations for span %s: %s", span_id, error)
 
