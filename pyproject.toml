@@ -24,7 +24,13 @@ package = false
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+pythonpath = ["."]
 addopts = "--strict-markers"
 markers = [
     "redis: marks tests that require a live Redis instance (skipped when Redis is unavailable; pass --require-redis to fail instead)",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
 ]
