@@ -18,6 +18,9 @@ class _NoopSpan:
     def set_attribute(self, _key: str, _value: Any) -> None:
         return None
 
+    def get_span_context(self):
+        return None
+
 
 @contextmanager
 def _noop_span_context(_name: str):

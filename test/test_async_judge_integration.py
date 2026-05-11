@@ -336,7 +336,11 @@ class TestRedisJudgeIntegration(unittest.TestCase):
             side_effect=AssertionError("Fallback judge executor should not be used in broker e2e test")
         )
 
-        worker_process = multiprocessing.Process(
+        # Use fork to inherit sys.path from the pytest process; spawn (macOS
+        # default on Python 3.13) would start a fresh interpreter that cannot
+        # import project-local modules without a PYTHONPATH setup.
+        _fork_ctx = multiprocessing.get_context("fork")
+        worker_process = _fork_ctx.Process(
             target=_external_judge_worker_once,
             args=(stream_name, group_name, "test-ext-worker"),
             daemon=True,
