@@ -54,6 +54,54 @@ load_project_env(__file__)
 logger = logging.getLogger(__name__)
 security_dashboard = get_dashboard()
 
+
+def _get_api_profile() -> str:
+    profile = os.getenv("API_PROFILE", "interactive").strip().lower()
+    return profile if profile in {"interactive", "balanced", "throughput"} else "interactive"
+
+
+def _profile_default(interactive_value: Any, balanced_value: Any, throughput_value: Any | None = None) -> Any:
+    profile = _get_api_profile()
+    if profile == "interactive":
+        return interactive_value
+    if profile == "throughput" and throughput_value is not None:
+        return throughput_value
+    return balanced_value
+
+
+def _parse_int_range(name: str, default: int, min_val: int = 1, max_val: int = 64) -> int:
+    """Parse integer env var with bounds checking. Profile-aware: respects explicit env settings."""
+    if name in os.environ:
+        try:
+            return max(min_val, min(int(os.getenv(name)), max_val))
+        except (ValueError, TypeError):
+            pass
+    return max(min_val, min(default, max_val))
+
+
+def _parse_float_range(name: str, default: float, min_val: float = 0.0, max_val: float = 1000.0) -> float:
+    """Parse float env var with bounds checking. Profile-aware: respects explicit env settings."""
+    if name in os.environ:
+        try:
+            return max(min_val, min(float(os.getenv(name)), max_val))
+        except (ValueError, TypeError):
+            pass
+    return max(min_val, min(default, max_val))
+
+
+def _profiled_int(name: str, interactive: int, balanced: int, throughput: int | None = None) -> int:
+    """Profile-aware int with explicit env override (respects API_PROFILE setting for defaults only)."""
+    profile = _get_api_profile()
+    default = interactive if profile == "interactive" else (throughput if profile == "throughput" and throughput is not None else balanced)
+    return _parse_int_range(name, default, min_val=1, max_val=64)
+
+
+def _profiled_float(name: str, interactive: float, balanced: float, throughput: float | None = None, min_val: float = 0.0, max_val: float = 1000.0) -> float:
+    """Profile-aware float with explicit env override (respects API_PROFILE setting for defaults only)."""
+    profile = _get_api_profile()
+    default = interactive if profile == "interactive" else (throughput if profile == "throughput" and throughput is not None else balanced)
+    return _parse_float_range(name, default, min_val, max_val)
+
 try:
     from phoenix.client import Client as PhoenixClient
 except ImportError:  # pragma: no cover - optional dependency
@@ -90,51 +138,26 @@ security_auditor_bridge = SecurityDashboardAuditorBridge(security_dashboard)
 
 
 def _get_default_judge_mode() -> str:
-    mode = os.getenv("JUDGE_MODE_DEFAULT", "async").strip().lower()
-    return mode if mode in {"sync", "async", "off"} else "async"
+    """Get default judge mode with profile-aware defaults and explicit env override."""
+    profile = _get_api_profile()
+    default = "sync" if profile == "interactive" else "async"
+    mode = os.getenv("JUDGE_MODE_DEFAULT", default).strip().lower()
+    return mode if mode in {"sync", "async", "off"} else default
 
 
 def _get_judge_timeout_seconds() -> float:
-    try:
-        configured = float(os.getenv("JUDGE_TIMEOUT_SECONDS", "2.5"))
-    except ValueError:
-        configured = 2.5
-    return max(1.5, min(configured, 10.0))
+    return _profiled_float("JUDGE_TIMEOUT_SECONDS", 2.5, 2.5, 3.5, min_val=1.5, max_val=10.0)
 
 
-def _get_stage_timeout_seconds(name: str, default: float, min_value: float, max_value: float) -> float:
-    try:
-        configured = float(os.getenv(name, str(default)))
-    except ValueError:
-        configured = default
-    return max(min_value, min(configured, max_value))
 
-
-def _get_stage_worker_count(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1, min(value, 64))
-
-
-def _get_stage_queue_limit(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1, min(value, 5000))
 
 
 def _get_stage_submit_timeout_seconds() -> float:
-    try:
-        value = float(os.getenv("STAGE_QUEUE_SUBMIT_TIMEOUT_SECONDS", "0.05"))
-    except ValueError:
-        value = 0.05
-    return max(0.0, min(value, 5.0))
+    return _parse_float_range("STAGE_QUEUE_SUBMIT_TIMEOUT_SECONDS", 0.05, min_val=0.0, max_val=5.0)
 
 
 def _get_bool_env(name: str, default: bool = False) -> bool:
+    """Parse boolean env var (respects explicit True/False settings)."""
     value = os.getenv(name)
     if value is None:
         return default
@@ -162,19 +185,11 @@ def _get_judge_broker_group() -> str:
 
 
 def _get_breaker_failure_threshold() -> int:
-    try:
-        value = int(os.getenv("STAGE_BREAKER_FAILURE_THRESHOLD", "3"))
-    except ValueError:
-        value = 3
-    return max(1, min(value, 10))
+    return _parse_int_range("STAGE_BREAKER_FAILURE_THRESHOLD", 3, min_val=1, max_val=10)
 
 
 def _get_breaker_recovery_seconds() -> float:
-    try:
-        value = float(os.getenv("STAGE_BREAKER_RECOVERY_SECONDS", "20"))
-    except ValueError:
-        value = 20.0
-    return max(1.0, min(value, 120.0))
+    return _parse_float_range("STAGE_BREAKER_RECOVERY_SECONDS", 20.0, min_val=1.0, max_val=120.0)
 
 
 def _judge_timed_out(judge: Dict[str, Any]) -> bool:
@@ -185,72 +200,77 @@ def _judge_timed_out(judge: Dict[str, Any]) -> bool:
 
 
 def _get_compression_max_tokens() -> int:
-    try:
-        value = int(os.getenv("CONTEXT_MAX_TOKENS", "2000"))
-    except ValueError:
-        value = 2000
-    return max(200, min(value, 8000))
+    return _parse_int_range("CONTEXT_MAX_TOKENS", 2000, min_val=200, max_val=8000)
 
 
 def _get_compression_dedup_threshold() -> float:
-    try:
-        value = float(os.getenv("CONTEXT_DEDUP_THRESHOLD", "0.85"))
-    except ValueError:
-        value = 0.85
-    return max(0.5, min(value, 1.0))
+    return _parse_float_range("CONTEXT_DEDUP_THRESHOLD", 0.85, min_val=0.5, max_val=1.0)
 
 
 def _get_depth_threshold(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1, min(value, 10))
+    return _parse_int_range(name, default, min_val=1, max_val=10)
 
 
 def _get_evaluation_mode() -> str:
-    mode = os.getenv("EVALUATION_MODE", "async").strip().lower()
-    return mode if mode in {"async", "sync", "off"} else "async"
+    """Get evaluation mode with profile defaults but explicit env override."""
+    profile = _get_api_profile()
+    default = "sync" if profile == "interactive" else "async"
+    mode = os.getenv("EVALUATION_MODE", str(default)).strip().lower()
+    return mode if mode in {"async", "sync", "off"} else default
+
+
+def _get_profiled_stage_timeout(
+    name: str,
+    interactive_default: float,
+    balanced_default: float,
+    throughput_default: float,
+    min_value: float,
+    max_value: float,
+) -> float:
+    """Profile-aware stage timeout with explicit env override and bounds checking."""
+    return _profiled_float(name, interactive_default, balanced_default, throughput_default, min_value, max_value)
+
+
+def _get_profiled_stage_worker_count(
+    name: str,
+    interactive_default: int,
+    balanced_default: int,
+    throughput_default: int,
+) -> int:
+    """Profile-aware stage worker count with explicit env override."""
+    return _profiled_int(name, interactive_default, balanced_default, throughput_default)
+
+
+def _get_profiled_stage_queue_limit(
+    name: str,
+    interactive_default: int,
+    balanced_default: int,
+    throughput_default: int,
+) -> int:
+    """Profile-aware stage queue limit with explicit env override."""
+    profile = _get_api_profile()
+    default = interactive_default if profile == "interactive" else (throughput_default if profile == "throughput" else balanced_default)
+    return _parse_int_range(name, default, min_val=1, max_val=5000)
 
 
 def _get_latency_budget_ms(name: str, default: float) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1.0, min(value, 30000.0))
+    return _parse_float_range(name, default, min_val=1.0, max_val=30000.0)
 
 
 def _get_stage_sli_retention_hours() -> float:
-    try:
-        value = float(os.getenv("STAGE_SLI_RETENTION_HOURS", "168"))
-    except ValueError:
-        value = 168.0
-    return max(1.0, min(value, 24.0 * 365.0))
+    return _parse_float_range("STAGE_SLI_RETENTION_HOURS", 168.0, min_val=1.0, max_val=24.0 * 365.0)
 
 
 def _get_stage_sli_max_file_bytes() -> int:
-    try:
-        value = int(os.getenv("STAGE_SLI_MAX_FILE_BYTES", str(20 * 1024 * 1024)))
-    except ValueError:
-        value = 20 * 1024 * 1024
-    return max(1024 * 1024, min(value, 512 * 1024 * 1024))
+    return _parse_int_range("STAGE_SLI_MAX_FILE_BYTES", 20 * 1024 * 1024, min_val=1024 * 1024, max_val=512 * 1024 * 1024)
 
 
 def _get_stage_sli_max_rotated_files() -> int:
-    try:
-        value = int(os.getenv("STAGE_SLI_MAX_ROTATED_FILES", "10"))
-    except ValueError:
-        value = 10
-    return max(1, min(value, 200))
+    return _parse_int_range("STAGE_SLI_MAX_ROTATED_FILES", 10, min_val=1, max_val=200)
 
 
 def _get_stage_sli_maintenance_seconds() -> float:
-    try:
-        value = float(os.getenv("STAGE_SLI_MAINTENANCE_SECONDS", "60"))
-    except ValueError:
-        value = 60.0
-    return max(1.0, min(value, 3600.0))
+    return _parse_float_range("STAGE_SLI_MAINTENANCE_SECONDS", 60.0, min_val=1.0, max_val=3600.0)
 
 
 def _get_stage_sli_log_path() -> Path:
@@ -554,14 +574,29 @@ chat_workflow = MultiAgentChatWorkflow(
     broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
     context_max_tokens=_get_compression_max_tokens(),
     context_dedup_threshold=_get_compression_dedup_threshold(),
-    retrieval_timeout_seconds=_get_stage_timeout_seconds(
-        "RETRIEVAL_TIMEOUT_SECONDS", default=1.8, min_value=0.2, max_value=10.0
+    retrieval_timeout_seconds=_get_profiled_stage_timeout(
+        "RETRIEVAL_TIMEOUT_SECONDS",
+        interactive_default=1.8,
+        balanced_default=1.8,
+        throughput_default=2.4,
+        min_value=0.2,
+        max_value=10.0,
     ),
-    generation_timeout_seconds=_get_stage_timeout_seconds(
-        "GENERATION_TIMEOUT_SECONDS", default=8.0, min_value=0.5, max_value=30.0
+    generation_timeout_seconds=_get_profiled_stage_timeout(
+        "GENERATION_TIMEOUT_SECONDS",
+        interactive_default=6.5,
+        balanced_default=8.0,
+        throughput_default=10.0,
+        min_value=0.5,
+        max_value=30.0,
     ),
-    evaluation_timeout_seconds=_get_stage_timeout_seconds(
-        "EVALUATION_TIMEOUT_SECONDS", default=3.5, min_value=0.5, max_value=20.0
+    evaluation_timeout_seconds=_get_profiled_stage_timeout(
+        "EVALUATION_TIMEOUT_SECONDS",
+        interactive_default=2.5,
+        balanced_default=3.5,
+        throughput_default=5.0,
+        min_value=0.5,
+        max_value=20.0,
     ),
     breaker_failure_threshold=_get_breaker_failure_threshold(),
     breaker_recovery_seconds=_get_breaker_recovery_seconds(),
@@ -569,16 +604,16 @@ chat_workflow = MultiAgentChatWorkflow(
     retrieval_budget_ms=_get_latency_budget_ms("RETRIEVAL_BUDGET_MS", 700.0),
     generation_budget_ms=_get_latency_budget_ms("GENERATION_BUDGET_MS", 1800.0),
     evaluation_mode=_get_evaluation_mode(),
-    safety_workers=_get_stage_worker_count("SAFETY_WORKERS", 2),
-    retrieval_workers=_get_stage_worker_count("RETRIEVAL_WORKERS", 4),
-    generation_workers=_get_stage_worker_count("GENERATION_WORKERS", 4),
-    judge_workers=_get_stage_worker_count("JUDGE_WORKERS", 2),
-    evaluation_workers=_get_stage_worker_count("EVALUATION_WORKERS", 2),
-    safety_queue_limit=_get_stage_queue_limit("SAFETY_QUEUE_LIMIT", 200),
-    retrieval_queue_limit=_get_stage_queue_limit("RETRIEVAL_QUEUE_LIMIT", 200),
-    generation_queue_limit=_get_stage_queue_limit("GENERATION_QUEUE_LIMIT", 200),
-    judge_queue_limit=_get_stage_queue_limit("JUDGE_QUEUE_LIMIT", 100),
-    evaluation_queue_limit=_get_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 200),
+    safety_workers=_get_profiled_stage_worker_count("SAFETY_WORKERS", 2, 3, 4),
+    retrieval_workers=_get_profiled_stage_worker_count("RETRIEVAL_WORKERS", 4, 8, 12),
+    generation_workers=_get_profiled_stage_worker_count("GENERATION_WORKERS", 4, 8, 12),
+    judge_workers=_get_profiled_stage_worker_count("JUDGE_WORKERS", 1, 2, 4),
+    evaluation_workers=_get_profiled_stage_worker_count("EVALUATION_WORKERS", 1, 2, 4),
+    safety_queue_limit=_get_profiled_stage_queue_limit("SAFETY_QUEUE_LIMIT", 120, 240, 400),
+    retrieval_queue_limit=_get_profiled_stage_queue_limit("RETRIEVAL_QUEUE_LIMIT", 160, 600, 1200),
+    generation_queue_limit=_get_profiled_stage_queue_limit("GENERATION_QUEUE_LIMIT", 160, 600, 1200),
+    judge_queue_limit=_get_profiled_stage_queue_limit("JUDGE_QUEUE_LIMIT", 80, 160, 240),
+    evaluation_queue_limit=_get_profiled_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 120, 300, 500),
     queue_submit_timeout_seconds=_get_stage_submit_timeout_seconds(),
     evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
     evaluation_broker_stream=_get_evaluation_broker_stream(),
@@ -623,9 +658,25 @@ class ChatRequest(BaseModel):
     model: str = Field(default_factory=get_openai_chat_model)
     evaluate: bool = True
     judge_mode: str = Field(default_factory=_get_default_judge_mode, pattern="^(sync|async|off)$")
-    conversation_history: List[Dict[str, str]] = Field(default_factory=list)
+    conversation_history: List[Dict[str, Any]] = Field(default_factory=list)
     # Optional session id for Phoenix Sessions grouping; auto-generated when absent
     session_id: Optional[str] = None
+
+
+def _normalize_conversation_history(history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Keep only chat-role/content pairs and sanitize + filter for workflow safety."""
+    normalized: List[Dict[str, str]] = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        normalized.append({"role": str(role), "content": content})
+    return normalized
 
 
 class ChatResponse(BaseModel):
@@ -692,7 +743,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             model=request.model,
             evaluate=request.evaluate,
             judge_mode=request.judge_mode,
-            conversation_history=request.conversation_history,
+            conversation_history=_normalize_conversation_history(request.conversation_history),
             client_ip=client_ip,
         )
 
