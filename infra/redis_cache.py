@@ -34,15 +34,17 @@ class RedisL2Cache:
         self, query: str, mission_filter: Optional[str], collection_name: str
     ) -> str:
         """Generate cache key for retrieval results."""
-        normalized = f"{query.strip().lower()}:{mission_filter or '':collection_name}"
+        normalized = f"{query.strip().lower()}:{mission_filter or ''}:{collection_name}"
         hash_val = hashlib.md5(normalized.encode()).hexdigest()
         return f"cache:retrieval:{hash_val}"
 
     def _cache_key_response(
-        self, query: str, mission_filter: Optional[str], model: str, evaluate: bool
+        self, query: str, mission_filter: Optional[str], collection_name: str, model: str, evaluate: bool
     ) -> str:
         """Generate cache key for response results."""
-        normalized = f"{query.strip().lower()}:{mission_filter or ''}:{model}:{evaluate}"
+        normalized = (
+            f"{query.strip().lower()}:{mission_filter or ''}:{collection_name}:{model}:{evaluate}"
+        )
         hash_val = hashlib.md5(normalized.encode()).hexdigest()
         return f"cache:response:{hash_val}"
 
@@ -78,13 +80,13 @@ class RedisL2Cache:
         logger.debug(f"L2 retrieval cache SET: {key}")
 
     def get_response(
-        self, query: str, mission_filter: Optional[str], model: str, evaluate: bool
+        self, query: str, mission_filter: Optional[str], collection_name: str, model: str, evaluate: bool
     ) -> Optional[Dict[str, Any]]:
         """Get cached response (answer + metadata)."""
         if not self.redis.is_available():
             return None
 
-        key = self._cache_key_response(query, mission_filter, model, evaluate)
+        key = self._cache_key_response(query, mission_filter, collection_name, model, evaluate)
         result = self.redis.get(key)
         if result is not None:
             self._hits += 1
@@ -97,6 +99,7 @@ class RedisL2Cache:
         self,
         query: str,
         mission_filter: Optional[str],
+        collection_name: str,
         model: str,
         evaluate: bool,
         response: Dict[str, Any],
@@ -105,7 +108,7 @@ class RedisL2Cache:
         if not self.redis.is_available():
             return
 
-        key = self._cache_key_response(query, mission_filter, model, evaluate)
+        key = self._cache_key_response(query, mission_filter, collection_name, model, evaluate)
         self.redis.set(key, response, ex=self.response_ttl)
         logger.debug(f"L2 response cache SET: {key}")
 

@@ -190,21 +190,25 @@ def display_evaluation_metrics(scores: Dict[str, float]):
     st.sidebar.subheader("📊 Response Quality")
     
     for metric_name, score in scores.items():
+        if metric_name.endswith("_ms") or "submitted_at" in metric_name:
+            continue
         if isinstance(score, (int, float)):
-            if score >= 0.8:
+            normalized_score = max(0.0, min(float(score), 1.0))
+
+            if normalized_score >= 0.8:
                 color = "green"
-            elif score >= 0.6:
+            elif normalized_score >= 0.6:
                 color = "orange"
             else:
                 color = "red"
-            
+
             st.sidebar.metric(
                 label=metric_name.replace('_', ' ').title(),
                 value=f"{score:.3f}",
-                delta=None
+                delta=None,
             )
 
-            st.sidebar.progress(score)
+            st.sidebar.progress(normalized_score)
 
 def main():
     st.title("🚀 NASA Space Mission Chat with Evaluation")

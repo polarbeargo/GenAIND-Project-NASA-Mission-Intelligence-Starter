@@ -481,12 +481,17 @@ class MultiAgentChatWorkflow:
         answer = self._cache_get(self._answer_cache, answer_key)
         if answer is None:
             # L2 cache (Redis) if L1 miss:
-            answer = self._redis_l2_cache.get_response(
-                effective_input.question,
-                effective_input.mission_filter,
-                effective_input.model,
-                effective_input.evaluate,
-            )
+            try:
+                answer = self._redis_l2_cache.get_response(
+                    effective_input.question,
+                    effective_input.mission_filter,
+                    effective_input.collection_name,
+                    effective_input.model,
+                    effective_input.evaluate,
+                )
+            except Exception as _l2_err:
+                logging.getLogger(__name__).debug("L2 answer cache read skipped: %s", _l2_err)
+                answer = None
             if answer is not None:
                 # Populate L1 on L2 hit
                 self._cache_set(
@@ -508,13 +513,17 @@ class MultiAgentChatWorkflow:
 
             # L2 cache (Redis) if L1 miss:
             if retrieval_result is None:
-                retrieval_result = self._normalize_retrieval_payload(
-                    self._redis_l2_cache.get_retrieval(
-                        effective_input.question,
-                        effective_input.mission_filter,
-                        effective_input.collection_name,
+                try:
+                    retrieval_result = self._normalize_retrieval_payload(
+                        self._redis_l2_cache.get_retrieval(
+                            effective_input.question,
+                            effective_input.mission_filter,
+                            effective_input.collection_name,
+                        )
                     )
-                )
+                except Exception as _l2_err:
+                    logging.getLogger(__name__).debug("L2 retrieval cache read skipped: %s", _l2_err)
+                    retrieval_result = None
                 if retrieval_result is not None:
                     # Populate L1 on L2 hit
                     self._cache_set(
@@ -571,16 +580,6 @@ class MultiAgentChatWorkflow:
                         ttl_seconds=self._retrieval_cache_ttl,
                         max_entries=self._retrieval_cache_max_entries,
                     )
-                    # Also set in L2 (Redis) for cross-pod sharing
-                    self._redis_l2_cache.set_retrieval(
-                        effective_input.question,
-                        effective_input.mission_filter,
-                        effective_input.collection_name,
-                        [
-                            {"context": c, "metadata": m}
-                            for c, m in zip(retrieval_result.contexts, retrieval_result.metadatas)
-                        ],
-                    )
                 except TimeoutError:
                     self._retrieval_breaker.record_failure()
                     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
@@ -615,6 +614,22 @@ class MultiAgentChatWorkflow:
                     logging.getLogger(__name__).warning("Retrieval failed, using fallback: %s", retrieval_failure_reason)
         else:
             self._retrieval_breaker.record_success()
+
+        # Write successful retrieval to L2 cache outside the retrieval try/except so
+        # a Redis error cannot retroactively mark a good retrieval as failed.
+        if not retrieval_failed and retrieval_result is not None and not cached_answer_hit:
+            try:
+                self._redis_l2_cache.set_retrieval(
+                    effective_input.question,
+                    effective_input.mission_filter,
+                    effective_input.collection_name,
+                    [
+                        {"context": c, "metadata": m}
+                        for c, m in zip(retrieval_result.contexts, retrieval_result.metadatas)
+                    ],
+                )
+            except Exception as _l2_err:
+                logging.getLogger(__name__).debug("L2 retrieval cache write skipped: %s", _l2_err)
 
         if retrieval_result is None:
             retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
@@ -747,13 +762,17 @@ class MultiAgentChatWorkflow:
             )
             
             # Also set in L2 (Redis) for cross-pod sharing
-            self._redis_l2_cache.set_response(
-                effective_input.question,
-                effective_input.mission_filter,
-                effective_input.model,
-                effective_input.evaluate,
-                answer,
-            )
+            try:
+                self._redis_l2_cache.set_response(
+                    effective_input.question,
+                    effective_input.mission_filter,
+                    effective_input.collection_name,
+                    effective_input.model,
+                    effective_input.evaluate,
+                    answer,
+                )
+            except Exception as _l2_err:
+                logging.getLogger(__name__).debug("L2 answer cache write skipped: %s", _l2_err)
 
         judge_mode = (workflow_input.judge_mode or "async").lower()
         if judge_mode == "off":

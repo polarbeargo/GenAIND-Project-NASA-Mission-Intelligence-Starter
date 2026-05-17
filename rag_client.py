@@ -174,16 +174,50 @@ def _merge_candidate_results(
     return merged
 
 
+def _query_collection(
+    collection,
+    query: str,
+    n_results: int,
+    where_filter: Optional[Dict[str, Any]],
+    where_document: Optional[Dict[str, Any]] = None,
+    query_embedding: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    query_kwargs: Dict[str, Any] = {
+        "n_results": n_results,
+        "where": where_filter,
+    }
+    if where_document is not None:
+        query_kwargs["where_document"] = where_document
+
+    if query_embedding is not None:
+        query_kwargs["query_embeddings"] = [query_embedding]
+    else:
+        query_kwargs["query_texts"] = [query]
+
+    return collection.query(**query_kwargs)
+
+
 def _run_hybrid_first_pass(
     collection,
     query: str,
     first_pass_n: int,
     where_filter: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    semantic_results = collection.query(
-        query_texts=[query],
+    query_embedding = None
+    embedding_function = _build_embedding_function()
+    if embedding_function is not None:
+        try:
+            embedded_query = embedding_function([query])[0]
+            query_embedding = embedded_query.tolist() if hasattr(embedded_query, "tolist") else embedded_query
+        except Exception as error:
+            logger.debug("Query embedding precompute failed; falling back to query_texts: %s", error)
+
+    semantic_results = _query_collection(
+        collection=collection,
+        query=query,
         n_results=first_pass_n,
-        where=where_filter,
+        where_filter=where_filter,
+        query_embedding=query_embedding,
     )
 
     if not _hybrid_enabled():
@@ -199,11 +233,13 @@ def _run_hybrid_first_pass(
     for term in keyword_terms:
         try:
             keyword_results.append(
-                collection.query(
-                    query_texts=[query],
+                _query_collection(
+                    collection=collection,
+                    query=query,
                     n_results=keyword_n,
-                    where=where_filter,
+                    where_filter=where_filter,
                     where_document={"$contains": term},
+                    query_embedding=query_embedding,
                 )
             )
         except TypeError:
