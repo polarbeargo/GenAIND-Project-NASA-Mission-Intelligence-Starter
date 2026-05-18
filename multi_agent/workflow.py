@@ -979,6 +979,18 @@ class MultiAgentChatWorkflow:
                 answer,
                 contexts,
             )
+        elif not self._evaluation_broker.has_active_consumers():
+            logging.getLogger(__name__).warning(
+                "Evaluation broker has no active consumers; running local async fallback for job %s",
+                job_id,
+            )
+            self._eval_executor.submit(
+                self._run_async_evaluation,
+                job_id,
+                workflow_input,
+                answer,
+                contexts,
+            )
         return pending
 
     def _run_async_evaluation(
@@ -989,6 +1001,13 @@ class MultiAgentChatWorkflow:
         contexts,
     ) -> None:
         started = time.perf_counter()
+
+        # Cross-pod idempotency: only one worker/pod should execute a job.
+        if self._redis_job_store.is_completed(job_id):
+            return
+        if not self._redis_job_store.acquire_processing(job_id, processing_ttl_seconds=300):
+            return
+
         if not self._evaluation_breaker.allow():
             payload = {
                 "job_id": job_id,
@@ -999,15 +1018,10 @@ class MultiAgentChatWorkflow:
                 "error": "evaluation circuit breaker open",
             }
             self._record_evaluation_job(job_id, payload)
+            self._redis_job_store.release_processing(job_id)
             return
         try:
-            eval_future = self._eval_executor.submit(
-                self.analysis_worker.evaluate,
-                workflow_input,
-                answer,
-                contexts,
-            )
-            result = self._await_result(eval_future, timeout=self._evaluation_timeout_seconds)
+            result = self.analysis_worker.evaluate(workflow_input, answer, contexts)
             latency_ms = (time.perf_counter() - started) * 1000.0
             self._record_stage_metric(
                 "evaluation",
@@ -1057,6 +1071,8 @@ class MultiAgentChatWorkflow:
             }
             self._record_evaluation_job(job_id, payload)
             logging.getLogger(__name__).warning("Async evaluation failed: %s", str(error)[:120])
+        finally:
+            self._redis_job_store.release_processing(job_id)
 
     def _record_evaluation_job(self, job_id: str, payload: Dict[str, Any]) -> None:
         # Store in L1 (in-process)

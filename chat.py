@@ -26,6 +26,9 @@ from typing import Dict, List, Optional
 
 load_project_env(__file__)
 
+_EVAL_POLL_INTERVAL_SECONDS = 1.0
+_EVAL_PENDING_TIMEOUT_SECONDS = 90.0
+
 st.set_page_config(
     page_title="NASA RAG Chat with Evaluation",
     page_icon="🚀",
@@ -79,6 +82,25 @@ def call_chat_api(
             return {"error": f"Unexpected API call failure: {request_error}"}
 
     return {"error": "Unknown failure calling /chat"}
+
+
+def call_evaluation_job_api(
+    api_base_url: str,
+    job_id: str,
+    timeout_seconds: float = 2.0,
+) -> Dict:
+    """Fetch one async evaluation job result from FastAPI."""
+    endpoint = f"{api_base_url.rstrip('/')}/evaluation/{job_id}"
+    headers = {
+        "Accept": "application/json",
+    }
+    req = urllib_request.Request(endpoint, headers=headers, method="GET")
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
+            data = response.read().decode("utf-8")
+            return json.loads(data) if data else {}
+    except Exception:
+        return {}
 
 
 def run_local_chat_turn(
@@ -179,6 +201,9 @@ def display_evaluation_metrics(scores: Dict[str, float]):
     if scores.get("status") == "pending_or_unavailable":
         st.sidebar.info("Evaluation is pending or unavailable for this turn.")
         return
+    if str(scores.get("status", "")).lower() == "pending":
+        st.sidebar.info("Evaluation is running in background. Metrics will appear shortly.")
+        return
 
     if "error" in scores:
         if scores["error"] == "No contexts available for evaluation":
@@ -190,6 +215,8 @@ def display_evaluation_metrics(scores: Dict[str, float]):
     st.sidebar.subheader("📊 Response Quality")
     
     for metric_name, score in scores.items():
+        if metric_name in {"status", "source", "job_id", "question"}:
+            continue
         if metric_name.endswith("_ms") or "submitted_at" in metric_name:
             continue
         if isinstance(score, (int, float)):
@@ -285,6 +312,48 @@ def main():
         
         if (st.session_state.current_backend != selected_backend_key):
             st.session_state.current_backend = selected_backend_key
+
+    # Keep API path fast: poll async evaluation jobs outside /chat request path.
+    if enable_evaluation and execution_mode == "API (/chat)":
+        current_eval = st.session_state.last_evaluation
+        if isinstance(current_eval, dict):
+            pending_status = str(current_eval.get("status", "")).lower() == "pending"
+            job_id = str(current_eval.get("job_id", "")).strip()
+            if pending_status and job_id:
+                job_payload = call_evaluation_job_api(
+                    api_base_url=api_base_url,
+                    job_id=job_id,
+                    timeout_seconds=min(3.0, float(api_timeout_seconds)),
+                )
+                job_result = job_payload.get("result") if isinstance(job_payload, dict) else None
+                if isinstance(job_result, dict):
+                    result_status = str(job_result.get("status", "")).lower()
+                    if result_status in {"completed", "done", "success", "ok"}:
+                        st.session_state.last_evaluation = job_result
+                    elif "error" in job_result or result_status in {"failed", "error", "timeout"}:
+                        st.session_state.last_evaluation = job_result
+                    elif any(
+                        metric_key in job_result
+                        for metric_key in {"response_relevancy", "faithfulness", "bleu_score", "rouge_score"}
+                    ):
+                        st.session_state.last_evaluation = job_result
+
+                latest_eval = st.session_state.last_evaluation
+                still_pending = isinstance(latest_eval, dict) and str(latest_eval.get("status", "")).lower() == "pending"
+                if still_pending:
+                    submitted_at_ms = latest_eval.get("submitted_at_ms")
+                    elapsed_seconds = 0.0
+                    if isinstance(submitted_at_ms, (int, float)):
+                        elapsed_seconds = max(0.0, (time.time() * 1000.0 - float(submitted_at_ms)) / 1000.0)
+
+                    if elapsed_seconds > _EVAL_PENDING_TIMEOUT_SECONDS:
+                        st.session_state.last_evaluation = {
+                            "status": "pending_or_unavailable",
+                            "error": "Evaluation is still pending after timeout window",
+                        }
+                    else:
+                        time.sleep(_EVAL_POLL_INTERVAL_SECONDS)
+                        st.rerun()
     
     if st.session_state.last_evaluation and enable_evaluation:
         display_evaluation_metrics(st.session_state.last_evaluation)

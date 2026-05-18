@@ -72,6 +72,18 @@ class RedisEvaluationBroker:
             logger.warning("Failed to enqueue evaluation job %s: %s", job_id, error)
             return False
 
+    def has_active_consumers(self) -> bool:
+        """Return True when at least one consumer is registered on the group."""
+        if not self._ensure_group():
+            return False
+
+        try:
+            consumers = self.redis._client.xinfo_consumers(self.stream_name, self.consumer_group)
+            return bool(consumers)
+        except Exception as error:
+            logger.debug("Failed to inspect evaluation consumers: %s", error)
+            return False
+
     def consume(
         self,
         consumer_name: str,
