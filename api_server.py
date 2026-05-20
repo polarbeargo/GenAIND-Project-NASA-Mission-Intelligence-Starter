@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from numbers import Number
 import os
 import time
@@ -15,12 +16,15 @@ from typing import Dict, List, Optional, Any
 
 from env_utils import load_project_env
 from fastapi import FastAPI, HTTPException, status, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 import rag_client
 import llm_client
 import ragas_evaluator
+from infra.redis_client import get_redis_client
 from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
@@ -162,6 +166,24 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_rate_limit_enabled() -> bool:
+    return _get_bool_env("RATE_LIMIT_ENABLED", default=True)
+
+
+def _get_rate_limit_requests_per_period() -> int:
+    return _profiled_int("RATE_LIMIT_REQUESTS_PER_PERIOD", 20, 60, 120)
+
+
+def _get_rate_limit_period_seconds() -> int:
+    return _parse_int_range("RATE_LIMIT_PERIOD_SECONDS", 60, min_val=1, max_val=3600)
+
+
+def _get_rate_limit_paths() -> List[str]:
+    configured = os.getenv("RATE_LIMIT_PATHS", "/chat").strip()
+    paths = [path.strip() for path in configured.split(",") if path.strip()]
+    return paths or ["/chat"]
 
 
 def _get_evaluation_broker_stream() -> str:
@@ -415,6 +437,102 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
     lines.append(f"nasa_worker_pool_generated_at_ms {generated_at_ms}")
     return "\n".join(lines) + "\n"
 
+
+class RedisSlidingWindowRateLimiter:
+    """Distributed sliding-window limiter backed by Redis sorted sets."""
+
+    LUA_SCRIPT = """
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local request_id = ARGV[3]
+
+local now_parts = redis.call("TIME")
+local now_ms = (tonumber(now_parts[1]) * 1000) + math.floor(tonumber(now_parts[2]) / 1000)
+local window_start = now_ms - window_ms
+
+redis.call("ZREMRANGEBYSCORE", key, 0, window_start)
+
+local current = redis.call("ZCARD", key)
+local oldest = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
+local retry_after_ms = window_ms
+if oldest[2] then
+    retry_after_ms = window_ms - (now_ms - tonumber(oldest[2]))
+end
+if retry_after_ms < 1 then
+    retry_after_ms = 1
+end
+
+if current >= limit then
+    return {0, current, retry_after_ms}
+end
+
+redis.call("ZADD", key, now_ms, request_id)
+redis.call("PEXPIRE", key, window_ms)
+current = current + 1
+return {1, current, retry_after_ms}
+"""
+
+    def __init__(self, requests_per_period: int, period_seconds: int, paths: List[str], enabled: bool = True):
+        self.requests_per_period = max(1, int(requests_per_period))
+        self.period_seconds = max(1, int(period_seconds))
+        self.paths = {path.strip() for path in paths if path.strip()}
+        self.enabled = enabled
+
+    def should_limit_path(self, path: str) -> bool:
+        return self.enabled and path in self.paths
+
+    def check(self, client_ip: str, path: str) -> Optional[Dict[str, Any]]:
+        if not self.should_limit_path(path):
+            return None
+
+        redis_client = get_redis_client()
+        if not redis_client.is_available():
+            logger.warning("Rate limiting disabled for %s because Redis is unavailable", path)
+            return None
+
+        key = f"rate_limit:{path.lstrip('/').replace('/', ':')}:{client_ip}"
+        window_ms = self.period_seconds * 1000
+        request_id = str(uuid.uuid4())
+        result = redis_client.eval(self.LUA_SCRIPT, 1, key, self.requests_per_period, window_ms, request_id)
+
+        if not result:
+            logger.warning("Rate limiting failed open for %s because Redis eval returned no result", path)
+            return None
+
+        allowed = bool(int(result[0]))
+        current = int(result[1])
+        retry_after_ms = max(1, int(result[2]))
+        remaining = max(0, self.requests_per_period - current)
+        reset_after_seconds = max(1, math.ceil(retry_after_ms / 1000))
+
+        return {
+            "allowed": allowed,
+            "limit": self.requests_per_period,
+            "current": current,
+            "remaining": remaining,
+            "retry_after_seconds": reset_after_seconds,
+            "window_seconds": self.period_seconds,
+            "key": key,
+        }
+
+
+def _apply_security_headers(response: Response) -> Response:
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    return response
+
+
+def _apply_rate_limit_headers(response: Response, rate_limit: Dict[str, Any]) -> Response:
+    response.headers["X-RateLimit-Limit"] = str(rate_limit["limit"])
+    response.headers["X-RateLimit-Remaining"] = str(rate_limit["remaining"])
+    response.headers["X-RateLimit-Reset"] = str(rate_limit["retry_after_seconds"])
+    response.headers["Retry-After"] = str(rate_limit["retry_after_seconds"])
+    return response
+
 class CacheStats:
     """Track cache performance metrics for monitoring."""
 
@@ -541,6 +659,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="NASA Mission Intelligence API", version="1.0.0", lifespan=lifespan)
 tracer = init_telemetry(app, service_name="nasa-mission-intelligence-api")
 monitor = EvidentlyMonitor()
+rate_limiter = RedisSlidingWindowRateLimiter(
+    requests_per_period=_get_rate_limit_requests_per_period(),
+    period_seconds=_get_rate_limit_period_seconds(),
+    paths=_get_rate_limit_paths(),
+    enabled=_get_rate_limit_enabled(),
+)
 
 # Initialize security controls (LLM10: Resource limiting)
 resource_limiter = ResourceLimitEnforcer(
@@ -632,12 +756,45 @@ chat_workflow = MultiAgentChatWorkflow(
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    rate_limit_result = None
+
+    if rate_limiter.should_limit_path(request.url.path):
+        try:
+            rate_limit_result = await run_in_threadpool(rate_limiter.check, client_ip, request.url.path)
+        except Exception as error:
+            logger.warning("Rate limit check failed open for %s %s: %s", request.method, request.url.path, error)
+
+        if rate_limit_result and not rate_limit_result["allowed"]:
+            security_dashboard.log_event(
+                event_type="rate_limit_exceeded",
+                severity="medium",
+                user_id=client_ip,
+                ip_address=client_ip,
+                details={
+                    "path": request.url.path,
+                    "limit": rate_limit_result["limit"],
+                    "window_seconds": rate_limit_result["window_seconds"],
+                    "retry_after_seconds": rate_limit_result["retry_after_seconds"],
+                },
+            )
+            response = JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={
+                    "detail": "Rate limit exceeded",
+                    "limit": rate_limit_result["limit"],
+                    "window_seconds": rate_limit_result["window_seconds"],
+                    "retry_after_seconds": rate_limit_result["retry_after_seconds"],
+                },
+            )
+            _apply_security_headers(response)
+            _apply_rate_limit_headers(response, rate_limit_result)
+            return response
+
     response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    _apply_security_headers(response)
+    if rate_limit_result:
+        _apply_rate_limit_headers(response, rate_limit_result)
     return response
 
 app.add_middleware(

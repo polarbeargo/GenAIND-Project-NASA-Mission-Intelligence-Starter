@@ -195,6 +195,16 @@ class RedisClient:
             logger.debug(f"Redis incr failed for key={key}: {error}")
             return 0
 
+    def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> Any:
+        """Execute a Lua script atomically."""
+        if not self._available or self._client is None:
+            return None
+        try:
+            return self._client.eval(script, numkeys, *keys_and_args)
+        except Exception as error:
+            logger.debug(f"Redis eval failed: {error}")
+            return None
+
     def lpush(self, name: str, *values: Any) -> int:
         """Push values to list (left side)."""
         if not self._available or self._client is None:
