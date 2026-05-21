@@ -181,7 +181,15 @@ def _get_rate_limit_period_seconds() -> int:
 
 
 def _get_rate_limit_paths() -> List[str]:
-    configured = os.getenv("RATE_LIMIT_PATHS", "/chat").strip()
+    # Default to endpoints that are either expensive or mutate shared runtime state.
+    default_paths = ",".join([
+        "/chat",
+        "/collections/clear-cache",
+        "/collections/warm-cache",
+        "/monitoring/report",
+        "/monitoring/rag/report",
+    ])
+    configured = os.getenv("RATE_LIMIT_PATHS", default_paths).strip()
     paths = [path.strip() for path in configured.split(",") if path.strip()]
     return paths or ["/chat"]
 
@@ -476,14 +484,47 @@ return {1, current, retry_after_ms}
     def __init__(self, requests_per_period: int, period_seconds: int, paths: List[str], enabled: bool = True):
         self.requests_per_period = max(1, int(requests_per_period))
         self.period_seconds = max(1, int(period_seconds))
-        self.paths = {path.strip() for path in paths if path.strip()}
+        exact_paths = set()
+        prefix_paths = []
+        for raw_path in paths:
+            normalized = self._normalize_path(raw_path)
+            if not normalized:
+                continue
+            if normalized.endswith("*"):
+                prefix = normalized[:-1].rstrip("/")
+                if prefix:
+                    prefix_paths.append(prefix)
+            else:
+                exact_paths.add(normalized)
+        self.paths = frozenset(exact_paths)
+        self.path_prefixes = tuple(sorted(set(prefix_paths), key=len, reverse=True))
         self.enabled = enabled
 
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        normalized = (path or "").strip()
+        if not normalized:
+            return ""
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        if len(normalized) > 1 and normalized.endswith("/"):
+            normalized = normalized.rstrip("/")
+        return normalized
+
     def should_limit_path(self, path: str) -> bool:
-        return self.enabled and path in self.paths
+        if not self.enabled:
+            return False
+        normalized = self._normalize_path(path)
+        if normalized in self.paths:
+            return True
+        for prefix in self.path_prefixes:
+            if normalized.startswith(prefix):
+                return True
+        return False
 
     def check(self, client_ip: str, path: str) -> Optional[Dict[str, Any]]:
-        if not self.should_limit_path(path):
+        normalized_path = self._normalize_path(path)
+        if not self.should_limit_path(normalized_path):
             return None
 
         redis_client = get_redis_client()
@@ -491,7 +532,7 @@ return {1, current, retry_after_ms}
             logger.warning("Rate limiting disabled for %s because Redis is unavailable", path)
             return None
 
-        key = f"rate_limit:{path.lstrip('/').replace('/', ':')}:{client_ip}"
+        key = f"rate_limit:{normalized_path.lstrip('/').replace('/', ':')}:{client_ip}"
         window_ms = self.period_seconds * 1000
         request_id = str(uuid.uuid4())
         result = redis_client.eval(self.LUA_SCRIPT, 1, key, self.requests_per_period, window_ms, request_id)
