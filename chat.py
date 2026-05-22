@@ -41,6 +41,39 @@ def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
 
     return rag_client.discover_chroma_backends()
 
+def _normalize_query(question: str) -> str:
+    """Normalize question for cache key matching."""
+    return " ".join(question.lower().split())
+
+def _get_client_cache_key(question: str, backend: str, n_docs: int, model: str) -> str:
+    """Generate deterministic cache key for client-side question cache."""
+    import hashlib
+    normalized_q = _normalize_query(question)
+    cache_str = f"{normalized_q}|{backend}|{n_docs}|{model}"
+    return hashlib.md5(cache_str.encode("utf-8")).hexdigest()
+
+def _get_cached_response(question: str, backend: str, n_docs: int, model: str) -> Dict | None:
+    """Check client-side cache for identical question in same session (thread-safe via Streamlit session_state)."""
+    cache_key = _get_client_cache_key(question, backend, n_docs, model)
+    cached_item = st.session_state.question_response_cache.get(cache_key)
+    if cached_item and isinstance(cached_item, dict):
+        return cached_item
+    return None
+
+def _set_cached_response(question: str, backend: str, n_docs: int, model: str, response: Dict) -> None:
+    """Store response in client-side cache (thread-safe via Streamlit session_state)."""
+    cache_key = _get_client_cache_key(question, backend, n_docs, model)
+    # Only cache successful responses
+    if not response.get("error"):
+        st.session_state.question_response_cache[cache_key] = {
+            "response": response.get("answer", ""),
+            "contexts": response.get("contexts", []),
+            "latency_ms": response.get("latency_ms", 0.0),
+            "judge": response.get("judge", {}),
+            "backend": response.get("backend", ""),
+            "cached": True,
+        }
+
 def call_chat_api(
     api_base_url: str,
     payload: Dict,
@@ -251,6 +284,13 @@ def main():
         st.session_state.last_contexts = []
     if "session_id" not in st.session_state:
         st.session_state.session_id = os.urandom(8).hex()
+    if "question_response_cache" not in st.session_state:
+        # Client-side cache: {cache_key: {"response": str, "contexts": list, "latency_ms": float, "cached": True}}
+        st.session_state.question_response_cache = {}
+    if "eval_poll_placeholder" not in st.session_state:
+        st.session_state.eval_poll_placeholder = None
+    if "eval_poll_text" not in st.session_state:
+        st.session_state.eval_poll_text = None
     
     with st.sidebar:
         st.header("🔧 Configuration")
@@ -313,47 +353,61 @@ def main():
         if (st.session_state.current_backend != selected_backend_key):
             st.session_state.current_backend = selected_backend_key
 
-    # Keep API path fast: poll async evaluation jobs outside /chat request path.
+    # Efficient async evaluation polling with auto-rerun on status change
     if enable_evaluation and execution_mode == "API (/chat)":
         current_eval = st.session_state.last_evaluation
         if isinstance(current_eval, dict):
             pending_status = str(current_eval.get("status", "")).lower() == "pending"
             job_id = str(current_eval.get("job_id", "")).strip()
             if pending_status and job_id:
-                job_payload = call_evaluation_job_api(
-                    api_base_url=api_base_url,
-                    job_id=job_id,
-                    timeout_seconds=min(3.0, float(api_timeout_seconds)),
-                )
-                job_result = job_payload.get("result") if isinstance(job_payload, dict) else None
-                if isinstance(job_result, dict):
-                    result_status = str(job_result.get("status", "")).lower()
-                    if result_status in {"completed", "done", "success", "ok"}:
-                        st.session_state.last_evaluation = job_result
-                    elif "error" in job_result or result_status in {"failed", "error", "timeout"}:
-                        st.session_state.last_evaluation = job_result
-                    elif any(
-                        metric_key in job_result
-                        for metric_key in {"response_relevancy", "faithfulness", "bleu_score", "rouge_score"}
-                    ):
-                        st.session_state.last_evaluation = job_result
-
-                latest_eval = st.session_state.last_evaluation
-                still_pending = isinstance(latest_eval, dict) and str(latest_eval.get("status", "")).lower() == "pending"
-                if still_pending:
-                    submitted_at_ms = latest_eval.get("submitted_at_ms")
-                    elapsed_seconds = 0.0
-                    if isinstance(submitted_at_ms, (int, float)):
-                        elapsed_seconds = max(0.0, (time.time() * 1000.0 - float(submitted_at_ms)) / 1000.0)
-
-                    if elapsed_seconds > _EVAL_PENDING_TIMEOUT_SECONDS:
+                submitted_at_ms = current_eval.get("submitted_at_ms")
+                elapsed_seconds = 0.0
+                if isinstance(submitted_at_ms, (int, float)):
+                    elapsed_seconds = max(0.0, (time.time() * 1000.0 - float(submitted_at_ms)) / 1000.0)
+                
+                with st.empty().container():
+                    if elapsed_seconds < _EVAL_PENDING_TIMEOUT_SECONDS:
+                        # Poll with reasonable timeout (don't truncate it too much)
+                        poll_timeout = min(2.0, max(0.5, float(api_timeout_seconds) * 0.25))
+                        job_payload = call_evaluation_job_api(
+                            api_base_url=api_base_url,
+                            job_id=job_id,
+                            timeout_seconds=poll_timeout,
+                        )
+                        job_result = job_payload.get("result") if isinstance(job_payload, dict) else None
+                        
+                        # Update state if result found, trigger rerun if status changed
+                        status_changed = False
+                        if isinstance(job_result, dict):
+                            result_status = str(job_result.get("status", "")).lower()
+                            if result_status in {"completed", "done", "success", "ok", "failed", "error", "timeout"}:
+                                st.session_state.last_evaluation = job_result
+                                status_changed = True
+                            elif any(
+                                metric_key in job_result
+                                for metric_key in {"response_relevancy", "faithfulness", "bleu_score", "rouge_score"}
+                            ):
+                                st.session_state.last_evaluation = job_result
+                                status_changed = True
+                        
+                        # Show progress with actual poll feedback
+                        progress = min(100, int((elapsed_seconds / _EVAL_PENDING_TIMEOUT_SECONDS) * 100))
+                        poll_status = "✓ polled" if job_result else "⏳ polling..."
+                        st.progress(progress / 100.0, text=f"Evaluation {poll_status} ({progress}%)")
+                        
+                        # Trigger rerun if status changed (completion/error detected)
+                        if status_changed:
+                            time.sleep(0.2)  # Brief pause to let backend settle
+                            st.rerun()
+                        else:
+                            # Show info about continued polling
+                            st.info(f"Job {job_id}: Waiting for async evaluation to complete... (elapsed: {elapsed_seconds:.1f}s)")
+                    else:
                         st.session_state.last_evaluation = {
                             "status": "pending_or_unavailable",
                             "error": "Evaluation is still pending after timeout window",
                         }
-                    else:
-                        time.sleep(_EVAL_POLL_INTERVAL_SECONDS)
-                        st.rerun()
+                        st.warning("⏱️ Evaluation timeout (90s) — marking as unavailable")
     
     if st.session_state.last_evaluation and enable_evaluation:
         display_evaluation_metrics(st.session_state.last_evaluation)
@@ -365,13 +419,15 @@ def main():
                 meta = message["meta"]
                 latency_ms = meta.get("latency_ms")
                 backend = meta.get("backend", "unknown")
+                is_cached = meta.get("cached", False)
+                cache_indicator = " [📦 CACHED]" if is_cached else ""
                 judge = meta.get("judge") if isinstance(meta.get("judge"), dict) else {}
                 judge_source = judge.get("source", "unknown")
                 judge_passed = judge.get("passed")
                 latency_text = f"{float(latency_ms):.1f} ms" if isinstance(latency_ms, (int, float)) else "n/a"
                 judge_text = "pass" if judge_passed is True else "review" if judge_passed is False else "n/a"
                 st.caption(
-                    f"Latency: {latency_text} | Backend: {backend} | Judge: {judge_text} ({judge_source})"
+                    f"Latency: {latency_text}{cache_indicator} | Backend: {backend} | Judge: {judge_text} ({judge_source})"
                 )
     
     if prompt := st.chat_input("Ask about NASA space missions..."):
@@ -394,21 +450,42 @@ def main():
                         conversation_history=conversation_history_api,
                     )
                 else:
-                    payload = {
-                        "question": prompt,
-                        "chroma_dir": selected_backend["directory"],
-                        "collection_name": selected_backend["collection_name"],
-                        "n_results": n_docs,
-                        "model": model_choice,
-                        "evaluate": bool(enable_evaluation),
-                        "conversation_history": conversation_history_api,
-                        "session_id": st.session_state.session_id,
-                    }
-                    result = call_chat_api(
-                        api_base_url=api_base_url,
-                        payload=payload,
-                        timeout_seconds=float(api_timeout_seconds),
-                    )
+                    # Check client-side cache first (instant response for identical questions in session)
+                    backend_key = f"{selected_backend['directory']}:{selected_backend['collection_name']}"
+                    cached_result = _get_cached_response(prompt, backend_key, n_docs, model_choice)
+                    
+                    if cached_result:
+                        # Instant cached response - mark cache hit for observability
+                        result = {
+                            "answer": cached_result["response"],
+                            "contexts": cached_result["contexts"],
+                            "latency_ms": cached_result.get("latency_ms", 0.0),
+                            "backend": cached_result.get("backend", backend_key),
+                            "judge": cached_result.get("judge", {}),
+                            "cached_from_session": True,  # Flag for monitoring
+                            "evaluation": {},
+                        }
+                    else:
+                        # API call with full payload
+                        payload = {
+                            "question": prompt,
+                            "chroma_dir": selected_backend["directory"],
+                            "collection_name": selected_backend["collection_name"],
+                            "n_results": n_docs,
+                            "model": model_choice,
+                            "evaluate": bool(enable_evaluation),
+                            "conversation_history": conversation_history_api,
+                            "session_id": st.session_state.session_id,
+                        }
+                        result = call_chat_api(
+                            api_base_url=api_base_url,
+                            payload=payload,
+                            timeout_seconds=float(api_timeout_seconds),
+                        )
+                        
+                        # Cache successful API responses for session reuse
+                        if not result.get("error"):
+                            _set_cached_response(prompt, backend_key, n_docs, model_choice, result)
 
                     error_text = str(result.get("error", ""))
                     status_code = result.get("status_code")
@@ -420,7 +497,7 @@ def main():
                         isinstance(result.get("answer"), str)
                         and "timed out" in result.get("answer", "").lower()
                     )
-                    if timeout_or_retryable_error and fallback_to_local:
+                    if timeout_or_retryable_error and fallback_to_local and not result.get("cached_from_session"):
                         st.info("API path degraded. Retrying with Local legacy mode...")
                         result = run_local_chat_turn(
                             prompt=prompt,
@@ -439,15 +516,18 @@ def main():
                         "latency_ms": result.get("latency_ms"),
                         "backend": result.get("backend", "n/a"),
                         "judge": result.get("judge") if isinstance(result.get("judge"), dict) else {},
+                        "cached": False,
                     }
                 else:
                     response = str(result.get("answer", "I could not generate a response."))
                     contexts_list = result.get("contexts") or []
                     st.session_state.last_contexts = contexts_list
+                    is_session_cached = result.get("cached_from_session", False)
                     response_meta = {
                         "latency_ms": result.get("latency_ms"),
                         "backend": result.get("backend", "unknown"),
                         "judge": result.get("judge") if isinstance(result.get("judge"), dict) else {},
+                        "cached": is_session_cached,
                     }
 
                     evaluation_scores = result.get("evaluation", {})
@@ -462,6 +542,9 @@ def main():
                         st.session_state.last_evaluation = None
 
                     judge_result = response_meta.get("judge")
+                    is_cached = response_meta.get("cached", False)
+                    cache_indicator = " [📦 CACHED]" if is_cached else ""
+                    
                     if isinstance(judge_result, dict) and judge_result:
                         source = judge_result.get("source", "unknown")
                         passed = judge_result.get("passed", False)
@@ -472,7 +555,7 @@ def main():
                         )
                         backend_value = response_meta.get("backend", "unknown")
                         st.caption(
-                            f"Latency: {latency_text} | Backend: {backend_value} | Judge: {confidence} ({source})"
+                            f"Latency: {latency_text}{cache_indicator} | Backend: {backend_value} | Judge: {confidence} ({source})"
                         )
 
                 st.markdown(response)

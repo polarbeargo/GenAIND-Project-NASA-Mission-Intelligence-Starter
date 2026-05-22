@@ -349,6 +349,15 @@ class MultiAgentChatWorkflow:
         self._answer_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_lock = Lock()
         
+        # Cache statistics for observability
+        self._cache_stats_lock = Lock()
+        self._retrieval_cache_hits = 0
+        self._retrieval_cache_misses = 0
+        self._answer_cache_hits = 0
+        self._answer_cache_misses = 0
+        self._redis_cache_hits = 0
+        self._redis_cache_misses = 0
+        
         # Redis L2 cache: shared across pods, fallback gracefully if unavailable
         redis_client = get_redis_client()
         self._redis_l2_cache = RedisL2Cache(
@@ -478,7 +487,7 @@ class MultiAgentChatWorkflow:
             )
 
         # Check answer cache before retrieval to avoid unnecessary query embeddings.
-        answer = self._cache_get(self._answer_cache, answer_key)
+        answer = self._cache_get(self._answer_cache, answer_key, cache_type="answer")
         if answer is None:
             # L2 cache (Redis) if L1 miss:
             try:
@@ -489,9 +498,15 @@ class MultiAgentChatWorkflow:
                     effective_input.model,
                     effective_input.evaluate,
                 )
+                if answer is not None:
+                    with self._cache_stats_lock:
+                        self._redis_cache_hits += 1
             except Exception as _l2_err:
                 logging.getLogger(__name__).debug("L2 answer cache read skipped: %s", _l2_err)
                 answer = None
+                if answer is None:
+                    with self._cache_stats_lock:
+                        self._redis_cache_misses += 1
             if answer is not None:
                 # Populate L1 on L2 hit
                 self._cache_set(
@@ -508,7 +523,7 @@ class MultiAgentChatWorkflow:
         if not cached_answer_hit:
             # L1 cache (in-process):
             retrieval_result = self._normalize_retrieval_payload(
-                self._cache_get(self._retrieval_cache, retrieval_key)
+                self._cache_get(self._retrieval_cache, retrieval_key, cache_type="retrieval")
             )
 
             # L2 cache (Redis) if L1 miss:
@@ -1179,6 +1194,65 @@ class MultiAgentChatWorkflow:
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
 
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return cache hit/miss statistics for L1 (in-process), L2 (Redis), and total effectiveness."""
+        with self._cache_stats_lock:
+            retrieval_total = self._retrieval_cache_hits + self._retrieval_cache_misses
+            answer_total = self._answer_cache_hits + self._answer_cache_misses
+            redis_total = self._redis_cache_hits + self._redis_cache_misses
+            
+            retrieval_hit_rate = (
+                (self._retrieval_cache_hits / retrieval_total * 100)
+                if retrieval_total > 0
+                else 0.0
+            )
+            answer_hit_rate = (
+                (self._answer_cache_hits / answer_total * 100)
+                if answer_total > 0
+                else 0.0
+            )
+            redis_hit_rate = (
+                (self._redis_cache_hits / redis_total * 100)
+                if redis_total > 0
+                else 0.0
+            )
+            
+            combined_hits = self._retrieval_cache_hits + self._answer_cache_hits + self._redis_cache_hits
+            combined_total = retrieval_total + answer_total + redis_total
+            combined_hit_rate = (
+                (combined_hits / combined_total * 100)
+                if combined_total > 0
+                else 0.0
+            )
+        
+        return {
+            "l1_retrieval": {
+                "hits": self._retrieval_cache_hits,
+                "misses": self._retrieval_cache_misses,
+                "total": retrieval_total,
+                "hit_rate_percent": round(retrieval_hit_rate, 2),
+            },
+            "l1_answer": {
+                "hits": self._answer_cache_hits,
+                "misses": self._answer_cache_misses,
+                "total": answer_total,
+                "hit_rate_percent": round(answer_hit_rate, 2),
+            },
+            "l2_redis": {
+                "hits": self._redis_cache_hits,
+                "misses": self._redis_cache_misses,
+                "total": redis_total,
+                "hit_rate_percent": round(redis_hit_rate, 2),
+            },
+            "combined": {
+                "hits": combined_hits,
+                "misses": combined_total - combined_hits,
+                "total": combined_total,
+                "hit_rate_percent": round(combined_hit_rate, 2),
+            },
+            "timestamp_utc": time.time(),
+        }
+
     def get_latency_sli_report(self) -> Dict[str, Any]:
         """Return p50/p95 latency and timeout SLI rollups per stage."""
         workers: Dict[str, Any] = {}
@@ -1304,18 +1378,33 @@ class MultiAgentChatWorkflow:
         )
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
-    def _cache_get(self, cache: OrderedDict[str, tuple[float, Any]], key: str):
+    def _cache_get(self, cache: OrderedDict[str, tuple[float, Any]], key: str, cache_type: str = "unknown"):
         now = time.time()
         with self._cache_lock:
             item = cache.get(key)
             if not item:
+                with self._cache_stats_lock:
+                    if cache_type == "retrieval":
+                        self._retrieval_cache_misses += 1
+                    elif cache_type == "answer":
+                        self._answer_cache_misses += 1
                 return None
             expires_at, value = item
             if expires_at < now:
                 cache.pop(key, None)
+                with self._cache_stats_lock:
+                    if cache_type == "retrieval":
+                        self._retrieval_cache_misses += 1
+                    elif cache_type == "answer":
+                        self._answer_cache_misses += 1
                 return None
             # Mark as recently used for LRU semantics.
             cache.move_to_end(key)
+            with self._cache_stats_lock:
+                if cache_type == "retrieval":
+                    self._retrieval_cache_hits += 1
+                elif cache_type == "answer":
+                    self._answer_cache_hits += 1
             return value
 
     def _cache_set(

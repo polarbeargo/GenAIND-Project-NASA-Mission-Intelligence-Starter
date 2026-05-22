@@ -1101,6 +1101,32 @@ def monitoring_evaluation(limit: int = 20) -> Dict[str, Any]:
     }
 
 
+@app.get("/monitoring/cache")
+def monitoring_cache() -> Dict[str, Any]:
+    """Return cache statistics and effectiveness metrics for observability."""
+    init_stats = cache_stats.to_dict()
+    lru_info = _cached_rag_init.cache_info()
+    workflow_cache_stats = chat_workflow.get_cache_stats()
+    
+    return {
+        "rag_init": init_stats,
+        "lru_cache": {
+            "hits": lru_info.hits,
+            "misses": lru_info.misses,
+            "currsize": lru_info.currsize,
+            "maxsize": lru_info.maxsize,
+            "hit_rate_percent": round(
+                (lru_info.hits / (lru_info.hits + lru_info.misses) * 100)
+                if (lru_info.hits + lru_info.misses) > 0
+                else 0.0,
+                2
+            ),
+        },
+        "workflow": workflow_cache_stats,
+        "timestamp_utc": time.time(),
+    }
+
+
 @app.get("/evaluation/{job_id}")
 def evaluation_job(job_id: str) -> Dict[str, Any]:
     """Return one async evaluation job by id."""
