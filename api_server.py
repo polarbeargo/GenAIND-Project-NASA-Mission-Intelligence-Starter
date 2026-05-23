@@ -786,6 +786,7 @@ chat_workflow = MultiAgentChatWorkflow(
     judge_broker_enabled=_get_bool_env("JUDGE_BROKER_ENABLED", default=False),
     judge_broker_stream=_get_judge_broker_stream(),
     judge_broker_group=_get_judge_broker_group(),
+    redis_l2_cache_enabled=_get_bool_env("REDIS_L2_CACHE_ENABLED", default=True),
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),
         retention_hours=_get_stage_sli_retention_hours(),

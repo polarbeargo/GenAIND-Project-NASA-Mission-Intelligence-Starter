@@ -283,6 +283,7 @@ class MultiAgentChatWorkflow:
         judge_broker_enabled: bool = False,
         judge_broker_stream: str = "judge:jobs",
         judge_broker_group: str = "judge-workers",
+        redis_l2_cache_enabled: bool = False,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -365,6 +366,7 @@ class MultiAgentChatWorkflow:
             retrieval_ttl_seconds=self._retrieval_cache_ttl,
             response_ttl_seconds=self._answer_cache_ttl,
         )
+        self._redis_l2_cache_enabled = bool(redis_l2_cache_enabled)
         
         # Redis async job store: track judge/evaluation results shared across pods
         self._redis_job_store = RedisAsyncJobStore(redis_client, retention_ttl_seconds=3600)
@@ -488,7 +490,7 @@ class MultiAgentChatWorkflow:
 
         # Check answer cache before retrieval to avoid unnecessary query embeddings.
         answer = self._cache_get(self._answer_cache, answer_key, cache_type="answer")
-        if answer is None:
+        if answer is None and self._redis_l2_cache_enabled:
             # L2 cache (Redis) if L1 miss:
             try:
                 answer = self._redis_l2_cache.get_response(
@@ -527,7 +529,7 @@ class MultiAgentChatWorkflow:
             )
 
             # L2 cache (Redis) if L1 miss:
-            if retrieval_result is None:
+            if retrieval_result is None and self._redis_l2_cache_enabled:
                 try:
                     retrieval_result = self._normalize_retrieval_payload(
                         self._redis_l2_cache.get_retrieval(
@@ -632,7 +634,12 @@ class MultiAgentChatWorkflow:
 
         # Write successful retrieval to L2 cache outside the retrieval try/except so
         # a Redis error cannot retroactively mark a good retrieval as failed.
-        if not retrieval_failed and retrieval_result is not None and not cached_answer_hit:
+        if (
+            self._redis_l2_cache_enabled
+            and not retrieval_failed
+            and retrieval_result is not None
+            and not cached_answer_hit
+        ):
             try:
                 self._redis_l2_cache.set_retrieval(
                     effective_input.question,
@@ -777,17 +784,18 @@ class MultiAgentChatWorkflow:
             )
             
             # Also set in L2 (Redis) for cross-pod sharing
-            try:
-                self._redis_l2_cache.set_response(
-                    effective_input.question,
-                    effective_input.mission_filter,
-                    effective_input.collection_name,
-                    effective_input.model,
-                    effective_input.evaluate,
-                    answer,
-                )
-            except Exception as _l2_err:
-                logging.getLogger(__name__).debug("L2 answer cache write skipped: %s", _l2_err)
+            if self._redis_l2_cache_enabled:
+                try:
+                    self._redis_l2_cache.set_response(
+                        effective_input.question,
+                        effective_input.mission_filter,
+                        effective_input.collection_name,
+                        effective_input.model,
+                        effective_input.evaluate,
+                        answer,
+                    )
+                except Exception as _l2_err:
+                    logging.getLogger(__name__).debug("L2 answer cache write skipped: %s", _l2_err)
 
         judge_mode = (workflow_input.judge_mode or "async").lower()
         if judge_mode == "off":
@@ -1194,65 +1202,6 @@ class MultiAgentChatWorkflow:
         with self._judge_lock:
             return list(self._judge_results)[:safe_limit]
 
-    def get_cache_stats(self) -> Dict[str, Any]:
-        """Return cache hit/miss statistics for L1 (in-process), L2 (Redis), and total effectiveness."""
-        with self._cache_stats_lock:
-            retrieval_total = self._retrieval_cache_hits + self._retrieval_cache_misses
-            answer_total = self._answer_cache_hits + self._answer_cache_misses
-            redis_total = self._redis_cache_hits + self._redis_cache_misses
-            
-            retrieval_hit_rate = (
-                (self._retrieval_cache_hits / retrieval_total * 100)
-                if retrieval_total > 0
-                else 0.0
-            )
-            answer_hit_rate = (
-                (self._answer_cache_hits / answer_total * 100)
-                if answer_total > 0
-                else 0.0
-            )
-            redis_hit_rate = (
-                (self._redis_cache_hits / redis_total * 100)
-                if redis_total > 0
-                else 0.0
-            )
-            
-            combined_hits = self._retrieval_cache_hits + self._answer_cache_hits + self._redis_cache_hits
-            combined_total = retrieval_total + answer_total + redis_total
-            combined_hit_rate = (
-                (combined_hits / combined_total * 100)
-                if combined_total > 0
-                else 0.0
-            )
-        
-        return {
-            "l1_retrieval": {
-                "hits": self._retrieval_cache_hits,
-                "misses": self._retrieval_cache_misses,
-                "total": retrieval_total,
-                "hit_rate_percent": round(retrieval_hit_rate, 2),
-            },
-            "l1_answer": {
-                "hits": self._answer_cache_hits,
-                "misses": self._answer_cache_misses,
-                "total": answer_total,
-                "hit_rate_percent": round(answer_hit_rate, 2),
-            },
-            "l2_redis": {
-                "hits": self._redis_cache_hits,
-                "misses": self._redis_cache_misses,
-                "total": redis_total,
-                "hit_rate_percent": round(redis_hit_rate, 2),
-            },
-            "combined": {
-                "hits": combined_hits,
-                "misses": combined_total - combined_hits,
-                "total": combined_total,
-                "hit_rate_percent": round(combined_hit_rate, 2),
-            },
-            "timestamp_utc": time.time(),
-        }
-
     def get_latency_sli_report(self) -> Dict[str, Any]:
         """Return p50/p95 latency and timeout SLI rollups per stage."""
         workers: Dict[str, Any] = {}
@@ -1324,18 +1273,63 @@ class MultiAgentChatWorkflow:
         }
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Return cache performance metrics for both L1 and L2."""
+        """Return cache capacity and hit/miss effectiveness for L1 and L2."""
+        with self._cache_lock:
+            retrieval_entries = len(self._retrieval_cache)
+            answer_entries = len(self._answer_cache)
+
+        with self._cache_stats_lock:
+            retrieval_hits = self._retrieval_cache_hits
+            retrieval_misses = self._retrieval_cache_misses
+            answer_hits = self._answer_cache_hits
+            answer_misses = self._answer_cache_misses
+            redis_hits = self._redis_cache_hits
+            redis_misses = self._redis_cache_misses
+
+        retrieval_total = retrieval_hits + retrieval_misses
+        answer_total = answer_hits + answer_misses
+        redis_total = redis_hits + redis_misses
+        combined_hits = retrieval_hits + answer_hits + redis_hits
+        combined_total = retrieval_total + answer_total + redis_total
+
+        retrieval_hit_rate = (retrieval_hits / retrieval_total * 100.0) if retrieval_total else 0.0
+        answer_hit_rate = (answer_hits / answer_total * 100.0) if answer_total else 0.0
+        redis_hit_rate = (redis_hits / redis_total * 100.0) if redis_total else 0.0
+        combined_hit_rate = (combined_hits / combined_total * 100.0) if combined_total else 0.0
+
         return {
             "generated_at_ms": round(time.time() * 1000),
             "l1_retrieval": {
-                "entries": len(self._retrieval_cache),
+                "entries": retrieval_entries,
                 "max_entries": self._retrieval_cache_max_entries,
+                "hits": retrieval_hits,
+                "misses": retrieval_misses,
+                "total": retrieval_total,
+                "hit_rate_percent": round(retrieval_hit_rate, 2),
             },
             "l1_answer": {
-                "entries": len(self._answer_cache),
+                "entries": answer_entries,
                 "max_entries": self._answer_cache_max_entries,
+                "hits": answer_hits,
+                "misses": answer_misses,
+                "total": answer_total,
+                "hit_rate_percent": round(answer_hit_rate, 2),
             },
-            "l2_redis": self._redis_l2_cache.stats(),
+            "l2_redis": {
+                **self._redis_l2_cache.stats(),
+                "enabled": self._redis_l2_cache_enabled,
+                "hits": redis_hits,
+                "misses": redis_misses,
+                "total": redis_total,
+                "hit_rate_percent": round(redis_hit_rate, 2),
+            },
+            "combined": {
+                "hits": combined_hits,
+                "misses": combined_total - combined_hits,
+                "total": combined_total,
+                "hit_rate_percent": round(combined_hit_rate, 2),
+            },
+            "timestamp_utc": time.time(),
         }
 
     def __del__(self):

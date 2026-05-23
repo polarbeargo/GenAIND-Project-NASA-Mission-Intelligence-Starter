@@ -45,31 +45,84 @@ def _normalize_query(question: str) -> str:
     """Normalize question for cache key matching."""
     return " ".join(question.lower().split())
 
-def _get_client_cache_key(question: str, backend: str, n_docs: int, model: str) -> str:
+def _history_signature(conversation_history: List[Dict[str, str]]) -> str:
+    """Generate deterministic history signature for cache key correctness."""
+    if not conversation_history:
+        return "no_history"
+    try:
+        stable_history = json.dumps(conversation_history, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        stable_history = str(conversation_history)
+    return stable_history
+
+
+def _get_client_cache_key(
+    question: str,
+    backend: str,
+    n_docs: int,
+    model: str,
+    conversation_history: List[Dict[str, str]],
+    enable_evaluation: bool,
+) -> str:
     """Generate deterministic cache key for client-side question cache."""
     import hashlib
+
     normalized_q = _normalize_query(question)
-    cache_str = f"{normalized_q}|{backend}|{n_docs}|{model}"
+    history_sig = _history_signature(conversation_history)
+    cache_str = f"{normalized_q}|{backend}|{n_docs}|{model}|{int(bool(enable_evaluation))}|{history_sig}"
     return hashlib.md5(cache_str.encode("utf-8")).hexdigest()
 
-def _get_cached_response(question: str, backend: str, n_docs: int, model: str) -> Dict | None:
+def _get_cached_response(
+    question: str,
+    backend: str,
+    n_docs: int,
+    model: str,
+    conversation_history: List[Dict[str, str]],
+    enable_evaluation: bool,
+) -> Dict | None:
     """Check client-side cache for identical question in same session (thread-safe via Streamlit session_state)."""
-    cache_key = _get_client_cache_key(question, backend, n_docs, model)
+    cache_key = _get_client_cache_key(
+        question,
+        backend,
+        n_docs,
+        model,
+        conversation_history,
+        enable_evaluation,
+    )
     cached_item = st.session_state.question_response_cache.get(cache_key)
     if cached_item and isinstance(cached_item, dict):
         return cached_item
     return None
 
-def _set_cached_response(question: str, backend: str, n_docs: int, model: str, response: Dict) -> None:
+def _set_cached_response(
+    question: str,
+    backend: str,
+    n_docs: int,
+    model: str,
+    conversation_history: List[Dict[str, str]],
+    enable_evaluation: bool,
+    response: Dict,
+) -> None:
     """Store response in client-side cache (thread-safe via Streamlit session_state)."""
-    cache_key = _get_client_cache_key(question, backend, n_docs, model)
+    cache_key = _get_client_cache_key(
+        question,
+        backend,
+        n_docs,
+        model,
+        conversation_history,
+        enable_evaluation,
+    )
     # Only cache successful responses
     if not response.get("error"):
+        evaluation_payload = response.get("evaluation")
+        if not isinstance(evaluation_payload, dict):
+            evaluation_payload = {}
         st.session_state.question_response_cache[cache_key] = {
             "response": response.get("answer", ""),
             "contexts": response.get("contexts", []),
             "latency_ms": response.get("latency_ms", 0.0),
             "judge": response.get("judge", {}),
+            "evaluation": evaluation_payload,
             "backend": response.get("backend", ""),
             "cached": True,
         }
@@ -230,6 +283,9 @@ def display_evaluation_metrics(scores: Dict[str, float]):
     """Display evaluation metrics in the sidebar"""
     if scores.get("status") == "skipped_no_contexts":
         st.sidebar.info("Evaluation skipped: no retrieved contexts for this turn.")
+        return
+    if scores.get("status") == "cached_without_evaluation":
+        st.sidebar.info("Evaluation not rerun for this cached response.")
         return
     if scores.get("status") == "pending_or_unavailable":
         st.sidebar.info("Evaluation is pending or unavailable for this turn.")
@@ -452,7 +508,14 @@ def main():
                 else:
                     # Check client-side cache first (instant response for identical questions in session)
                     backend_key = f"{selected_backend['directory']}:{selected_backend['collection_name']}"
-                    cached_result = _get_cached_response(prompt, backend_key, n_docs, model_choice)
+                    cached_result = _get_cached_response(
+                        prompt,
+                        backend_key,
+                        n_docs,
+                        model_choice,
+                        conversation_history_api,
+                        bool(enable_evaluation),
+                    )
                     
                     if cached_result:
                         # Instant cached response - mark cache hit for observability
@@ -463,7 +526,7 @@ def main():
                             "backend": cached_result.get("backend", backend_key),
                             "judge": cached_result.get("judge", {}),
                             "cached_from_session": True,  # Flag for monitoring
-                            "evaluation": {},
+                            "evaluation": cached_result.get("evaluation", {}),
                         }
                     else:
                         # API call with full payload
@@ -485,7 +548,15 @@ def main():
                         
                         # Cache successful API responses for session reuse
                         if not result.get("error"):
-                            _set_cached_response(prompt, backend_key, n_docs, model_choice, result)
+                            _set_cached_response(
+                                prompt,
+                                backend_key,
+                                n_docs,
+                                model_choice,
+                                conversation_history_api,
+                                bool(enable_evaluation),
+                                result,
+                            )
 
                     error_text = str(result.get("error", ""))
                     status_code = result.get("status_code")
@@ -535,7 +606,10 @@ def main():
                         if evaluation_scores:
                             st.session_state.last_evaluation = evaluation_scores
                         elif contexts_list:
-                            st.session_state.last_evaluation = {"status": "pending_or_unavailable"}
+                            if execution_mode == "API (/chat)" and not is_session_cached:
+                                st.session_state.last_evaluation = {"status": "pending_or_unavailable"}
+                            else:
+                                st.session_state.last_evaluation = {"status": "cached_without_evaluation"}
                         else:
                             st.session_state.last_evaluation = {"status": "skipped_no_contexts"}
                     else:
