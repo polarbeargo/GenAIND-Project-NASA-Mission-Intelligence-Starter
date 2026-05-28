@@ -63,6 +63,29 @@ _STOP_WORDS = {
     "why",
 }
 
+_MISSION_ALIASES = {
+    "apollo11": "apollo_11",
+    "apollo_11": "apollo_11",
+    "apollo 11": "apollo_11",
+    "apollo-11": "apollo_11",
+    "apollo13": "apollo_13",
+    "apollo_13": "apollo_13",
+    "apollo 13": "apollo_13",
+    "apollo-13": "apollo_13",
+    "challenger": "challenger",
+}
+
+
+def _normalize_mission_filter(mission_filter: str) -> str:
+    """Normalize user mission aliases to collection metadata keys."""
+    raw = (mission_filter or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in _MISSION_ALIASES:
+        return _MISSION_ALIASES[raw]
+    # Generic fallback for known underscore style used in metadata.
+    return raw.replace(" ", "_").replace("-", "_")
+
 
 def _get_first_pass_multiplier() -> int:
     """Return candidate expansion factor for first-pass retrieval."""
@@ -490,7 +513,7 @@ def retrieve_documents(
     where_filter = None
 
     if mission_filter and mission_filter.strip().lower() not in {"all", "any", "*", "none"}:
-        normalized_mission = mission_filter.strip().lower().replace(" ", "_")
+        normalized_mission = _normalize_mission_filter(mission_filter)
         where_filter = {"mission": normalized_mission}
 
     requested_n = max(1, int(n_results))
