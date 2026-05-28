@@ -72,6 +72,13 @@ class TestEvaluationModes(unittest.TestCase):
         self._seed_common_mocks(workflow)
         workflow.analysis_worker.evaluate = MagicMock(return_value={"faithfulness": 0.93})
 
+        # Force local async path and deterministic processing regardless of
+        # external Redis availability in the test environment.
+        workflow._evaluation_broker.enqueue = MagicMock(return_value=False)
+        workflow._redis_job_store.is_completed = MagicMock(return_value=False)
+        workflow._redis_job_store.acquire_processing = MagicMock(return_value=True)
+        workflow._redis_job_store.release_processing = MagicMock(return_value=True)
+
         # Force deterministic async execution for test.
         workflow._eval_executor.submit = lambda fn, *args: fn(*args)
 
@@ -109,6 +116,37 @@ class TestEvaluationModes(unittest.TestCase):
         self.assertEqual(result.evaluation.get("status"), "disabled")
         self.assertEqual(result.evaluation.get("source"), "disabled")
         workflow.analysis_worker.evaluate.assert_not_called()
+
+    def test_get_evaluation_job_prefers_l2_when_l1_is_stale_pending(self):
+        workflow = build_workflow(evaluation_mode="async")
+        job_id = "job-123"
+
+        with workflow._evaluation_lock:
+            workflow._evaluation_results[job_id] = {
+                "job_id": job_id,
+                "status": "pending",
+                "source": "async",
+            }
+
+        workflow._redis_job_store.get_result = MagicMock(
+            return_value={
+                "job_id": job_id,
+                "status": "completed",
+                "source": "async",
+                "faithfulness": 0.91,
+            }
+        )
+
+        payload = workflow.get_evaluation_job(job_id)
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload.get("status"), "completed")
+        self.assertAlmostEqual(float(payload.get("faithfulness", 0.0)), 0.91)
+
+        with workflow._evaluation_lock:
+            hydrated = workflow._evaluation_results.get(job_id)
+            self.assertIsNotNone(hydrated)
+            self.assertEqual(hydrated.get("status"), "completed")
 
 
 if __name__ == "__main__":

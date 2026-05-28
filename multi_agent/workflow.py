@@ -1109,14 +1109,29 @@ class MultiAgentChatWorkflow:
         self._redis_job_store.set_result(job_id, payload)
 
     def get_evaluation_job(self, job_id: str) -> Dict[str, Any] | None:
-        # Try L1 first
+        # Read current L1 snapshot first.
         with self._evaluation_lock:
-            payload = self._evaluation_results.get(job_id)
-            if payload is not None:
-                return dict(payload)
-        
-        # Fall back to L2 (Redis)
-        return self._redis_job_store.get_result(job_id)
+            l1_payload = self._evaluation_results.get(job_id)
+
+        l1_status = str((l1_payload or {}).get("status", "")).strip().lower()
+        l1_terminal = l1_status in {"completed", "error", "dead_lettered", "poisoned", "skipped"}
+
+        # If L1 is missing or non-terminal (e.g., pending), consult shared L2 so
+        # broker-backed worker completions are visible across polling requests.
+        if (l1_payload is None) or (not l1_terminal):
+            l2_payload = self._redis_job_store.get_result(job_id)
+            if isinstance(l2_payload, dict):
+                l2_status = str(l2_payload.get("status", "")).strip().lower()
+                if l2_status and l2_status != l1_status:
+                    # Hydrate L1 with the freshest state for subsequent reads.
+                    with self._evaluation_lock:
+                        self._evaluation_results[job_id] = dict(l2_payload)
+                        self._evaluation_results.move_to_end(job_id)
+                        while len(self._evaluation_results) > self._evaluation_buffer_size:
+                            self._evaluation_results.popitem(last=False)
+                return dict(l2_payload)
+
+        return dict(l1_payload) if isinstance(l1_payload, dict) else None
 
     def get_recent_evaluation_jobs(self, limit: int = 20):
         safe_limit = max(1, min(limit, self._evaluation_buffer_size))

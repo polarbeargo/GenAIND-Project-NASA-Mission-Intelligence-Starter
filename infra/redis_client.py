@@ -27,7 +27,7 @@ class RedisClient:
         port: int = 6379,
         db: int = 0,
         password: Optional[str] = None,
-        socket_timeout: float = 2.0,
+        socket_timeout: float = 5.0,
         socket_connect_timeout: float = 2.0,
         max_connections: int = 50,
         decode_responses: bool = True,
@@ -42,7 +42,7 @@ class RedisClient:
         self.max_connections = max_connections
         self.decode_responses = decode_responses
         self.enabled = enabled and REDIS_AVAILABLE
-        self._client: Optional[redis.Redis] = None
+        self._client: Optional[Any] = None
         self._available = False
 
         if self.enabled:
@@ -254,11 +254,17 @@ def get_redis_client() -> RedisClient:
     db = int(os.getenv("REDIS_DB", "0"))
     password = os.getenv("REDIS_PASSWORD")
     enabled = os.getenv("REDIS_ENABLED", "false").lower() in {"true", "1", "yes"}
+    socket_timeout = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "5.0"))
+    socket_connect_timeout = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", "3.0"))
+    max_connections = int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
 
     return RedisClient(
         host=host,
         port=port,
         db=db,
         password=password,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_connect_timeout,
+        max_connections=max_connections,
         enabled=enabled,
     )
