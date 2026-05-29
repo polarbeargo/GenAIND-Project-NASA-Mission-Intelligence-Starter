@@ -132,6 +132,9 @@
           "root_selector": "series",
           "source": "url",
           "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
           "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
         }
       ],
@@ -213,6 +216,9 @@
           "root_selector": "series",
           "source": "url",
           "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
           "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
         }
       ],
@@ -294,6 +300,9 @@
           "root_selector": "series",
           "source": "url",
           "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
           "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
         }
       ],
@@ -358,6 +367,9 @@
           "root_selector": "series",
           "source": "url",
           "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
           "url": "http://127.0.0.1:8000/monitoring/latency-sli/timeseries?stage=$stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds&mission=$mission&backend=$backend&model=$model"
         }
       ],
