@@ -225,15 +225,21 @@ def _run_hybrid_first_pass(
     query: str,
     first_pass_n: int,
     where_filter: Optional[Dict[str, Any]],
+    chroma_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     query_embedding = None
-    embedding_function = _build_embedding_function()
-    if embedding_function is not None:
-        try:
-            embedded_query = embedding_function([query])[0]
-            query_embedding = embedded_query.tolist() if hasattr(embedded_query, "tolist") else embedded_query
-        except Exception as error:
-            logger.debug("Query embedding precompute failed; falling back to query_texts: %s", error)
+    # Only precompute query embeddings for OpenAI-backed collections.
+    # Non-OpenAI collections can have a different vector dimension (e.g., 384),
+    # so forcing OpenAI embeddings (e.g., 1536) causes hard query failures.
+    effective_chroma_dir = chroma_dir or getattr(collection, "_rag_chroma_dir", None)
+    if effective_chroma_dir and _is_openai_chroma_dir(str(effective_chroma_dir)):
+        embedding_function = _build_embedding_function()
+        if embedding_function is not None:
+            try:
+                embedded_query = embedding_function([query])[0]
+                query_embedding = embedded_query.tolist() if hasattr(embedded_query, "tolist") else embedded_query
+            except Exception as error:
+                logger.debug("Query embedding precompute failed; falling back to query_texts: %s", error)
 
     semantic_results = _query_collection(
         collection=collection,
@@ -527,6 +533,7 @@ def retrieve_documents(
         query=query,
         first_pass_n=first_pass_n,
         where_filter=where_filter,
+        chroma_dir=chroma_dir,
     )
 
     results = _rerank_documents(query=query, results=results, keep_n=requested_n)
