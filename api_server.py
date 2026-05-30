@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional, Any
 
 from env_utils import load_project_env
@@ -31,6 +32,7 @@ from observability import init_telemetry, telemetry_status
 from multi_agent import ChatWorkflowInput, MultiAgentChatWorkflow, WorkflowError
 from monitoring.security_dashboard import get_dashboard
 from monitoring.stage_sli_events import StageLatencyEventStore
+from monitoring.worker_pool_events import WorkerPoolEventStore
 
 try:
     from security import (
@@ -311,6 +313,34 @@ def _get_stage_sli_log_path() -> Path:
     return path
 
 
+def _get_worker_pool_sli_retention_hours() -> float:
+    return _parse_float_range("WORKER_POOL_SLI_RETENTION_HOURS", 168.0, min_val=1.0, max_val=24.0 * 30.0)
+
+
+def _get_worker_pool_sli_max_file_bytes() -> int:
+    return _parse_int_range("WORKER_POOL_SLI_MAX_FILE_BYTES", 20 * 1024 * 1024, min_val=1024 * 1024, max_val=200 * 1024 * 1024)
+
+
+def _get_worker_pool_sli_max_rotated_files() -> int:
+    return _parse_int_range("WORKER_POOL_SLI_MAX_ROTATED_FILES", 10, min_val=1, max_val=100)
+
+
+def _get_worker_pool_sli_maintenance_seconds() -> float:
+    return _parse_float_range("WORKER_POOL_SLI_MAINTENANCE_SECONDS", 60.0, min_val=1.0, max_val=3600.0)
+
+
+def _get_worker_pool_sli_log_path() -> Path:
+    configured = os.getenv("WORKER_POOL_SLI_LOG_FILE", "./monitoring/worker_pool_events.jsonl").strip()
+    path = Path(configured) if configured else Path("./monitoring/worker_pool_events.jsonl")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _get_worker_pool_sli_sample_interval_seconds() -> float:
+    return _parse_float_range("WORKER_POOL_SLI_SAMPLE_INTERVAL_SECONDS", 10.0, min_val=0.0, max_val=300.0)
+
+
 def _phoenix_base_url() -> str:
     configured = (os.getenv("PHOENIX_BASE_URL") or "").strip()
     if configured:
@@ -444,6 +474,41 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
     generated_at_ms = float(report.get("generated_at_ms", 0))
     lines.append(f"nasa_worker_pool_generated_at_ms {generated_at_ms}")
     return "\n".join(lines) + "\n"
+
+
+def _worker_pool_series(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert worker-pool snapshots into a row-oriented JSON series for dashboards."""
+    rows: List[Dict[str, Any]] = []
+    workers = report.get("workers", {})
+    for stage, snapshot in workers.items():
+        queue_limit = float(snapshot.get("queue_limit", 0))
+        capacity = float(snapshot.get("capacity", 0))
+        queued_estimate = float(snapshot.get("queued_estimate", 0))
+        inflight = float(snapshot.get("inflight", 0))
+        rows.append(
+            {
+                "stage": str(stage),
+                "max_workers": float(snapshot.get("max_workers", 0)),
+                "queue_limit": queue_limit,
+                "capacity": capacity,
+                "inflight": inflight,
+                "queued_estimate": queued_estimate,
+                "submitted": float(snapshot.get("submitted", 0)),
+                "completed": float(snapshot.get("completed", 0)),
+                "rejected": float(snapshot.get("rejected", 0)),
+                "failed": float(snapshot.get("failed", 0)),
+                "oldest_queue_age_seconds": float(snapshot.get("oldest_queue_age_seconds", 0.0)),
+                "rejected_rate": float(snapshot.get("rejected_rate", 0.0)),
+                "error_rate": float(snapshot.get("error_rate", 0.0)),
+                "queue_depth_ratio": (queued_estimate / queue_limit) if queue_limit > 0 else 0.0,
+                "utilization_ratio": (inflight / capacity) if capacity > 0 else 0.0,
+            }
+        )
+
+    return {
+        "generated_at_ms": report.get("generated_at_ms", 0),
+        "series": rows,
+    }
 
 
 class RedisSlidingWindowRateLimiter:
@@ -795,6 +860,36 @@ chat_workflow = MultiAgentChatWorkflow(
         maintenance_interval_seconds=_get_stage_sli_maintenance_seconds(),
     ),
 )
+
+worker_pool_event_store = WorkerPoolEventStore(
+    log_file=_get_worker_pool_sli_log_path(),
+    retention_hours=_get_worker_pool_sli_retention_hours(),
+    max_file_bytes=_get_worker_pool_sli_max_file_bytes(),
+    max_rotated_files=_get_worker_pool_sli_max_rotated_files(),
+    maintenance_interval_seconds=_get_worker_pool_sli_maintenance_seconds(),
+)
+worker_pool_sli_sample_interval_seconds = _get_worker_pool_sli_sample_interval_seconds()
+_worker_pool_sli_last_write_monotonic = 0.0
+_worker_pool_sli_write_lock = Lock()
+
+
+def _capture_worker_pool_report() -> Dict[str, Any]:
+    global _worker_pool_sli_last_write_monotonic
+    report = chat_workflow.get_worker_pool_report()
+
+    should_write = False
+    now_monotonic = time.monotonic()
+    with _worker_pool_sli_write_lock:
+        if worker_pool_sli_sample_interval_seconds <= 0.0:
+            should_write = True
+        elif (now_monotonic - _worker_pool_sli_last_write_monotonic) >= worker_pool_sli_sample_interval_seconds:
+            should_write = True
+        if should_write:
+            _worker_pool_sli_last_write_monotonic = now_monotonic
+
+    if should_write:
+        worker_pool_event_store.record_snapshot(report)
+    return report
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -1180,13 +1275,38 @@ def monitoring_latency_sli() -> Dict[str, Any]:
 @app.get("/monitoring/worker-pools")
 def monitoring_worker_pools() -> Dict[str, Any]:
     """Return bounded stage worker-pool utilization and saturation counters."""
-    return chat_workflow.get_worker_pool_report()
+    return _capture_worker_pool_report()
+
+
+@app.get("/monitoring/worker-pools/series")
+def monitoring_worker_pools_series() -> Dict[str, Any]:
+    """Return row-oriented worker-pool stage metrics for dashboard consumption."""
+    report = _capture_worker_pool_report()
+    return _worker_pool_series(report)
+
+
+@app.get("/monitoring/worker-pools/timeseries")
+def monitoring_worker_pools_timeseries(
+    stage: Optional[str] = None,
+    window_minutes: int = 60,
+    bucket_seconds: int = 300,
+) -> Dict[str, Any]:
+    """Return bucketed worker-pool saturation snapshots for dashboard correlation."""
+    _capture_worker_pool_report()
+    try:
+        return worker_pool_event_store.get_timeseries(
+            stage=stage,
+            window_minutes=window_minutes,
+            bucket_seconds=bucket_seconds,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
 
 
 @app.get("/monitoring/worker-pools/prometheus", response_class=Response)
 def monitoring_worker_pools_prometheus() -> Response:
     """Return worker-pool saturation metrics in Prometheus text format."""
-    report = chat_workflow.get_worker_pool_report()
+    report = _capture_worker_pool_report()
     payload = _format_worker_pool_prometheus(report)
     return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 

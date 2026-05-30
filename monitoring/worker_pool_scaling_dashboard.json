@@ -1,0 +1,851 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_INFINITY",
+      "label": "Infinity",
+      "description": "Grafana Infinity datasource",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.4.0"
+    },
+    {
+      "type": "datasource",
+      "id": "yesoreyeram-infinity-datasource",
+      "name": "Infinity",
+      "version": "2.7.1"
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "title": "Open Latency SLI Dashboard",
+      "type": "dashboards",
+      "tags": [
+        "nasa",
+        "latency",
+        "sli"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Scale-out early when queue depth ratio is sustained above 0.6; sustained levels near 0.85 indicate strong saturation.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.6
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "queue_depth_ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "oldest_queue_age_seconds"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "queue_depth_ratio"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "stage",
+              "text": "stage",
+              "type": "string"
+            },
+            {
+              "selector": "queue_depth_ratio",
+              "text": "queue_depth_ratio",
+              "type": "number"
+            },
+            {
+              "selector": "queue_limit",
+              "text": "queue_limit",
+              "type": "number"
+            },
+            {
+              "selector": "oldest_queue_age_seconds",
+              "text": "oldest_queue_age_seconds",
+              "type": "number"
+            }
+          ],
+          "format": "table",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/worker-pools/series"
+        }
+      ],
+      "title": "Queue Depth Ratio by Stage",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Use utilization ratio above 0.75 as a secondary autoscaling trigger after queue pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "utilization_ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "utilization_ratio"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "stage",
+              "text": "stage",
+              "type": "string"
+            },
+            {
+              "selector": "utilization_ratio",
+              "text": "utilization_ratio",
+              "type": "number"
+            },
+            {
+              "selector": "capacity",
+              "text": "capacity",
+              "type": "number"
+            },
+            {
+              "selector": "max_workers",
+              "text": "max_workers",
+              "type": "number"
+            }
+          ],
+          "format": "table",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/worker-pools/series"
+        }
+      ],
+      "title": "Utilization Ratio by Stage",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Any sustained increase in rejected submissions is a strong overload signal and should trigger aggressive scaling review.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "rejected"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "stage",
+              "text": "stage",
+              "type": "string"
+            },
+            {
+              "selector": "rejected",
+              "text": "rejected",
+              "type": "number"
+            },
+            {
+              "selector": "rejected_rate",
+              "text": "rejected_rate",
+              "type": "number"
+            },
+            {
+              "selector": "failed",
+              "text": "failed",
+              "type": "number"
+            }
+          ],
+          "format": "table",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/worker-pools/series"
+        }
+      ],
+      "title": "Rejected Submissions by Stage",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Inspect current inflight work, queued backlog, and queue age together to understand whether autoscaling is reacting in time.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "queued_estimate"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "stage",
+              "text": "stage",
+              "type": "string"
+            },
+            {
+              "selector": "inflight",
+              "text": "inflight",
+              "type": "number"
+            },
+            {
+              "selector": "queued_estimate",
+              "text": "queued_estimate",
+              "type": "number"
+            },
+            {
+              "selector": "oldest_queue_age_seconds",
+              "text": "oldest_queue_age_seconds",
+              "type": "number"
+            },
+            {
+              "selector": "submitted",
+              "text": "submitted",
+              "type": "number"
+            },
+            {
+              "selector": "completed",
+              "text": "completed",
+              "type": "number"
+            }
+          ],
+          "format": "table",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/worker-pools/series"
+        }
+      ],
+      "title": "Inflight / Queued Estimate by Stage",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Correlate selected stage saturation with p95 latency behavior. Use the dashboard link to jump to the full latency SLI view.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.6
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "queue_depth_ratio_avg",
+              "text": "queue_depth_ratio_avg",
+              "type": "number"
+            },
+            {
+              "selector": "utilization_ratio_avg",
+              "text": "utilization_ratio_avg",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/worker-pools/timeseries?stage=$worker_stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds"
+        }
+      ],
+      "title": "Selected Worker Stage Queue/Utilization Trend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${DS_INFINITY}"
+      },
+      "description": "Compare timeout and within-budget behavior for the selected stage while tuning HPA thresholds.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "columns": [
+            {
+              "selector": "bucket_start_ms",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "timeout_rate_percent",
+              "text": "timeout_rate_percent",
+              "type": "number"
+            },
+            {
+              "selector": "within_budget_rate_percent",
+              "text": "within_budget_rate_percent",
+              "type": "number"
+            }
+          ],
+          "format": "timeseries",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "series",
+          "source": "url",
+          "type": "json",
+          "url_options": {
+            "method": "GET"
+          },
+          "url": "$api_base_url/monitoring/latency-sli/timeseries?stage=$latency_stage&window_minutes=$window_minutes&bucket_seconds=$bucket_seconds"
+        }
+      ],
+      "title": "Selected Latency Stage Timeout vs Within Budget",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "nasa",
+    "worker-pools",
+    "autoscaling",
+    "hpa"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "http://host.docker.internal:8000",
+          "value": "http://host.docker.internal:8000"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "API Base URL",
+        "multi": false,
+        "name": "api_base_url",
+        "query": "http://host.docker.internal:8000",
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "retrieval",
+          "value": "retrieval"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Worker Stage",
+        "multi": false,
+        "name": "worker_stage",
+        "options": [
+          {
+            "selected": false,
+            "text": "safety",
+            "value": "safety"
+          },
+          {
+            "selected": true,
+            "text": "retrieval",
+            "value": "retrieval"
+          },
+          {
+            "selected": false,
+            "text": "generation",
+            "value": "generation"
+          },
+          {
+            "selected": false,
+            "text": "judge",
+            "value": "judge"
+          },
+          {
+            "selected": false,
+            "text": "evaluation",
+            "value": "evaluation"
+          }
+        ],
+        "query": "safety,retrieval,generation,judge,evaluation",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "retrieval",
+          "value": "retrieval"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Latency Stage",
+        "multi": false,
+        "name": "latency_stage",
+        "options": [
+          {
+            "selected": false,
+            "text": "preflight",
+            "value": "preflight"
+          },
+          {
+            "selected": true,
+            "text": "retrieval",
+            "value": "retrieval"
+          },
+          {
+            "selected": false,
+            "text": "generation",
+            "value": "generation"
+          },
+          {
+            "selected": false,
+            "text": "evaluation",
+            "value": "evaluation"
+          }
+        ],
+        "query": "preflight,retrieval,generation,evaluation",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "60",
+          "value": "60"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Window (min)",
+        "multi": false,
+        "name": "window_minutes",
+        "options": [
+          {
+            "selected": false,
+            "text": "15",
+            "value": "15"
+          },
+          {
+            "selected": true,
+            "text": "60",
+            "value": "60"
+          },
+          {
+            "selected": false,
+            "text": "360",
+            "value": "360"
+          },
+          {
+            "selected": false,
+            "text": "1440",
+            "value": "1440"
+          }
+        ],
+        "query": "15,60,360,1440",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "300",
+          "value": "300"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Bucket (sec)",
+        "multi": false,
+        "name": "bucket_seconds",
+        "options": [
+          {
+            "selected": false,
+            "text": "60",
+            "value": "60"
+          },
+          {
+            "selected": true,
+            "text": "300",
+            "value": "300"
+          },
+          {
+            "selected": false,
+            "text": "900",
+            "value": "900"
+          }
+        ],
+        "query": "60,300,900",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "NASA Worker Pool Scaling",
+  "uid": "nasa-worker-pool-scaling",
+  "version": 1,
+  "weekStart": ""
+}
