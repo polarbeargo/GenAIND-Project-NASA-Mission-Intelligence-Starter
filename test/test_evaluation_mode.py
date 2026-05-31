@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import logging
 import unittest
+from concurrent.futures import TimeoutError
 from unittest.mock import MagicMock
 
 from multi_agent.models import ChatWorkflowInput, RetrievalResult, SafetyPreflightResult
-from multi_agent.workflow import MultiAgentChatWorkflow
+from multi_agent.workflow import MultiAgentChatWorkflow, StageOverloadError
 
 
 class DummyViolation(Exception):
@@ -80,6 +81,7 @@ class TestEvaluationModes(unittest.TestCase):
         workflow._redis_job_store.release_processing = MagicMock(return_value=True)
 
         # Force deterministic async execution for test.
+        workflow._eval_job_executor.submit = lambda fn, *args: fn(*args)
         workflow._eval_executor.submit = lambda fn, *args: fn(*args)
 
         result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
@@ -116,6 +118,54 @@ class TestEvaluationModes(unittest.TestCase):
         self.assertEqual(result.evaluation.get("status"), "disabled")
         self.assertEqual(result.evaluation.get("source"), "disabled")
         workflow.analysis_worker.evaluate.assert_not_called()
+
+    def test_async_evaluation_overload_returns_skipped_payload_non_fatal(self):
+        workflow = build_workflow(evaluation_mode="async")
+        self._seed_common_mocks(workflow)
+        workflow.analysis_worker.evaluate = MagicMock(return_value={"faithfulness": 0.93})
+        workflow._evaluation_broker.enqueue = MagicMock(return_value=False)
+        workflow._eval_job_executor.submit = MagicMock(side_effect=StageOverloadError("eval queue full"))
+
+        result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
+
+        self.assertEqual(result.evaluation.get("status"), "skipped")
+        self.assertEqual(result.evaluation.get("source"), "overload")
+        self.assertTrue(result.evaluation.get("job_id"))
+
+        stored = workflow.get_evaluation_job(result.evaluation["job_id"])
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.get("status"), "skipped")
+
+    def test_async_evaluation_timeout_records_non_fatal_error_payload(self):
+        workflow = build_workflow(evaluation_mode="async")
+        self._seed_common_mocks(workflow)
+        workflow._evaluation_timeout_seconds = 0.05
+        workflow._evaluation_broker.enqueue = MagicMock(return_value=False)
+        workflow._redis_job_store.is_completed = MagicMock(return_value=False)
+        workflow._redis_job_store.acquire_processing = MagicMock(return_value=True)
+        workflow._redis_job_store.release_processing = MagicMock(return_value=True)
+
+        class TimeoutFuture:
+            def result(self, timeout=None):
+                raise TimeoutError()
+
+            def cancel(self):
+                return True
+
+        workflow._eval_job_executor.submit = lambda fn, *args: fn(*args)
+        workflow._eval_executor.submit = lambda fn, *args: TimeoutFuture()
+
+        result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
+
+        self.assertEqual(result.evaluation.get("status"), "pending")
+        job_id = result.evaluation.get("job_id")
+        self.assertTrue(job_id)
+
+        stored = workflow.get_evaluation_job(job_id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.get("status"), "error")
+        self.assertEqual(stored.get("source"), "async")
+        self.assertIn("timed out", str(stored.get("error", "")).lower())
 
     def test_get_evaluation_job_prefers_l2_when_l1_is_stale_pending(self):
         workflow = build_workflow(evaluation_mode="async")

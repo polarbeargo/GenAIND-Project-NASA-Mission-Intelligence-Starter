@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from multi_agent.models import ChatWorkflowInput, RetrievalResult, SafetyPreflightResult
-from multi_agent.workflow import MultiAgentChatWorkflow
+from multi_agent.workflow import MultiAgentChatWorkflow, WorkflowError
 
 
 class DummyViolation(Exception):
@@ -33,6 +33,7 @@ def build_workflow(evaluation_mode: str = "async") -> MultiAgentChatWorkflow:
         security_auditor=None,
         security_level=None,
         retrieval_timeout_seconds=0.01,
+        preflight_timeout_seconds=0.01,
         generation_timeout_seconds=0.05,
         evaluation_timeout_seconds=0.05,
         breaker_failure_threshold=1,
@@ -128,6 +129,23 @@ class TestStageTimeouts(unittest.TestCase):
         self.assertGreaterEqual(generation["timeouts"], 1)
         self.assertGreater(generation["timeout_rate"], 0.0)
         self.assertEqual(generation["budget_ms"], 1800.0)
+
+    def test_preflight_timeout_raises_workflow_error_and_records_timeout_metric(self):
+        workflow = build_workflow()
+
+        def _slow_preflight(_workflow_input):
+            time.sleep(0.2)
+            return SafetyPreflightResult(blocked_response=None)
+
+        workflow.safety_worker.preflight = MagicMock(side_effect=_slow_preflight)
+
+        with self.assertRaises(WorkflowError) as error_ctx:
+            workflow.run(make_input(evaluate=False), openai_key="fake-key")
+
+        self.assertEqual(error_ctx.exception.status_code, 503)
+
+        preflight_report = workflow.get_latency_sli_report()["workers"]["preflight"]
+        self.assertGreaterEqual(preflight_report["timeouts"], 1)
 
 
 if __name__ == "__main__":
