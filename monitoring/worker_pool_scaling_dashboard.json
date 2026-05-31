@@ -7,6 +7,14 @@
       "type": "datasource",
       "pluginId": "yesoreyeram-infinity-datasource",
       "pluginName": "Infinity"
+    },
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Grafana Prometheus datasource",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
     }
   ],
   "__requires": [
@@ -21,6 +29,12 @@
       "id": "yesoreyeram-infinity-datasource",
       "name": "Infinity",
       "version": "2.7.1"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": ""
     },
     {
       "type": "panel",
@@ -665,6 +679,78 @@
       ],
       "title": "Selected Latency Stage Timeout vs Within Budget",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Prometheus-native quick view for utilization ratio by selected stage; when Stage is empty, this panel shows all stages.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "nasa_worker_pool_utilization_ratio{stage=~\".*${stage:regex}.*\"}",
+          "legendFormat": "stage={{stage}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Prometheus Utilization Ratio (Selected Stage or All When Empty)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -691,6 +777,30 @@
         "name": "api_base_url",
         "query": "http://host.docker.internal:8000",
         "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "retrieval",
+          "value": "retrieval"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(nasa_runtime_stage_pool_workers, stage)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Stage (Prometheus, empty=all)",
+        "multi": false,
+        "name": "stage",
+        "query": {
+          "query": "label_values(nasa_runtime_stage_pool_workers, stage)",
+          "refId": "PromVarStage"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "type": "query"
       },
       {
         "current": {
@@ -846,6 +956,6 @@
   "timezone": "",
   "title": "NASA Worker Pool Scaling",
   "uid": "nasa-worker-pool-scaling",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

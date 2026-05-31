@@ -263,6 +263,17 @@ def _get_profiled_stage_timeout(
     return _profiled_float(name, interactive_default, balanced_default, throughput_default, min_value, max_value)
 
 
+def _get_preflight_timeout_seconds() -> float:
+    return _get_profiled_stage_timeout(
+        "PREFLIGHT_TIMEOUT_SECONDS",
+        interactive_default=0.5,
+        balanced_default=0.5,
+        throughput_default=0.8,
+        min_value=0.05,
+        max_value=5.0,
+    )
+
+
 def _get_profiled_stage_worker_count(
     name: str,
     interactive_default: int,
@@ -473,6 +484,69 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
 
     generated_at_ms = float(report.get("generated_at_ms", 0))
     lines.append(f"nasa_worker_pool_generated_at_ms {generated_at_ms}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_runtime_config_prometheus(config: Dict[str, Any]) -> str:
+    """Render runtime config snapshot fields as Prometheus metrics."""
+    api_profile = _prometheus_escape_label(str(config.get("api_profile", "unknown")))
+    timeouts = config.get("timeouts_seconds", {}) or {}
+    breaker = config.get("breaker", {}) or {}
+    stage_pools = config.get("stage_pools", {}) or {}
+
+    lines: List[str] = [
+        "# HELP nasa_runtime_config_info Runtime configuration labels.",
+        "# TYPE nasa_runtime_config_info gauge",
+        "# HELP nasa_runtime_timeout_seconds Effective timeout values in seconds by stage.",
+        "# TYPE nasa_runtime_timeout_seconds gauge",
+        "# HELP nasa_runtime_breaker_failure_threshold Effective stage breaker consecutive failure threshold.",
+        "# TYPE nasa_runtime_breaker_failure_threshold gauge",
+        "# HELP nasa_runtime_breaker_recovery_seconds Effective stage breaker recovery duration in seconds.",
+        "# TYPE nasa_runtime_breaker_recovery_seconds gauge",
+        "# HELP nasa_runtime_stage_pool_workers Configured worker count per stage.",
+        "# TYPE nasa_runtime_stage_pool_workers gauge",
+        "# HELP nasa_runtime_stage_pool_queue_limit Configured queue limit per stage.",
+        "# TYPE nasa_runtime_stage_pool_queue_limit gauge",
+    ]
+
+    lines.append(f'nasa_runtime_config_info{{api_profile="{api_profile}"}} 1')
+
+    for stage, timeout_value in timeouts.items():
+        safe_stage = _prometheus_escape_label(str(stage))
+        try:
+            safe_timeout = float(timeout_value)
+        except (TypeError, ValueError):
+            continue
+        lines.append(f'nasa_runtime_timeout_seconds{{stage="{safe_stage}"}} {safe_timeout:.6f}')
+
+    try:
+        failure_threshold = float(breaker.get("failure_threshold", 0.0))
+    except (TypeError, ValueError):
+        failure_threshold = 0.0
+    try:
+        recovery_seconds = float(breaker.get("recovery_seconds", 0.0))
+    except (TypeError, ValueError):
+        recovery_seconds = 0.0
+
+    lines.append(f"nasa_runtime_breaker_failure_threshold {failure_threshold:.6f}")
+    lines.append(f"nasa_runtime_breaker_recovery_seconds {recovery_seconds:.6f}")
+
+    for stage, sizing in stage_pools.items():
+        if not isinstance(sizing, dict):
+            continue
+        safe_stage = _prometheus_escape_label(str(stage))
+        try:
+            workers = float(sizing.get("workers", 0.0))
+        except (TypeError, ValueError):
+            workers = 0.0
+        try:
+            queue_limit = float(sizing.get("queue_limit", 0.0))
+        except (TypeError, ValueError):
+            queue_limit = 0.0
+
+        lines.append(f'nasa_runtime_stage_pool_workers{{stage="{safe_stage}"}} {workers:.6f}')
+        lines.append(f'nasa_runtime_stage_pool_queue_limit{{stage="{safe_stage}"}} {queue_limit:.6f}')
+
     return "\n".join(lines) + "\n"
 
 
@@ -759,6 +833,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("Startup warmup complete. Cache stats: %s", cache_stats.to_dict())
     yield
+    try:
+        chat_workflow.shutdown()
+        logger.info("Workflow executors shut down")
+    except Exception as error:
+        logger.warning("Workflow shutdown encountered an error: %s", str(error)[:120])
     logger.info("Shutting down NASA RAG API")
 
 
@@ -787,6 +866,52 @@ JAILBREAK_KEYWORDS = [
     "ignore previous", "disregard", "forget", "override",
 ]
 
+_PREFLIGHT_TIMEOUT_SECONDS = _get_preflight_timeout_seconds()
+_RETRIEVAL_TIMEOUT_SECONDS = _get_profiled_stage_timeout(
+    "RETRIEVAL_TIMEOUT_SECONDS",
+    interactive_default=1.8,
+    balanced_default=1.8,
+    throughput_default=2.4,
+    min_value=0.2,
+    max_value=10.0,
+)
+_GENERATION_TIMEOUT_SECONDS = _get_profiled_stage_timeout(
+    "GENERATION_TIMEOUT_SECONDS",
+    interactive_default=6.5,
+    balanced_default=8.0,
+    throughput_default=10.0,
+    min_value=0.5,
+    max_value=30.0,
+)
+_EVALUATION_TIMEOUT_SECONDS = _get_profiled_stage_timeout(
+    "EVALUATION_TIMEOUT_SECONDS",
+    interactive_default=2.5,
+    balanced_default=3.5,
+    throughput_default=5.0,
+    min_value=0.5,
+    max_value=20.0,
+)
+_JUDGE_TIMEOUT_SECONDS = _get_judge_timeout_seconds()
+_QUEUE_SUBMIT_TIMEOUT_SECONDS = _get_stage_submit_timeout_seconds()
+_BREAKER_FAILURE_THRESHOLD = _get_breaker_failure_threshold()
+_BREAKER_RECOVERY_SECONDS = _get_breaker_recovery_seconds()
+
+_STAGE_WORKER_COUNTS = {
+    "safety": _get_profiled_stage_worker_count("SAFETY_WORKERS", 2, 3, 4),
+    "retrieval": _get_profiled_stage_worker_count("RETRIEVAL_WORKERS", 4, 8, 12),
+    "generation": _get_profiled_stage_worker_count("GENERATION_WORKERS", 4, 8, 12),
+    "judge": _get_profiled_stage_worker_count("JUDGE_WORKERS", 1, 2, 4),
+    "evaluation": _get_profiled_stage_worker_count("EVALUATION_WORKERS", 1, 2, 4),
+}
+
+_STAGE_QUEUE_LIMITS = {
+    "safety": _get_profiled_stage_queue_limit("SAFETY_QUEUE_LIMIT", 120, 240, 400),
+    "retrieval": _get_profiled_stage_queue_limit("RETRIEVAL_QUEUE_LIMIT", 160, 600, 1200),
+    "generation": _get_profiled_stage_queue_limit("GENERATION_QUEUE_LIMIT", 160, 600, 1200),
+    "judge": _get_profiled_stage_queue_limit("JUDGE_QUEUE_LIMIT", 80, 160, 240),
+    "evaluation": _get_profiled_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 120, 300, 500),
+}
+
 chat_workflow = MultiAgentChatWorkflow(
     get_collection_fn=_get_cached_rag_init,
     logger=logger,
@@ -799,52 +924,32 @@ chat_workflow = MultiAgentChatWorkflow(
     security_violation=SecurityViolation,
     security_auditor=security_auditor_bridge,
     security_level=SecurityLevel,
-    judge_timeout_seconds=_get_judge_timeout_seconds(),
+    judge_timeout_seconds=_JUDGE_TIMEOUT_SECONDS,
     factoid_n_results=_get_depth_threshold("RETRIEVAL_FACTOID_N_RESULTS", 2),
     broad_n_results=_get_depth_threshold("RETRIEVAL_BROAD_N_RESULTS", 4),
     context_max_tokens=_get_compression_max_tokens(),
     context_dedup_threshold=_get_compression_dedup_threshold(),
-    retrieval_timeout_seconds=_get_profiled_stage_timeout(
-        "RETRIEVAL_TIMEOUT_SECONDS",
-        interactive_default=1.8,
-        balanced_default=1.8,
-        throughput_default=2.4,
-        min_value=0.2,
-        max_value=10.0,
-    ),
-    generation_timeout_seconds=_get_profiled_stage_timeout(
-        "GENERATION_TIMEOUT_SECONDS",
-        interactive_default=6.5,
-        balanced_default=8.0,
-        throughput_default=10.0,
-        min_value=0.5,
-        max_value=30.0,
-    ),
-    evaluation_timeout_seconds=_get_profiled_stage_timeout(
-        "EVALUATION_TIMEOUT_SECONDS",
-        interactive_default=2.5,
-        balanced_default=3.5,
-        throughput_default=5.0,
-        min_value=0.5,
-        max_value=20.0,
-    ),
-    breaker_failure_threshold=_get_breaker_failure_threshold(),
-    breaker_recovery_seconds=_get_breaker_recovery_seconds(),
+    retrieval_timeout_seconds=_RETRIEVAL_TIMEOUT_SECONDS,
+    preflight_timeout_seconds=_PREFLIGHT_TIMEOUT_SECONDS,
+    generation_timeout_seconds=_GENERATION_TIMEOUT_SECONDS,
+    evaluation_timeout_seconds=_EVALUATION_TIMEOUT_SECONDS,
+    breaker_failure_threshold=_BREAKER_FAILURE_THRESHOLD,
+    breaker_recovery_seconds=_BREAKER_RECOVERY_SECONDS,
     preflight_budget_ms=_get_latency_budget_ms("PREFLIGHT_BUDGET_MS", 20.0),
     retrieval_budget_ms=_get_latency_budget_ms("RETRIEVAL_BUDGET_MS", 700.0),
     generation_budget_ms=_get_latency_budget_ms("GENERATION_BUDGET_MS", 1800.0),
     evaluation_mode=_get_evaluation_mode(),
-    safety_workers=_get_profiled_stage_worker_count("SAFETY_WORKERS", 2, 3, 4),
-    retrieval_workers=_get_profiled_stage_worker_count("RETRIEVAL_WORKERS", 4, 8, 12),
-    generation_workers=_get_profiled_stage_worker_count("GENERATION_WORKERS", 4, 8, 12),
-    judge_workers=_get_profiled_stage_worker_count("JUDGE_WORKERS", 1, 2, 4),
-    evaluation_workers=_get_profiled_stage_worker_count("EVALUATION_WORKERS", 1, 2, 4),
-    safety_queue_limit=_get_profiled_stage_queue_limit("SAFETY_QUEUE_LIMIT", 120, 240, 400),
-    retrieval_queue_limit=_get_profiled_stage_queue_limit("RETRIEVAL_QUEUE_LIMIT", 160, 600, 1200),
-    generation_queue_limit=_get_profiled_stage_queue_limit("GENERATION_QUEUE_LIMIT", 160, 600, 1200),
-    judge_queue_limit=_get_profiled_stage_queue_limit("JUDGE_QUEUE_LIMIT", 80, 160, 240),
-    evaluation_queue_limit=_get_profiled_stage_queue_limit("EVALUATION_QUEUE_LIMIT", 120, 300, 500),
-    queue_submit_timeout_seconds=_get_stage_submit_timeout_seconds(),
+    safety_workers=_STAGE_WORKER_COUNTS["safety"],
+    retrieval_workers=_STAGE_WORKER_COUNTS["retrieval"],
+    generation_workers=_STAGE_WORKER_COUNTS["generation"],
+    judge_workers=_STAGE_WORKER_COUNTS["judge"],
+    evaluation_workers=_STAGE_WORKER_COUNTS["evaluation"],
+    safety_queue_limit=_STAGE_QUEUE_LIMITS["safety"],
+    retrieval_queue_limit=_STAGE_QUEUE_LIMITS["retrieval"],
+    generation_queue_limit=_STAGE_QUEUE_LIMITS["generation"],
+    judge_queue_limit=_STAGE_QUEUE_LIMITS["judge"],
+    evaluation_queue_limit=_STAGE_QUEUE_LIMITS["evaluation"],
+    queue_submit_timeout_seconds=_QUEUE_SUBMIT_TIMEOUT_SECONDS,
     evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
     evaluation_broker_stream=_get_evaluation_broker_stream(),
     evaluation_broker_group=_get_evaluation_broker_group(),
@@ -1266,6 +1371,36 @@ def monitoring_client_caches() -> Dict[str, Any]:
     }
 
 
+@app.get("/monitoring/config")
+def monitoring_config() -> Dict[str, Any]:
+    """Return effective runtime config values relevant to operations."""
+    stage_pools = {
+        stage: {
+            "workers": _STAGE_WORKER_COUNTS[stage],
+            "queue_limit": _STAGE_QUEUE_LIMITS[stage],
+        }
+        for stage in _STAGE_WORKER_COUNTS
+    }
+
+    return {
+        "generated_at_ms": round(time.time() * 1000),
+        "api_profile": _get_api_profile(),
+        "timeouts_seconds": {
+            "preflight": _PREFLIGHT_TIMEOUT_SECONDS,
+            "retrieval": _RETRIEVAL_TIMEOUT_SECONDS,
+            "generation": _GENERATION_TIMEOUT_SECONDS,
+            "evaluation": _EVALUATION_TIMEOUT_SECONDS,
+            "judge": _JUDGE_TIMEOUT_SECONDS,
+            "queue_submit": _QUEUE_SUBMIT_TIMEOUT_SECONDS,
+        },
+        "breaker": {
+            "failure_threshold": _BREAKER_FAILURE_THRESHOLD,
+            "recovery_seconds": _BREAKER_RECOVERY_SECONDS,
+        },
+        "stage_pools": stage_pools,
+    }
+
+
 @app.get("/monitoring/latency-sli")
 def monitoring_latency_sli() -> Dict[str, Any]:
     """Return per-stage latency SLIs with budget compliance and timeout rate."""
@@ -1308,6 +1443,7 @@ def monitoring_worker_pools_prometheus() -> Response:
     """Return worker-pool saturation metrics in Prometheus text format."""
     report = _capture_worker_pool_report()
     payload = _format_worker_pool_prometheus(report)
+    payload += _format_runtime_config_prometheus(monitoring_config())
     return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 

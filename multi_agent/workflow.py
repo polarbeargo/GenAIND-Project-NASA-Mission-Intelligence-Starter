@@ -256,6 +256,7 @@ class MultiAgentChatWorkflow:
         context_max_tokens: int = 2000,
         context_dedup_threshold: float = 0.85,
         retrieval_timeout_seconds: float = 1.8,
+        preflight_timeout_seconds: float = 0.5,
         generation_timeout_seconds: float = 8.0,
         evaluation_timeout_seconds: float = 3.5,
         breaker_failure_threshold: int = 3,
@@ -338,6 +339,12 @@ class MultiAgentChatWorkflow:
             submit_timeout_seconds=queue_submit_timeout_seconds,
             thread_name_prefix="nasa-eval-worker",
         )
+        self._eval_job_executor = BoundedExecutor(
+            max_workers=evaluation_workers,
+            queue_limit=evaluation_queue_limit,
+            submit_timeout_seconds=queue_submit_timeout_seconds,
+            thread_name_prefix="nasa-eval-job-worker",
+        )
         self._judge_results = deque(maxlen=200)
         self._evaluation_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._judge_lock = Lock()
@@ -395,6 +402,7 @@ class MultiAgentChatWorkflow:
             )
         )
         self._retrieval_timeout_seconds = max(0.2, float(retrieval_timeout_seconds))
+        self._preflight_timeout_seconds = max(0.05, float(preflight_timeout_seconds))
         self._generation_timeout_seconds = max(0.5, float(generation_timeout_seconds))
         self._evaluation_timeout_seconds = max(0.5, float(evaluation_timeout_seconds))
         threshold = max(1, int(breaker_failure_threshold))
@@ -455,15 +463,61 @@ class MultiAgentChatWorkflow:
         preflight_started = time.perf_counter()
         try:
             preflight_future = self._safety_executor.submit(self.safety_worker.preflight, workflow_input)
-            preflight_result = self._await_result(preflight_future)
+            preflight_result = self._await_result(preflight_future, timeout=self._preflight_timeout_seconds)
         except StageOverloadError as error:
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=False,
+                status="overload",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
             raise WorkflowError(status_code=429, detail="Safety stage is overloaded. Please retry.") from error
+        except TimeoutError as error:
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=True,
+                status="timeout",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
+            raise WorkflowError(status_code=503, detail="Safety preflight timed out. Please retry.") from error
+        except WorkflowError:
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=False,
+                status="error",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
+            raise
+        except Exception as error:
+            preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
+            self._record_stage_metric(
+                "preflight",
+                preflight_latency_ms,
+                timed_out=False,
+                status="error",
+                mission=effective_input.mission_filter,
+                backend=backend_name,
+                model=effective_input.model,
+            )
+            raise WorkflowError(status_code=500, detail="Safety preflight failed") from error
         preflight_latency_ms = (time.perf_counter() - preflight_started) * 1000.0
         self._record_stage_metric(
             "preflight",
             preflight_latency_ms,
             timed_out=False,
-            status="ok",
+            status="blocked" if preflight_result.blocked_response else "ok",
             mission=effective_input.mission_filter,
             backend=backend_name,
             model=effective_input.model,
@@ -995,25 +1049,51 @@ class MultiAgentChatWorkflow:
         # If broker is disabled/unavailable, fall back to local bounded async executor.
         queued = self._evaluation_broker.enqueue(job_id, enqueue_payload)
         if not queued:
-            self._eval_executor.submit(
-                self._run_async_evaluation,
-                job_id,
-                workflow_input,
-                answer,
-                contexts,
-            )
+            try:
+                self._eval_job_executor.submit(
+                    self._run_async_evaluation,
+                    job_id,
+                    workflow_input,
+                    answer,
+                    contexts,
+                )
+            except StageOverloadError:
+                skipped = {
+                    "job_id": job_id,
+                    "status": "skipped",
+                    "source": "overload",
+                    "submitted_at_ms": submitted_at_ms,
+                    "finished_at_ms": round(time.time() * 1000),
+                    "question": workflow_input.question,
+                    "error": "evaluation queue saturated",
+                }
+                self._record_evaluation_job(job_id, skipped)
+                return skipped
         elif not self._evaluation_broker.has_active_consumers():
             logging.getLogger(__name__).warning(
                 "Evaluation broker has no active consumers; running local async fallback for job %s",
                 job_id,
             )
-            self._eval_executor.submit(
-                self._run_async_evaluation,
-                job_id,
-                workflow_input,
-                answer,
-                contexts,
-            )
+            try:
+                self._eval_job_executor.submit(
+                    self._run_async_evaluation,
+                    job_id,
+                    workflow_input,
+                    answer,
+                    contexts,
+                )
+            except StageOverloadError:
+                skipped = {
+                    "job_id": job_id,
+                    "status": "skipped",
+                    "source": "overload",
+                    "submitted_at_ms": submitted_at_ms,
+                    "finished_at_ms": round(time.time() * 1000),
+                    "question": workflow_input.question,
+                    "error": "evaluation queue saturated",
+                }
+                self._record_evaluation_job(job_id, skipped)
+                return skipped
         return pending
 
     def _run_async_evaluation(
@@ -1043,8 +1123,39 @@ class MultiAgentChatWorkflow:
             self._record_evaluation_job(job_id, payload)
             self._redis_job_store.release_processing(job_id)
             return
+
         try:
-            result = self.analysis_worker.evaluate(workflow_input, answer, contexts)
+            eval_future = self._eval_executor.submit(
+                self.analysis_worker.evaluate,
+                workflow_input,
+                answer,
+                contexts,
+            )
+        except StageOverloadError:
+            self._evaluation_breaker.record_failure()
+            self._record_stage_metric(
+                "evaluation",
+                latency_ms=0.0,
+                timed_out=False,
+                status="overload",
+                mission=workflow_input.mission_filter,
+                backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}".lower(),
+                model=workflow_input.model,
+            )
+            payload = {
+                "job_id": job_id,
+                "status": "skipped",
+                "source": "overload",
+                "finished_at_ms": round(time.time() * 1000),
+                "question": workflow_input.question,
+                "error": "evaluation queue saturated",
+            }
+            self._record_evaluation_job(job_id, payload)
+            self._redis_job_store.release_processing(job_id)
+            return
+
+        try:
+            result = self._await_result(eval_future, timeout=self._evaluation_timeout_seconds)
             latency_ms = (time.perf_counter() - started) * 1000.0
             self._record_stage_metric(
                 "evaluation",
@@ -1071,6 +1182,11 @@ class MultiAgentChatWorkflow:
             )
             self._record_evaluation_job(job_id, payload)
         except Exception as error:
+            if isinstance(error, TimeoutError):
+                try:
+                    eval_future.cancel()
+                except Exception:
+                    pass
             self._evaluation_breaker.record_failure()
             latency_ms = (time.perf_counter() - started) * 1000.0
             timed_out = isinstance(error, TimeoutError)
@@ -1090,7 +1206,11 @@ class MultiAgentChatWorkflow:
                 "latency_ms": round(latency_ms, 2),
                 "finished_at_ms": round(time.time() * 1000),
                 "question": workflow_input.question,
-                "error": str(error)[:200],
+                "error": (
+                    f"evaluation timed out after {self._evaluation_timeout_seconds:.2f}s"
+                    if timed_out
+                    else str(error)[:200]
+                ),
             }
             self._record_evaluation_job(job_id, payload)
             logging.getLogger(__name__).warning("Async evaluation failed: %s", str(error)[:120])
@@ -1273,6 +1393,7 @@ class MultiAgentChatWorkflow:
         self._generation_executor.shutdown(wait=False, cancel_futures=False)
         self._judge_executor.shutdown(wait=False, cancel_futures=False)
         self._eval_executor.shutdown(wait=False, cancel_futures=False)
+        self._eval_job_executor.shutdown(wait=False, cancel_futures=False)
 
     def get_worker_pool_report(self) -> Dict[str, Any]:
         """Return bounded worker-pool saturation metrics for autoscaling decisions."""
