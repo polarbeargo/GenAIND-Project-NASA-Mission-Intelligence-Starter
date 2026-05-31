@@ -9,6 +9,7 @@ https://genai.owasp.org/llm-top-10/
 import logging
 import os
 import re
+from threading import Lock
 from typing import Dict, List, Optional, Any
 from enum import Enum
 
@@ -232,6 +233,7 @@ class ResourceLimitEnforcer:
         self.max_queries_per_minute = max_queries_per_minute
         self.max_embedding_batch = max_embedding_batch
         self.query_count = {}
+        self._query_count_lock = Lock()
     
     def check_input_tokens(self, text: str) -> None:
         """Validate input token count."""
@@ -248,18 +250,20 @@ class ResourceLimitEnforcer:
         import time
         current_minute = int(time.time()) // 60
         key = f"{user_id}:{current_minute}"
-        count = self.query_count.get(key, 0)
-        if count >= self.max_queries_per_minute:
-            raise SecurityViolation(
-                level=SecurityLevel.MEDIUM,
-                message=f"Query rate limit exceeded: {count} queries in current minute",
-                details={"limit": self.max_queries_per_minute}
-            )
-        
-        self.query_count[key] = count + 1
-        
-        if len(self.query_count) > 10000:
-            self.query_count = dict(list(self.query_count.items())[-5000:])
+        with self._query_count_lock:
+            count = self.query_count.get(key, 0)
+            if count >= self.max_queries_per_minute:
+                raise SecurityViolation(
+                    level=SecurityLevel.MEDIUM,
+                    message=f"Query rate limit exceeded: {count} queries in current minute",
+                    details={"limit": self.max_queries_per_minute}
+                )
+
+            self.query_count[key] = count + 1
+
+            # Keep memory bounded under sustained high-cardinality traffic.
+            if len(self.query_count) > 10000:
+                self.query_count = dict(list(self.query_count.items())[-5000:])
     
     def check_embedding_batch(self, batch_size: int) -> None:
         """Validate embedding batch size (LLM08)."""
