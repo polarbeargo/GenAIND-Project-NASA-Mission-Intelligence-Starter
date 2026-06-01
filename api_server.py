@@ -274,6 +274,15 @@ def _get_preflight_timeout_seconds() -> float:
     )
 
 
+def _get_preflight_retrieval_mode() -> str:
+    mode = os.getenv("PREFLIGHT_RETRIEVAL_MODE", "strict").strip().lower()
+    return mode if mode in {"strict", "fastest"} else "strict"
+
+
+def _get_evaluation_local_fallback_enabled() -> bool:
+    return _get_bool_env("EVALUATION_LOCAL_FALLBACK_ENABLED", default=True)
+
+
 def _get_profiled_stage_worker_count(
     name: str,
     interactive_default: int,
@@ -490,6 +499,7 @@ def _format_worker_pool_prometheus(report: Dict[str, Any]) -> str:
 def _format_runtime_config_prometheus(config: Dict[str, Any]) -> str:
     """Render runtime config snapshot fields as Prometheus metrics."""
     api_profile = _prometheus_escape_label(str(config.get("api_profile", "unknown")))
+    runtime_modes = config.get("runtime_modes", {}) or {}
     timeouts = config.get("timeouts_seconds", {}) or {}
     breaker = config.get("breaker", {}) or {}
     stage_pools = config.get("stage_pools", {}) or {}
@@ -497,6 +507,8 @@ def _format_runtime_config_prometheus(config: Dict[str, Any]) -> str:
     lines: List[str] = [
         "# HELP nasa_runtime_config_info Runtime configuration labels.",
         "# TYPE nasa_runtime_config_info gauge",
+        "# HELP nasa_runtime_mode_info Runtime mode labels.",
+        "# TYPE nasa_runtime_mode_info gauge",
         "# HELP nasa_runtime_timeout_seconds Effective timeout values in seconds by stage.",
         "# TYPE nasa_runtime_timeout_seconds gauge",
         "# HELP nasa_runtime_breaker_failure_threshold Effective stage breaker consecutive failure threshold.",
@@ -510,6 +522,14 @@ def _format_runtime_config_prometheus(config: Dict[str, Any]) -> str:
     ]
 
     lines.append(f'nasa_runtime_config_info{{api_profile="{api_profile}"}} 1')
+    preflight_mode = _prometheus_escape_label(str(runtime_modes.get("preflight_retrieval", "strict")))
+    eval_local_fallback = _prometheus_escape_label(
+        str(bool(runtime_modes.get("evaluation_local_fallback_enabled", True))).lower()
+    )
+    lines.append(
+        "nasa_runtime_mode_info"
+        f'{{preflight_retrieval_mode="{preflight_mode}",evaluation_local_fallback_enabled="{eval_local_fallback}"}} 1'
+    )
 
     for stage, timeout_value in timeouts.items():
         safe_stage = _prometheus_escape_label(str(stage))
@@ -867,6 +887,7 @@ JAILBREAK_KEYWORDS = [
 ]
 
 _PREFLIGHT_TIMEOUT_SECONDS = _get_preflight_timeout_seconds()
+_PREFLIGHT_RETRIEVAL_MODE = _get_preflight_retrieval_mode()
 _RETRIEVAL_TIMEOUT_SECONDS = _get_profiled_stage_timeout(
     "RETRIEVAL_TIMEOUT_SECONDS",
     interactive_default=1.8,
@@ -895,6 +916,7 @@ _JUDGE_TIMEOUT_SECONDS = _get_judge_timeout_seconds()
 _QUEUE_SUBMIT_TIMEOUT_SECONDS = _get_stage_submit_timeout_seconds()
 _BREAKER_FAILURE_THRESHOLD = _get_breaker_failure_threshold()
 _BREAKER_RECOVERY_SECONDS = _get_breaker_recovery_seconds()
+_EVALUATION_LOCAL_FALLBACK_ENABLED = _get_evaluation_local_fallback_enabled()
 
 _STAGE_WORKER_COUNTS = {
     "safety": _get_profiled_stage_worker_count("SAFETY_WORKERS", 2, 3, 4),
@@ -950,7 +972,9 @@ chat_workflow = MultiAgentChatWorkflow(
     judge_queue_limit=_STAGE_QUEUE_LIMITS["judge"],
     evaluation_queue_limit=_STAGE_QUEUE_LIMITS["evaluation"],
     queue_submit_timeout_seconds=_QUEUE_SUBMIT_TIMEOUT_SECONDS,
+    preflight_retrieval_mode=_PREFLIGHT_RETRIEVAL_MODE,
     evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
+    evaluation_local_fallback_enabled=_EVALUATION_LOCAL_FALLBACK_ENABLED,
     evaluation_broker_stream=_get_evaluation_broker_stream(),
     evaluation_broker_group=_get_evaluation_broker_group(),
     judge_broker_enabled=_get_bool_env("JUDGE_BROKER_ENABLED", default=False),
@@ -1385,6 +1409,10 @@ def monitoring_config() -> Dict[str, Any]:
     return {
         "generated_at_ms": round(time.time() * 1000),
         "api_profile": _get_api_profile(),
+        "runtime_modes": {
+            "preflight_retrieval": _PREFLIGHT_RETRIEVAL_MODE,
+            "evaluation_local_fallback_enabled": _EVALUATION_LOCAL_FALLBACK_ENABLED,
+        },
         "timeouts_seconds": {
             "preflight": _PREFLIGHT_TIMEOUT_SECONDS,
             "retrieval": _RETRIEVAL_TIMEOUT_SECONDS,

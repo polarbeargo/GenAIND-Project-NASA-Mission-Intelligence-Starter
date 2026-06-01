@@ -278,7 +278,9 @@ class MultiAgentChatWorkflow:
         judge_queue_limit: int = 100,
         evaluation_queue_limit: int = 200,
         queue_submit_timeout_seconds: float = 0.05,
+        preflight_retrieval_mode: str = "strict",
         evaluation_broker_enabled: bool = False,
+        evaluation_local_fallback_enabled: bool = True,
         evaluation_broker_stream: str = "eval:jobs",
         evaluation_broker_group: str = "eval-workers",
         judge_broker_enabled: bool = False,
@@ -427,6 +429,11 @@ class MultiAgentChatWorkflow:
         )
         if self._evaluation_mode not in {"async", "sync", "off"}:
             self._evaluation_mode = "async"
+        normalized_preflight_mode = (preflight_retrieval_mode or "strict").strip().lower()
+        if normalized_preflight_mode not in {"strict", "fastest"}:
+            normalized_preflight_mode = "strict"
+        self._preflight_retrieval_mode = normalized_preflight_mode
+        self._evaluation_local_fallback_enabled = bool(evaluation_local_fallback_enabled)
         self._evaluation_buffer_size = max(100, int(evaluation_buffer_size))
         self._stage_event_store = stage_event_store or StageLatencyEventStore()
 
@@ -459,6 +466,31 @@ class MultiAgentChatWorkflow:
 
         retrieval_key = self._retrieval_cache_key(effective_input)
         answer_key = self._answer_cache_key(effective_input)
+        prestarted_retrieval_future = None
+        prestarted_retrieval_started = 0.0
+        prestarted_retrieval_submit_error: str | None = None
+
+        if self._preflight_retrieval_mode == "fastest":
+            if not self._retrieval_breaker.allow():
+                prestarted_retrieval_submit_error = "retrieval circuit breaker open"
+            else:
+                prestarted_retrieval_started = time.perf_counter()
+                try:
+                    prestarted_retrieval_future = self._retrieval_executor.submit(
+                        self.retrieval_worker.run,
+                        effective_input,
+                    )
+                except StageOverloadError:
+                    prestarted_retrieval_submit_error = "retrieval queue saturated"
+                    self._record_stage_metric(
+                        "retrieval",
+                        latency_ms=0.0,
+                        timed_out=False,
+                        status="overload",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
 
         preflight_started = time.perf_counter()
         try:
@@ -524,6 +556,11 @@ class MultiAgentChatWorkflow:
         )
 
         if preflight_result.blocked_response:
+            if prestarted_retrieval_future is not None:
+                try:
+                    prestarted_retrieval_future.cancel()
+                except Exception:
+                    pass
             return ChatWorkflowResult(
                 answer=preflight_result.blocked_response,
                 contexts=[],
@@ -609,7 +646,74 @@ class MultiAgentChatWorkflow:
         retrieval_failure_reason = ""
 
         if not cached_answer_hit and retrieval_result is None:
-            if not self._retrieval_breaker.allow():
+            if prestarted_retrieval_submit_error:
+                retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                retrieval_failed = True
+                retrieval_failure_reason = prestarted_retrieval_submit_error
+            elif prestarted_retrieval_future is not None:
+                retrieval_started = prestarted_retrieval_started or time.perf_counter()
+                try:
+                    retrieval_result = self._await_result(
+                        prestarted_retrieval_future,
+                        timeout=self._retrieval_timeout_seconds,
+                    )
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=False,
+                        status="ok",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
+                    self._retrieval_breaker.record_success()
+                    self._cache_set(
+                        self._retrieval_cache,
+                        retrieval_key,
+                        retrieval_result,
+                        ttl_seconds=self._retrieval_cache_ttl,
+                        max_entries=self._retrieval_cache_max_entries,
+                    )
+                except TimeoutError:
+                    self._retrieval_breaker.record_failure()
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=True,
+                        status="timeout",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
+                    retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                    retrieval_failed = True
+                    retrieval_failure_reason = "retrieval timeout"
+                    logging.getLogger(__name__).warning(
+                        "Retrieval timed out after %.2fs",
+                        self._retrieval_timeout_seconds,
+                    )
+                except Exception as error:
+                    self._retrieval_breaker.record_failure()
+                    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
+                    self._record_stage_metric(
+                        "retrieval",
+                        retrieval_latency_ms,
+                        timed_out=False,
+                        status="error",
+                        mission=effective_input.mission_filter,
+                        backend=backend_name,
+                        model=effective_input.model,
+                    )
+                    retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
+                    retrieval_failed = True
+                    retrieval_failure_reason = str(error)[:120]
+                    logging.getLogger(__name__).warning(
+                        "Retrieval failed, using fallback: %s",
+                        retrieval_failure_reason,
+                    )
+            elif not self._retrieval_breaker.allow():
                 retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
                 retrieval_failed = True
                 retrieval_failure_reason = "retrieval circuit breaker open"
@@ -1049,6 +1153,18 @@ class MultiAgentChatWorkflow:
         # If broker is disabled/unavailable, fall back to local bounded async executor.
         queued = self._evaluation_broker.enqueue(job_id, enqueue_payload)
         if not queued:
+            if not self._evaluation_local_fallback_enabled:
+                skipped = {
+                    "job_id": job_id,
+                    "status": "skipped",
+                    "source": "broker_unavailable",
+                    "submitted_at_ms": submitted_at_ms,
+                    "finished_at_ms": round(time.time() * 1000),
+                    "question": workflow_input.question,
+                    "error": "evaluation broker unavailable and local fallback disabled",
+                }
+                self._record_evaluation_job(job_id, skipped)
+                return skipped
             try:
                 self._eval_job_executor.submit(
                     self._run_async_evaluation,
@@ -1070,6 +1186,18 @@ class MultiAgentChatWorkflow:
                 self._record_evaluation_job(job_id, skipped)
                 return skipped
         elif not self._evaluation_broker.has_active_consumers():
+            if not self._evaluation_local_fallback_enabled:
+                skipped = {
+                    "job_id": job_id,
+                    "status": "skipped",
+                    "source": "no_consumers",
+                    "submitted_at_ms": submitted_at_ms,
+                    "finished_at_ms": round(time.time() * 1000),
+                    "question": workflow_input.question,
+                    "error": "evaluation broker has no active consumers and local fallback disabled",
+                }
+                self._record_evaluation_job(job_id, skipped)
+                return skipped
             logging.getLogger(__name__).warning(
                 "Evaluation broker has no active consumers; running local async fallback for job %s",
                 job_id,
