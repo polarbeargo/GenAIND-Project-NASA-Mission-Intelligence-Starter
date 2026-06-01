@@ -16,7 +16,7 @@ class DummyViolation(Exception):
     """Placeholder security exception."""
 
 
-def build_workflow(evaluation_mode: str = "async") -> MultiAgentChatWorkflow:
+def build_workflow(evaluation_mode: str = "async", **kwargs) -> MultiAgentChatWorkflow:
     logger = logging.getLogger("test.workflow.evaluation")
     logger.setLevel(logging.CRITICAL)
 
@@ -33,6 +33,7 @@ def build_workflow(evaluation_mode: str = "async") -> MultiAgentChatWorkflow:
         security_auditor=None,
         security_level=None,
         evaluation_mode=evaluation_mode,
+        **kwargs,
     )
 
 
@@ -197,6 +198,23 @@ class TestEvaluationModes(unittest.TestCase):
             hydrated = workflow._evaluation_results.get(job_id)
             self.assertIsNotNone(hydrated)
             self.assertEqual(hydrated.get("status"), "completed")
+
+    def test_async_evaluation_broker_only_mode_skips_when_broker_unavailable(self):
+        workflow = build_workflow(
+            evaluation_mode="async",
+            evaluation_broker_enabled=False,
+            evaluation_local_fallback_enabled=False,
+        )
+        self._seed_common_mocks(workflow)
+        workflow.analysis_worker.evaluate = MagicMock(return_value={"faithfulness": 0.93})
+        workflow._evaluation_broker.enqueue = MagicMock(return_value=False)
+        workflow._eval_job_executor.submit = MagicMock()
+
+        result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
+
+        self.assertEqual(result.evaluation.get("status"), "skipped")
+        self.assertEqual(result.evaluation.get("source"), "broker_unavailable")
+        workflow._eval_job_executor.submit.assert_not_called()
 
 
 if __name__ == "__main__":

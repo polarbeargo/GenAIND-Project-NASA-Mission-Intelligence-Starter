@@ -16,7 +16,7 @@ class DummyViolation(Exception):
     pass
 
 
-def build_workflow(evaluation_mode: str = "async") -> MultiAgentChatWorkflow:
+def build_workflow(evaluation_mode: str = "async", **kwargs) -> MultiAgentChatWorkflow:
     logger = logging.getLogger("test.stage.timeouts")
     logger.setLevel(logging.CRITICAL)
 
@@ -39,6 +39,7 @@ def build_workflow(evaluation_mode: str = "async") -> MultiAgentChatWorkflow:
         breaker_failure_threshold=1,
         breaker_recovery_seconds=60,
         evaluation_mode=evaluation_mode,
+        **kwargs,
     )
 
 
@@ -146,6 +147,34 @@ class TestStageTimeouts(unittest.TestCase):
 
         preflight_report = workflow.get_latency_sli_report()["workers"]["preflight"]
         self.assertGreaterEqual(preflight_report["timeouts"], 1)
+
+    def test_strict_mode_does_not_start_retrieval_when_preflight_blocks(self):
+        workflow = build_workflow(preflight_retrieval_mode="strict")
+        workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response="blocked")
+        )
+        workflow.retrieval_worker.run = MagicMock(
+            return_value=RetrievalResult(contexts=["c"], metadatas=[{}], context_text="c")
+        )
+
+        result = workflow.run(make_input(evaluate=False), openai_key="fake-key")
+
+        self.assertTrue(result.blocked)
+        workflow.retrieval_worker.run.assert_not_called()
+
+    def test_fastest_mode_starts_retrieval_even_if_preflight_blocks(self):
+        workflow = build_workflow(preflight_retrieval_mode="fastest")
+        workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response="blocked")
+        )
+        workflow.retrieval_worker.run = MagicMock(
+            return_value=RetrievalResult(contexts=["c"], metadatas=[{}], context_text="c")
+        )
+
+        result = workflow.run(make_input(evaluate=False), openai_key="fake-key")
+
+        self.assertTrue(result.blocked)
+        workflow.retrieval_worker.run.assert_called_once()
 
 
 if __name__ == "__main__":
