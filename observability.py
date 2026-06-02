@@ -89,6 +89,36 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _fastapi_excluded_urls() -> str:
+    """Return merged FastAPI tracing exclusion patterns for Phoenix/OTLP.
+
+    Uses simple substring matching (the FastAPI instrumentor checks whether
+    the request URL *contains* the pattern, so no anchors are needed).
+    Grafana/Prometheus scrape the API directly over HTTP — these exclusions
+    only suppress Phoenix span creation; the endpoints stay fully functional.
+    """
+    default_patterns = [
+        # All /monitoring/worker-pools sub-routes (snapshot, series, timeseries, prometheus)
+        "/monitoring/worker-pools",
+        # Latency SLI polling
+        "/monitoring/latency-sli",
+        # Config introspection
+        "/monitoring/config",
+        # Health / readiness probes
+        "/health",
+        "/ready",
+    ]
+    configured = os.getenv("OTEL_PYTHON_FASTAPI_EXCLUDED_URLS", "").strip()
+    if not configured:
+        return ",".join(default_patterns)
+    existing = [item.strip() for item in configured.split(",") if item.strip()]
+    merged: list[str] = []
+    for pattern in [*existing, *default_patterns]:
+        if pattern not in merged:
+            merged.append(pattern)
+    return ",".join(merged)
+
+
 def init_telemetry(app: FastAPI, service_name: str = "nasa-rag-api"):
     """Configure one deterministic and efficient tracing pipeline.
 
@@ -179,7 +209,11 @@ def init_telemetry(app: FastAPI, service_name: str = "nasa-rag-api"):
 
     if FastAPIInstrumentor is not None:
         try:
-            FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=provider,
+                excluded_urls=_fastapi_excluded_urls(),
+            )
         except Exception:
             logger.debug("FastAPI instrumentation already active")
         _TELEMETRY_STATE["fastapi_instrumented"] = True
