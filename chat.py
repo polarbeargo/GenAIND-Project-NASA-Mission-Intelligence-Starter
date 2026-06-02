@@ -61,6 +61,7 @@ def _get_client_cache_key(
     backend: str,
     n_docs: int,
     model: str,
+    mission_filter: Optional[str],
     conversation_history: List[Dict[str, str]],
     enable_evaluation: bool,
 ) -> str:
@@ -68,8 +69,12 @@ def _get_client_cache_key(
     import hashlib
 
     normalized_q = _normalize_query(question)
+    normalized_mission = (mission_filter or "").strip().lower()
     history_sig = _history_signature(conversation_history)
-    cache_str = f"{normalized_q}|{backend}|{n_docs}|{model}|{int(bool(enable_evaluation))}|{history_sig}"
+    cache_str = (
+        f"{normalized_q}|{backend}|{n_docs}|{model}|{normalized_mission}|"
+        f"{int(bool(enable_evaluation))}|{history_sig}"
+    )
     return hashlib.md5(cache_str.encode("utf-8")).hexdigest()
 
 def _get_cached_response(
@@ -77,6 +82,7 @@ def _get_cached_response(
     backend: str,
     n_docs: int,
     model: str,
+    mission_filter: Optional[str],
     conversation_history: List[Dict[str, str]],
     enable_evaluation: bool,
 ) -> Dict | None:
@@ -86,6 +92,7 @@ def _get_cached_response(
         backend,
         n_docs,
         model,
+        mission_filter,
         conversation_history,
         enable_evaluation,
     )
@@ -99,6 +106,7 @@ def _set_cached_response(
     backend: str,
     n_docs: int,
     model: str,
+    mission_filter: Optional[str],
     conversation_history: List[Dict[str, str]],
     enable_evaluation: bool,
     response: Dict,
@@ -109,6 +117,7 @@ def _set_cached_response(
         backend,
         n_docs,
         model,
+        mission_filter,
         conversation_history,
         enable_evaluation,
     )
@@ -193,6 +202,7 @@ def run_local_chat_turn(
     prompt: str,
     selected_backend: Dict[str, str],
     n_docs: int,
+    mission_filter: Optional[str],
     model_choice: str,
     enable_evaluation: bool,
     conversation_history: List[Dict[str, str]],
@@ -233,7 +243,7 @@ def run_local_chat_turn(
         collection=collection,
         query=prompt,
         n_results=n_docs,
-        mission_filter=None,
+        mission_filter=mission_filter,
         chroma_dir=selected_backend["directory"],
     )
 
@@ -402,6 +412,19 @@ def main():
         
         st.subheader("🔍 Retrieval Settings")
         n_docs = st.slider("Documents to retrieve", 1, 10, 3)
+        mission_filter_choice = st.selectbox(
+            "Mission Filter",
+            options=["All missions", "Apollo 11", "Apollo 13", "Challenger"],
+            index=0,
+            help="Constrain retrieval to one mission corpus (recommended for source-grounded mission questions).",
+        )
+        mission_filter_map = {
+            "All missions": None,
+            "Apollo 11": "apollo11",
+            "Apollo 13": "apollo13",
+            "Challenger": "challenger",
+        }
+        selected_mission_filter = mission_filter_map.get(mission_filter_choice)
         
         st.subheader("📊 Evaluation Settings")
         enable_evaluation = st.checkbox("Enable RAGAS Evaluation", value=True)
@@ -501,6 +524,7 @@ def main():
                         prompt=prompt,
                         selected_backend=selected_backend,
                         n_docs=n_docs,
+                        mission_filter=selected_mission_filter,
                         model_choice=model_choice,
                         enable_evaluation=bool(enable_evaluation),
                         conversation_history=conversation_history_api,
@@ -513,6 +537,7 @@ def main():
                         backend_key,
                         n_docs,
                         model_choice,
+                        selected_mission_filter,
                         conversation_history_api,
                         bool(enable_evaluation),
                     )
@@ -535,6 +560,7 @@ def main():
                             "chroma_dir": selected_backend["directory"],
                             "collection_name": selected_backend["collection_name"],
                             "n_results": n_docs,
+                            "mission_filter": selected_mission_filter,
                             "model": model_choice,
                             "evaluate": bool(enable_evaluation),
                             "conversation_history": conversation_history_api,
@@ -553,6 +579,7 @@ def main():
                                 backend_key,
                                 n_docs,
                                 model_choice,
+                                selected_mission_filter,
                                 conversation_history_api,
                                 bool(enable_evaluation),
                                 result,
@@ -574,6 +601,7 @@ def main():
                             prompt=prompt,
                             selected_backend=selected_backend,
                             n_docs=n_docs,
+                            mission_filter=selected_mission_filter,
                             model_choice=model_choice,
                             enable_evaluation=bool(enable_evaluation),
                             conversation_history=conversation_history_api,

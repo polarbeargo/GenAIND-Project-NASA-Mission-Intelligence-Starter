@@ -637,6 +637,19 @@ class MultiAgentChatWorkflow:
                 )
 
         cached_answer_hit = answer is not None
+        mission_specific_request = self._normalize_mission(effective_input.mission_filter) not in {
+            "",
+            "all",
+            "any",
+            "*",
+            "none",
+        }
+
+        # For mission-filtered requests, require fresh retrieval evidence and
+        # avoid serving mission answers from answer-cache alone.
+        if cached_answer_hit and mission_specific_request:
+            answer = None
+            cached_answer_hit = False
 
         retrieval_result = RetrievalResult(contexts=[], metadatas=[], context_text="")
         if not cached_answer_hit:
@@ -851,6 +864,34 @@ class MultiAgentChatWorkflow:
         # Keep cached-answer behavior explicit: no retrieval contexts are relied on
         # for judge/evaluation when answer cache satisfies the request.
         contexts_for_quality = [] if cached_answer_hit else retrieval_result.contexts
+
+        # Hard-grounding policy for mission-filtered queries:
+        # do not generate from priors when retrieval has no mission-matching evidence.
+        if (
+            answer is None
+            and not self._has_grounded_mission_context(effective_input.mission_filter, retrieval_result.metadatas)
+        ):
+            mission_label = (effective_input.mission_filter or "requested mission").strip() or "requested mission"
+            return ChatWorkflowResult(
+                answer=(
+                    f"I don't have enough grounded sources for mission '{mission_label}' in the current collection. "
+                    "Please switch collections or broaden the mission filter and try again."
+                ),
+                contexts=[],
+                evaluation={},
+                judge={
+                    "groundedness_score": 0.0,
+                    "safety_score": 1.0,
+                    "task_success_score": 0.0,
+                    "overall_score": 0.3,
+                    "confidence": 1.0,
+                    "passed": True,
+                    "low_confidence": True,
+                    "rationale": "Mission filter requested but no mission-matching grounded sources were retrieved.",
+                    "source": "policy",
+                },
+                blocked=False,
+            )
 
         if retrieval_failed:
             return ChatWorkflowResult(
@@ -1654,6 +1695,39 @@ class MultiAgentChatWorkflow:
         """Normalize query text for cache keys."""
         collapsed = re.sub(r"\s+", " ", (text or "").strip().lower())
         return collapsed
+
+    @staticmethod
+    def _normalize_mission(value: str | None) -> str:
+        """Normalize mission aliases to metadata-compatible keys."""
+        raw = (value or "").strip().lower()
+        aliases = {
+            "apollo11": "apollo_11",
+            "apollo_11": "apollo_11",
+            "apollo 11": "apollo_11",
+            "apollo-11": "apollo_11",
+            "apollo13": "apollo_13",
+            "apollo_13": "apollo_13",
+            "apollo 13": "apollo_13",
+            "apollo-13": "apollo_13",
+            "challenger": "challenger",
+        }
+        if raw in aliases:
+            return aliases[raw]
+        return raw.replace(" ", "_").replace("-", "_")
+
+    def _has_grounded_mission_context(self, mission_filter: str | None, metadatas: list[Dict[str, Any]]) -> bool:
+        """Return True when retrieval metadata includes at least one matching mission."""
+        normalized_target = self._normalize_mission(mission_filter)
+        if not normalized_target or normalized_target in {"all", "any", "*", "none"}:
+            return True
+        if not metadatas:
+            return False
+        for metadata in metadatas:
+            if not isinstance(metadata, dict):
+                continue
+            if self._normalize_mission(str(metadata.get("mission", ""))) == normalized_target:
+                return True
+        return False
 
     @staticmethod
     def _await_result(submission: Any, timeout: float | None = None):
