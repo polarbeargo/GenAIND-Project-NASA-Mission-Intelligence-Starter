@@ -157,8 +157,14 @@ class BoundedExecutor:
         self._failed = 0
         self._queued_submitted_at: deque[float] = deque()
         self._lock = Lock()
+        self._accepting_submissions = True
 
     def submit(self, fn, *args, **kwargs):
+        with self._lock:
+            if not self._accepting_submissions:
+                self._rejected += 1
+                raise StageOverloadError("stage executor is shutting down")
+
         acquired = self._permits.acquire(timeout=self.submit_timeout_seconds)
         if not acquired:
             with self._lock:
@@ -213,6 +219,7 @@ class BoundedExecutor:
                 "max_workers": self.max_workers,
                 "queue_limit": self.queue_limit,
                 "capacity": self.capacity,
+                "accepting_submissions": self._accepting_submissions,
                 "inflight": self._inflight,
                 "queued_estimate": queued,
                 "submitted": self._submitted,
@@ -223,6 +230,25 @@ class BoundedExecutor:
                 "rejected_rate": round(rejected_rate, 6),
                 "error_rate": round(error_rate, 6),
             }
+
+    def begin_shutdown(self) -> None:
+        """Stop accepting new submissions while allowing in-flight work to finish."""
+        with self._lock:
+            self._accepting_submissions = False
+
+    def wait_for_drain(self, timeout_seconds: float, poll_interval_seconds: float = 0.01) -> bool:
+        """Wait briefly for in-flight/queued work to drain.
+
+        Returns True when drained before timeout, else False.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        poll_interval = max(0.001, float(poll_interval_seconds))
+        while time.monotonic() <= deadline:
+            with self._lock:
+                if self._inflight <= 0:
+                    return True
+            time.sleep(poll_interval)
+        return False
 
     def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:
         self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
@@ -1516,12 +1542,32 @@ class MultiAgentChatWorkflow:
 
     def shutdown(self) -> None:
         """Stop background executors used by the workflow."""
+        self._safety_executor.begin_shutdown()
+        self._retrieval_executor.begin_shutdown()
+        self._generation_executor.begin_shutdown()
+        self._judge_executor.begin_shutdown()
+        self._eval_executor.begin_shutdown()
+        self._eval_job_executor.begin_shutdown()
+
+        # Phase 1: allow judge/evaluation pools a short soft-drain window so
+        # terminal async writes complete during controlled shutdown.
+        soft_drain_seconds = 0.25
+        deadline = time.monotonic() + soft_drain_seconds
+        for pool in (self._judge_executor, self._eval_executor, self._eval_job_executor):
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            pool.wait_for_drain(remaining)
+
+        # Phase 2: cancel any pending async futures to avoid long tail teardown.
+        self._judge_executor.shutdown(wait=False, cancel_futures=True)
+        self._eval_executor.shutdown(wait=False, cancel_futures=True)
+        self._eval_job_executor.shutdown(wait=False, cancel_futures=True)
+
+        # Keep request-path pools fast to stop; in-flight work exits naturally.
         self._safety_executor.shutdown(wait=False, cancel_futures=False)
         self._retrieval_executor.shutdown(wait=False, cancel_futures=False)
         self._generation_executor.shutdown(wait=False, cancel_futures=False)
-        self._judge_executor.shutdown(wait=False, cancel_futures=False)
-        self._eval_executor.shutdown(wait=False, cancel_futures=False)
-        self._eval_job_executor.shutdown(wait=False, cancel_futures=False)
 
     def get_worker_pool_report(self) -> Dict[str, Any]:
         """Return bounded worker-pool saturation metrics for autoscaling decisions."""
