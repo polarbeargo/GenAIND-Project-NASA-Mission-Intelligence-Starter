@@ -16,6 +16,8 @@
 | `JUDGE_MODE_DEFAULT` | `async` | Default judge mode for evaluation flow. |
 | `JUDGE_TIMEOUT_SECONDS` | `2.5` | Timeout budget for judge task. |
 | `EVALUATION_MODE` | `async` | Evaluation execution mode. |
+| `PREFLIGHT_RETRIEVAL_MODE` | `strict` | Preflight/retrieval execution mode (`strict` or `fastest`). |
+| `EVALUATION_LOCAL_FALLBACK_ENABLED` | `true` | Allow local async evaluation fallback when broker is unavailable or has no active consumers. |
 | `RETRIEVAL_TIMEOUT_SECONDS` | `3.5` | Retrieval stage timeout. |
 | `GENERATION_TIMEOUT_SECONDS` | `6.5` | Generation stage timeout. |
 | `EVALUATION_TIMEOUT_SECONDS` | `3.0` | Evaluation stage timeout. |

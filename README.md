@@ -37,23 +37,23 @@ This system is a **multi-agent RAG (Retrieval-Augmented Generation) pipeline** b
 The project uses `.env` as the scalable baseline profile (medium traffic), with two preset overrides:
 
 - `.env`: baseline profile used by default (medium pool/queue sizing)
-- `.env.small`: lower concurrency and queue limits for local demos or small traffic
-- `.env.high`: higher concurrency and queue limits for load testing and high traffic
+- `env/.env.small`: lower concurrency and queue limits for local demos or small traffic
+- `env/.env.high`: higher concurrency and queue limits for load testing and high traffic
 
 Quick profile switches:
 
 ```bash
 # Optional: keep a copy of your current .env before switching
-cp .env .env.backup
+cp .env env/.env.backup
 
 # Small traffic
-cp .env.small .env
+cp env/.env.small .env
 
 # High traffic
-cp .env.high .env
+cp env/.env.high .env
 
 # Restore previous settings
-cp .env.backup .env
+cp env/.env.backup .env
 ```
 
 [Env Variable Reference (Baseline `.env`)](doc/env-variable-reference.md).
@@ -117,7 +117,7 @@ Throughput guardrail: when `EVALUATION_LOCAL_FALLBACK_ENABLED=false`, ensure asy
 
 ### Embedding with `uv run`
 
-Use one of these two approaches depending on your goal:
+Use one of these approaches depending on your goal:
 
 1. **Quick setup (recommended for first run)**
    ```bash
@@ -138,12 +138,59 @@ Use one of these two approaches depending on your goal:
      --collection-name nasa_space_missions_text \
      --update-mode incremental
 
+   # Mission-scoped incremental run (reliable resume with per-file checkpoints)
+   uv run python embedding_pipeline.py \
+     --data-path ./data_text \
+     --chroma-dir ./chroma_db_openai \
+     --collection-name nasa_space_missions_text \
+     --missions challenger apollo_13 \
+     --update-mode incremental \
+     --checkpoint-manifest-each-file
+
+   # Non-incremental fast path (batch existence checks + batch upsert)
+   uv run python embedding_pipeline.py \
+     --data-path ./data_text \
+     --chroma-dir ./chroma_db_openai \
+     --collection-name nasa_space_missions_text \
+     --missions challenger \
+     --update-mode skip \
+     --fast-upsert
+
    # Stats only (no processing)
    uv run python embedding_pipeline.py --stats-only
 
    # Optional: test a retrieval query after processing
    uv run python embedding_pipeline.py --test-query "apollo 11 landing"
    ```
+
+3. **Targeted mission-only helper (fastest for backfilling missing missions)**
+   ```bash
+   # Challenger-only incremental backfill with per-file checkpointing
+   uv run python ingest_missing_missions.py \
+     --missions challenger \
+     --data-path ./data_text \
+     --chroma-dir ./chroma_db_openai \
+     --collection-name nasa_space_missions_text \
+     --update-mode incremental \
+     --checkpoint-manifest-each-file
+
+   # Multi-mission targeted backfill
+   uv run python ingest_missing_missions.py \
+     --missions challenger apollo_13 \
+     --data-path ./data_text \
+     --chroma-dir ./chroma_db_openai \
+     --collection-name nasa_space_missions_text \
+     --update-mode incremental \
+     --checkpoint-manifest-each-file
+   ```
+
+4. **Embedding ingestion benchmark (normal vs `fast_upsert`)**
+
+    Script: [benchmarks/benchmark_embedding_fast_upsert.py](benchmarks/benchmark_embedding_fast_upsert.py)
+
+    ```bash
+    uv run python benchmarks/benchmark_embedding_fast_upsert.py --mission challenger --runs 3
+    ```
 
 After embeddings are ready, launch chat:
 ```bash
@@ -152,24 +199,7 @@ uv run streamlit run chat.py
 
 ## Data Requirements
 
-### **Expected Data Structure**
-The system expects NASA document data organized in folders:
-```
-data/
-├── apollo11/           # Apollo 11 mission documents
-│   ├── *.txt          # Text files with mission data
-├── apollo13/           # Apollo 13 mission documents
-│   ├── *.txt          # Text files with mission data
-└── challenger/         # Challenger mission documents
-    ├── *.txt          # Text files with mission data
-```
-
-### **Supported Document Types**
-- Plain text files (.txt)
-- Mission transcripts
-- Technical documents
-- Audio transcriptions
-- Flight plans and procedures
+See [doc/data-requirements.md](doc/data-requirements.md) for the expected directory structure and supported document types.
 
 
 ## Context Compression Benchmark
@@ -243,9 +273,38 @@ Monitor with: `curl http://localhost:8000/monitoring/latency-sli`
 
 ## Kubernetes Custom Metrics Quick Runbook
 
-If use the provided Kubernetes autoscaling manifests, run this once so HPA can read worker-pool custom metrics.
+If use the provided Kubernetes autoscaling manifests, run this once so HPA can read worker-pool custom metrics end-to-end.
 
-1. **Deploy/update Prometheus Adapter with project rules**
+0. **Prerequisites (required before adapter + HPA checks)**
+   ```bash
+   # Minikube/cluster must be running and your kube-context must point to it
+   kubectl config current-context
+
+   # API deployment must exist (HPA scale target)
+   kubectl get deploy nasa-mission-intelligence-api -n default
+
+   # Pods should be running
+   kubectl get pods -n default -l app.kubernetes.io/name=nasa-mission-intelligence-api
+
+   # Prometheus Operator CRD must exist for ServiceMonitor
+   kubectl get crd servicemonitors.monitoring.coreos.com
+   ```
+
+   In a separate terminal, expose and verify the raw Prometheus endpoint from the API pod:
+   ```bash
+   kubectl port-forward deploy/nasa-mission-intelligence-api 8000:8000 -n default
+   ```
+
+   ```bash
+   curl -s http://127.0.0.1:8000/monitoring/worker-pools/prometheus | grep nasa_worker_pool_
+   ```
+
+1. **Apply ServiceMonitor so Prometheus scrapes worker-pool metrics**
+   ```bash
+   kubectl apply -f deploy/k8s/servicemonitor-worker-pools.yaml
+   ```
+
+2. **Deploy/update Prometheus Adapter with project rules**
     ```bash
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
     helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
@@ -253,31 +312,36 @@ If use the provided Kubernetes autoscaling manifests, run this once so HPA can r
        -f deploy/k8s/prometheus-adapter-values.yaml
     ```
 
-2. **Verify Custom Metrics API is available**
+3. **Verify Custom Metrics API is available**
     ```bash
     kubectl get apiservice v1beta1.custom.metrics.k8s.io
     kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq .
     ```
 
-3. **Verify worker-pool metrics are exposed**
+4. **Verify all HPA worker-pool metrics are exposed**
     ```bash
-    kubectl get --raw \
-       "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/nasa_worker_pool_queue_depth_ratio" | jq .
-
-    kubectl get --raw \
-       "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/nasa_worker_pool_utilization_ratio" | jq .
-
-    kubectl get --raw \
-       "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/nasa_worker_pool_rejected_total" | jq .
+   for m in \
+     nasa_worker_pool_queue_depth_ratio \
+     nasa_worker_pool_oldest_queue_age_seconds \
+     nasa_worker_pool_rejected_rate \
+     nasa_worker_pool_error_rate \
+     nasa_worker_pool_utilization_ratio \
+     nasa_worker_pool_rejected_total
+   do
+     echo "===== ${m} ====="
+     kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/${m}" | jq .
+   done
     ```
 
-4. **Apply HPA and confirm metrics are being consumed**
+5. **Apply HPA and confirm metrics are being consumed**
     ```bash
     kubectl apply -f deploy/k8s/hpa-api-worker-pools.yaml
     kubectl describe hpa nasa-mission-intelligence-api
     ```
 
 If app namespace is not `default`, replace `default` in the verification paths above.
+
+Fast troubleshooting guide: [Kubernetes Custom Metrics Fast Failure Checklist](doc/kubernetes-custom-metrics-fast-failure-checklist.md)
 
 ## Latency SLI Usage
 
@@ -359,6 +423,93 @@ Use this dashboard to monitor queue pressure and utilization trends per worker s
 
 ### Demonstration:
 ![Worker Pool Scaling Grafana Dashboard](images/worker_pool.gif)
+
+## Concurrency Design
+
+```mermaid
+gantt
+    title Single /chat request — cache-miss critical paths (strict vs fastest)
+    dateFormat  x
+    axisFormat  %L ms
+
+    section Strict mode - safety executor
+    SafetyWorker.preflight          : s_strict, 0, 20
+
+    section Strict mode - main thread
+    Await preflight                 : m_strict_1, 0, 20
+    Answer cache lookup             : m_strict_2, 20, 25
+    Submit + await retrieval        : m_strict_3, 25, 625
+    Await generation                : m_strict_4, 625, 1425
+    SafetyWorker.postflight         : m_strict_5, 1425, 1465
+    Judge enqueue / sync dispatch   : m_strict_6, 1465, 1480
+
+    section Strict mode - retrieval executor
+    RetrievalWorker (cache miss)    : r_strict, 25, 625
+
+    section Strict mode - generation executor
+    AnalysisWorker.generate_answer  : g_strict, 625, 1425
+
+    section Fastest mode - safety executor
+    SafetyWorker.preflight          : s_fast, 0, 20
+
+    section Fastest mode - retrieval executor
+    RetrievalWorker (prestarted)    : r_fast, 0, 600
+    Cancel prestarted retrieval (best effort on preflight block): r_fast_cancel, 20, 35
+
+    section Fastest mode - main thread
+    Await preflight                 : m_fast_1, 0, 20
+    Blocked return path             : crit, m_fast_blocked, 20, 40
+    Answer cache lookup             : m_fast_2, 20, 25
+    Await prestarted retrieval      : m_fast_3, 25, 405
+    Await generation                : m_fast_4, 405, 1205
+    SafetyWorker.postflight         : m_fast_5, 1205, 1245
+    Judge enqueue / sync dispatch   : m_fast_6, 1245, 1260
+
+    section Strict mode - downstream branches
+    JudgeWorker (sync mode)         : j_strict, 1480, 1740
+    Evaluation (sync mode)          : e_strict, 1740, 2140
+    Judge broker enqueue (async)    : a_strict_1, 1465, 1480
+    Evaluation broker enqueue (async): a_strict_2, 1480, 1495
+
+    section Fastest mode - downstream branches
+    JudgeWorker (sync mode)         : j_fast, 1260, 1520
+    Evaluation (sync mode)          : e_fast, 1520, 1920
+    Judge broker enqueue (async)    : a_fast_1, 1245, 1260
+    Evaluation broker enqueue (async): a_fast_2, 1260, 1275
+```
+
+This diagram reflects the strict-mode cache-miss critical path (`PREFLIGHT_RETRIEVAL_MODE=strict`).
+
+Preflight/retrieval mode behavior:
+- `strict` (default): preflight runs first on the dedicated safety executor. Retrieval is submitted only after preflight passes.
+- `fastest`: retrieval is prestarted in parallel with preflight to overlap latency. If preflight blocks, retrieval is canceled/ignored before response return.
+
+Mode tradeoff:
+- `strict`: strongest safety/cost posture (no speculative retrieval work before safety pass).
+- `fastest`: lowest latency on cache-miss path, with possible speculative retrieval work when preflight later blocks.
+
+Fast-path differences from the cache-miss path above:
+- Answer-cache hit skips retrieval, generation, and postflight, and returns the cached answer directly.
+- Retrieval breaker-open, timeout, or overload returns a degraded fallback response instead of continuing to generation.
+
+Judge concurrency behavior:
+- `judge_mode=sync`: judge runs on the request critical path after postflight.
+- `judge_mode=async`: workflow attempts Redis broker enqueue first. If enqueue fails/unavailable, it falls back to the local bounded judge executor. If the local judge queue is saturated, the request returns a non-fatal `source=overload` skipped judge payload. Results are queryable via `/monitoring/judge` and `/judge/last`.
+- `judge_mode=off`: judge is skipped.
+
+Evaluation concurrency behavior:
+- `EVALUATION_MODE=sync`: evaluation runs on the dedicated evaluation executor and stays on the request critical path.
+- `EVALUATION_MODE=async`: workflow records a pending job, attempts Redis broker enqueue first, then applies fallback gating:
+    - if `EVALUATION_LOCAL_FALLBACK_ENABLED=true`, local bounded async execution is used when broker enqueue fails or when no broker consumers are active;
+    - if `EVALUATION_LOCAL_FALLBACK_ENABLED=false`, the job is marked skipped with explicit source (`broker_unavailable` or `no_consumers`) instead of running locally.
+    - if local async queue is saturated, the job is marked skipped with `source=overload`.
+- `EVALUATION_MODE=off`: evaluation is skipped.
+
+Shutdown behavior (reliability detail):
+- Worker pools use a two-phase shutdown: first stop accepting submissions and soft-drain judge/evaluation pools briefly, then cancel pending async futures. Request-path pools remain fast non-blocking on stop.
+
+---
+
 
 ## References
 
