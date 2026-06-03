@@ -19,6 +19,7 @@ import logging
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Set
+import threading
 import chromadb
 from chromadb.config import Settings
 import openai
@@ -61,6 +62,20 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+MISSION_DIR_MAP: Dict[str, str] = {
+    'apollo_11': 'apollo11',
+    'apollo_13': 'apollo13',
+    'challenger': 'challenger',
+}
+
+MISSION_ALIASES: Dict[str, str] = {
+    'apollo11': 'apollo_11',
+    'apollo_11': 'apollo_11',
+    'apollo13': 'apollo_13',
+    'apollo_13': 'apollo_13',
+    'challenger': 'challenger',
+}
 
 class ChromaEmbeddingPipelineTextOnly:
     """Pipeline for creating ChromaDB collections with OpenAI embeddings - Text files only"""
@@ -114,6 +129,8 @@ class ChromaEmbeddingPipelineTextOnly:
         )
         self.manifest_path = Path(chroma_persist_directory) / f"{collection_name}_content_manifest.json"
         self.manifest = self._load_manifest()
+        self._manifest_lock = threading.RLock()
+        self._collection_lock = threading.RLock()
 
     def _load_manifest(self) -> Dict[str, Any]:
         """Load persistent content hash manifest used for incremental embedding updates."""
@@ -147,16 +164,17 @@ class ChromaEmbeddingPipelineTextOnly:
 
     def _save_manifest(self) -> None:
         """Persist manifest atomically to avoid partial writes during failures."""
-        self.manifest["collection"] = self.collection_name
-        self.manifest["chunk_size"] = self.chunk_size
-        self.manifest["chunk_overlap"] = self.chunk_overlap
-        self.manifest["embedding_model"] = self.embedding_model
-        self.manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        with self._manifest_lock:
+            self.manifest["collection"] = self.collection_name
+            self.manifest["chunk_size"] = self.chunk_size
+            self.manifest["chunk_overlap"] = self.chunk_overlap
+            self.manifest["embedding_model"] = self.embedding_model
+            self.manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
-        temp_path = self.manifest_path.with_suffix(self.manifest_path.suffix + ".tmp")
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(self.manifest, handle, ensure_ascii=True, indent=2, sort_keys=True)
-        temp_path.replace(self.manifest_path)
+            temp_path = self.manifest_path.with_suffix(self.manifest_path.suffix + ".tmp")
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.manifest, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            temp_path.replace(self.manifest_path)
 
     @staticmethod
     def _hash_text(value: str) -> str:
@@ -286,7 +304,8 @@ class ChromaEmbeddingPipelineTextOnly:
             True if document exists, False otherwise
         """
         try:
-            result = self.collection.get(ids=[doc_id])
+            with self._collection_lock:
+                result = self.collection.get(ids=[doc_id])
             return bool(result.get('ids'))
         except Exception:
             return False
@@ -305,12 +324,13 @@ class ChromaEmbeddingPipelineTextOnly:
         """
         try:
             embedding = self.get_embedding(text)
-            self.collection.update(
-                ids=[doc_id],
-                documents=[text],
-                metadatas=[metadata],
-                embeddings=[embedding]
-            )
+            with self._collection_lock:
+                self.collection.update(
+                    ids=[doc_id],
+                    documents=[text],
+                    metadatas=[metadata],
+                    embeddings=[embedding]
+                )
             logger.debug(f"Updated document: {doc_id}")
             return True
         except Exception as e:
@@ -328,7 +348,8 @@ class ChromaEmbeddingPipelineTextOnly:
             Number of documents deleted
         """
         try:
-            all_docs = self.collection.get()
+            with self._collection_lock:
+                all_docs = self.collection.get()
             
             ids_to_delete = []
             for i, metadata in enumerate(all_docs['metadatas']):
@@ -336,7 +357,8 @@ class ChromaEmbeddingPipelineTextOnly:
                     ids_to_delete.append(all_docs['ids'][i])
             
             if ids_to_delete:
-                self.collection.delete(ids=ids_to_delete)
+                with self._collection_lock:
+                    self.collection.delete(ids=ids_to_delete)
                 logger.info(f"Deleted {len(ids_to_delete)} documents matching source pattern: {source_pattern}")
                 return len(ids_to_delete)
             else:
@@ -361,7 +383,8 @@ class ChromaEmbeddingPipelineTextOnly:
             source = file_path.stem
             mission = self.extract_mission_from_path(file_path)
             
-            all_docs = self.collection.get()
+            with self._collection_lock:
+                all_docs = self.collection.get()
             
             file_doc_ids = []
             for i, metadata in enumerate(all_docs['metadatas']):
@@ -491,7 +514,8 @@ class ChromaEmbeddingPipelineTextOnly:
 
         stale_ids = list(old_doc_ids - new_doc_ids)
         if stale_ids:
-            self.collection.delete(ids=stale_ids)
+            with self._collection_lock:
+                self.collection.delete(ids=stale_ids)
             stats['deleted'] += len(stale_ids)
 
         for batch_start in range(0, len(upsert_payload), batch_size):
@@ -501,12 +525,13 @@ class ChromaEmbeddingPipelineTextOnly:
             metadatas = [item[2] for item in batch]
             embeddings = self.get_embeddings_batch(texts)
 
-            self.collection.upsert(
-                ids=ids,
-                documents=texts,
-                metadatas=metadatas,
-                embeddings=embeddings,
-            )
+            with self._collection_lock:
+                self.collection.upsert(
+                    ids=ids,
+                    documents=texts,
+                    metadatas=metadatas,
+                    embeddings=embeddings,
+                )
 
             for doc_id in ids:
                 if doc_id in old_doc_ids:
@@ -525,6 +550,32 @@ class ChromaEmbeddingPipelineTextOnly:
         stats['chunks'] = len(documents)
         stats['status'] = 'processed'
         return stats
+
+    @staticmethod
+    def normalize_mission_name(mission: str) -> Optional[str]:
+        """Normalize mission aliases to canonical mission keys."""
+        normalized = mission.strip().lower().replace('-', '_').replace(' ', '_')
+        return MISSION_ALIASES.get(normalized)
+
+    def _normalize_mission_filter(self, missions: Optional[List[str]]) -> Optional[Set[str]]:
+        """Normalize and validate requested mission filters."""
+        if not missions:
+            return None
+
+        normalized: Set[str] = set()
+        invalid: List[str] = []
+        for mission in missions:
+            canonical = self.normalize_mission_name(mission)
+            if canonical is None:
+                invalid.append(mission)
+                continue
+            normalized.add(canonical)
+
+        if invalid:
+            valid = ', '.join(sorted(MISSION_DIR_MAP.keys()))
+            raise ValueError(f"Unknown mission filter(s): {', '.join(invalid)}. Valid missions: {valid}")
+
+        return normalized
     
     def extract_mission_from_path(self, file_path: Path) -> str:
         """Extract mission name from file path"""
@@ -580,7 +631,7 @@ class ChromaEmbeddingPipelineTextOnly:
         else:
             return 'general_document'
     
-    def scan_text_files_only(self, base_path: str) -> List[Path]:
+    def scan_text_files_only(self, base_path: str, missions: Optional[List[str]] = None) -> List[Path]:
         """
         Scan data directories for text files only (avoiding JSON duplicates)
         
@@ -592,14 +643,12 @@ class ChromaEmbeddingPipelineTextOnly:
         """
         base_path = Path(base_path)
         files_to_process = []
+        mission_filter = self._normalize_mission_filter(missions)
         
-        data_dirs = [
-            'apollo11',
-            'apollo13',
-            'challenger'
-        ]
+        selected_missions = sorted(mission_filter) if mission_filter else sorted(MISSION_DIR_MAP.keys())
         
-        for data_dir in data_dirs:
+        for mission in selected_missions:
+            data_dir = MISSION_DIR_MAP[mission]
             dir_path = base_path / data_dir
             if dir_path.exists():
                 logger.info(f"Scanning directory: {dir_path}")
@@ -628,10 +677,77 @@ class ChromaEmbeddingPipelineTextOnly:
             logger.info(f"  {mission}: {count} files")
         
         return filtered_files
+
+    def _add_documents_to_collection_fast(
+        self,
+        documents: List[Tuple[str, Dict[str, Any]]],
+        file_path: Path,
+        batch_size: int,
+        update_mode: str,
+    ) -> Dict[str, int]:
+        """Fast path: batch existence checks + embeddings + upsert for throughput."""
+        stats = {'added': 0, 'updated': 0, 'skipped': 0}
+        if not documents:
+            return stats
+
+        if update_mode == 'replace':
+            existing_file_ids = self.get_file_documents(file_path)
+            if existing_file_ids:
+                with self._collection_lock:
+                    self.collection.delete(ids=existing_file_ids)
+
+        for batch_start in range(0, len(documents), batch_size):
+            batch = documents[batch_start:batch_start + batch_size]
+            batch_ids = [self.generate_document_id(file_path, metadata) for _, metadata in batch]
+
+            existing_ids: Set[str] = set()
+            if update_mode in {'skip', 'update'}:
+                with self._collection_lock:
+                    existing_result = self.collection.get(ids=batch_ids)
+                existing_ids = set(existing_result.get('ids') or [])
+
+            if update_mode == 'skip':
+                to_upsert = [
+                    (doc_id, text, metadata)
+                    for (text, metadata), doc_id in zip(batch, batch_ids)
+                    if doc_id not in existing_ids
+                ]
+                stats['skipped'] += len(existing_ids)
+            else:
+                to_upsert = [
+                    (doc_id, text, metadata)
+                    for (text, metadata), doc_id in zip(batch, batch_ids)
+                ]
+
+            if not to_upsert:
+                continue
+
+            upsert_ids = [item[0] for item in to_upsert]
+            upsert_texts = [item[1] for item in to_upsert]
+            upsert_metadatas = [item[2] for item in to_upsert]
+            embeddings = self.get_embeddings_batch(upsert_texts)
+
+            with self._collection_lock:
+                self.collection.upsert(
+                    ids=upsert_ids,
+                    documents=upsert_texts,
+                    metadatas=upsert_metadatas,
+                    embeddings=embeddings,
+                )
+
+            if update_mode == 'update':
+                updated = sum(1 for doc_id in upsert_ids if doc_id in existing_ids)
+                stats['updated'] += updated
+                stats['added'] += len(upsert_ids) - updated
+            else:
+                stats['added'] += len(upsert_ids)
+
+        return stats
     
     def add_documents_to_collection(self, documents: List[Tuple[str, Dict[str, Any]]], 
                                    file_path: Path, batch_size: int = 50, 
-                                   update_mode: str = 'skip') -> Dict[str, int]:
+                                   update_mode: str = 'skip',
+                                   fast_upsert: bool = False) -> Dict[str, int]:
         """
         Add documents to ChromaDB collection in batches with update handling
         
@@ -643,6 +759,7 @@ class ChromaEmbeddingPipelineTextOnly:
                         'skip' - skip existing documents
                         'update' - update existing documents
                         'replace' - delete all existing documents from file and re-add
+            fast_upsert: Use batch existence checks + upsert for higher throughput
             
         Returns:
             Dictionary with counts of added, updated, and skipped documents
@@ -655,10 +772,19 @@ class ChromaEmbeddingPipelineTextOnly:
         if update_mode not in {'skip', 'update', 'replace'}:
             raise ValueError("update_mode must be one of: skip, update, replace")
 
+        if fast_upsert:
+            return self._add_documents_to_collection_fast(
+                documents=documents,
+                file_path=file_path,
+                batch_size=batch_size,
+                update_mode=update_mode,
+            )
+
         if update_mode == 'replace':
             existing_file_ids = self.get_file_documents(file_path)
             if existing_file_ids:
-                self.collection.delete(ids=existing_file_ids)
+                with self._collection_lock:
+                    self.collection.delete(ids=existing_file_ids)
 
         for batch_start in range(0, len(documents), batch_size):
             batch = documents[batch_start:batch_start + batch_size]
@@ -679,12 +805,13 @@ class ChromaEmbeddingPipelineTextOnly:
                             stats['skipped'] += 1
                     else:
                         embedding = self.get_embedding(text)
-                        self.collection.add(
-                            ids=[doc_id],
-                            documents=[text],
-                            metadatas=[metadata],
-                            embeddings=[embedding]
-                        )
+                        with self._collection_lock:
+                            self.collection.add(
+                                ids=[doc_id],
+                                documents=[text],
+                                metadatas=[metadata],
+                                embeddings=[embedding]
+                            )
                         stats['added'] += 1
                 except Exception as e:
                     logger.error(f"Error processing document {doc_id}: {e}")
@@ -697,6 +824,9 @@ class ChromaEmbeddingPipelineTextOnly:
         base_path: str,
         update_mode: str = 'skip',
         batch_size: int = 50,
+        missions: Optional[List[str]] = None,
+        checkpoint_manifest_each_file: bool = False,
+        fast_upsert: bool = False,
     ) -> Dict[str, int]:
         """
         Process all text files and add to ChromaDB
@@ -707,6 +837,9 @@ class ChromaEmbeddingPipelineTextOnly:
                         'skip' - skip existing documents (default)
                         'update' - update existing documents
                         'replace' - delete all existing documents from file and re-add
+            missions: Optional mission filters (e.g., challenger, apollo_13)
+            checkpoint_manifest_each_file: Persist manifest after each file in incremental mode
+            fast_upsert: Use batch upsert fast path for non-incremental modes
             
         Returns:
             Statistics about processed files
@@ -722,7 +855,7 @@ class ChromaEmbeddingPipelineTextOnly:
         }
         run_rows: List[Dict[str, Any]] = []
 
-        files_to_process = self.scan_text_files_only(base_path)
+        files_to_process = self.scan_text_files_only(base_path, missions=missions)
         use_incremental = update_mode == 'incremental'
 
         if use_incremental:
@@ -735,7 +868,8 @@ class ChromaEmbeddingPipelineTextOnly:
                 old_ids = entry.get('doc_ids', []) or []
                 if old_ids:
                     try:
-                        self.collection.delete(ids=list(old_ids))
+                        with self._collection_lock:
+                            self.collection.delete(ids=list(old_ids))
                     except Exception as exc:
                         logger.warning("Failed deleting stale file docs from %s: %s", missing_key, exc)
                 manifest_files.pop(missing_key, None)
@@ -785,6 +919,7 @@ class ChromaEmbeddingPipelineTextOnly:
                         file_path=file_path,
                         batch_size=batch_size,
                         update_mode=update_mode,
+                        fast_upsert=fast_upsert,
                     )
                     chunk_count = len(documents)
 
@@ -810,6 +945,11 @@ class ChromaEmbeddingPipelineTextOnly:
                 run_row['error'] = str(e)[:500]
             finally:
                 run_rows.append(run_row)
+                if use_incremental and checkpoint_manifest_each_file:
+                    try:
+                        self._save_manifest()
+                    except Exception as exc:
+                        logger.warning("Failed to checkpoint manifest after %s: %s", file_path, exc)
 
         if use_incremental:
             self._save_manifest()
@@ -1040,6 +1180,12 @@ def main():
     parser.add_argument('--batch-size', type=int, default=50, help='Batch size for processing')
     parser.add_argument('--update-mode', choices=['skip', 'update', 'replace', 'incremental'], default='incremental',
                        help='How to handle existing documents: skip, update, replace, or incremental (manifest-based)')
+    parser.add_argument('--missions', nargs='+', default=None,
+                       help='Optional mission filter(s): challenger apollo_13 apollo11 (comma-separated values also supported)')
+    parser.add_argument('--checkpoint-manifest-each-file', action='store_true',
+                       help='In incremental mode, save manifest after every file for reliable resume')
+    parser.add_argument('--fast-upsert', action='store_true',
+                       help='Use batch upsert fast path for non-incremental update modes')
     parser.add_argument('--test-query', help='Test query after processing')
     parser.add_argument('--stats-only', action='store_true', help='Only show collection statistics')
     parser.add_argument('--delete-source', help='Delete all documents from a specific source pattern')
@@ -1074,12 +1220,22 @@ def main():
         return
     
     logger.info(f"Starting text data processing with update mode: {args.update_mode}")
+    mission_filters: Optional[List[str]] = None
+    if args.missions:
+        mission_filters = []
+        for raw_value in args.missions:
+            mission_filters.extend([value.strip() for value in raw_value.split(',') if value.strip()])
+        logger.info("Applying mission filter: %s", ', '.join(mission_filters))
+
     start_time = time.time()
     
     stats = pipeline.process_all_text_data(
         args.data_path,
         update_mode=args.update_mode,
         batch_size=args.batch_size,
+        missions=mission_filters,
+        checkpoint_manifest_each_file=args.checkpoint_manifest_each_file,
+        fast_upsert=args.fast_upsert,
     )
     
     end_time = time.time()
