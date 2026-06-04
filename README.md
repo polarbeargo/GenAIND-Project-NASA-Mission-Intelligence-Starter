@@ -275,73 +275,42 @@ Monitor with: `curl http://localhost:8000/monitoring/latency-sli`
 
 If use the provided Kubernetes autoscaling manifests, run this once so HPA can read worker-pool custom metrics end-to-end.
 
-0. **Prerequisites (required before adapter + HPA checks)**
-   ```bash
-   # Minikube/cluster must be running and your kube-context must point to it
-   kubectl config current-context
 
-   # API deployment must exist (HPA scale target)
-   kubectl get deploy nasa-mission-intelligence-api -n default
+### Automated setup (recommended)
 
-   # Pods should be running
-   kubectl get pods -n default -l app.kubernetes.io/name=nasa-mission-intelligence-api
+Use the bootstrap script to install/update Prometheus stack + Adapter, apply canonical API deployment/service + ServiceMonitor + HPA, then run smoke checks.
 
-   # Prometheus Operator CRD must exist for ServiceMonitor
-   kubectl get crd servicemonitors.monitoring.coreos.com
-   ```
+Default one-command flow:
 
-   In a separate terminal, expose and verify the raw Prometheus endpoint from the API pod:
-   ```bash
-   kubectl port-forward deploy/nasa-mission-intelligence-api 8000:8000 -n default
-   ```
+```bash
+./scripts/setup-k8s-custom-metrics.sh
+```
 
-   ```bash
-   curl -s http://127.0.0.1:8000/monitoring/worker-pools/prometheus | grep nasa_worker_pool_
-   ```
+By default this applies [deploy/k8s/api-deployment.yaml](deploy/k8s/api-deployment.yaml).
 
-1. **Apply ServiceMonitor so Prometheus scrapes worker-pool metrics**
-   ```bash
-   kubectl apply -f deploy/k8s/servicemonitor-worker-pools.yaml
-   ```
+```bash
+# Optional: override with a custom API manifest.
+API_MANIFEST_PATH=deploy/k8s/your-api-manifest.yaml ./scripts/setup-k8s-custom-metrics.sh
+```
 
-2. **Deploy/update Prometheus Adapter with project rules**
-    ```bash
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-    helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
-       --namespace monitoring --create-namespace \
-       -f deploy/k8s/prometheus-adapter-values.yaml
-    ```
+Run smoke checks only (custom metrics API, metric payloads, HPA current metrics, Latency SLI and Worker Pool observability endpoints, Prometheus query parity):
 
-3. **Verify Custom Metrics API is available**
-    ```bash
-    kubectl get apiservice v1beta1.custom.metrics.k8s.io
-    kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq .
-    ```
+```bash
+./scripts/smoke-k8s-custom-metrics.sh
+```
 
-4. **Verify all HPA worker-pool metrics are exposed**
-    ```bash
-   for m in \
-     nasa_worker_pool_queue_depth_ratio \
-     nasa_worker_pool_oldest_queue_age_seconds \
-     nasa_worker_pool_rejected_rate \
-     nasa_worker_pool_error_rate \
-     nasa_worker_pool_utilization_ratio \
-     nasa_worker_pool_rejected_total
-   do
-     echo "===== ${m} ====="
-     kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/${m}" | jq .
-   done
-    ```
+Optional overrides:
 
-5. **Apply HPA and confirm metrics are being consumed**
-    ```bash
-    kubectl apply -f deploy/k8s/hpa-api-worker-pools.yaml
-    kubectl describe hpa nasa-mission-intelligence-api
-    ```
+```bash
+APP_NAMESPACE=default \
+MONITORING_NAMESPACE=monitoring \
+DEPLOYMENT_NAME=nasa-mission-intelligence-api \
+HPA_NAME=nasa-mission-intelligence-api \
+./scripts/smoke-k8s-custom-metrics.sh
+```
 
-If app namespace is not `default`, replace `default` in the verification paths above.
-
-Fast troubleshooting guide: [Kubernetes Custom Metrics Fast Failure Checklist](doc/kubernetes-custom-metrics-fast-failure-checklist.md)
+- User Manual: [doc/kubernetes-custom-metrics-user-manual.md](doc/kubernetes-custom-metrics-user-manual.md)
+- Fast troubleshooting guide: [doc/kubernetes-custom-metrics-fast-failure-checklist.md](doc/kubernetes-custom-metrics-fast-failure-checklist.md)
 
 ## Latency SLI Usage
 
