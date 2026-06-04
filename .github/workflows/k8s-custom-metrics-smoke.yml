@@ -1,0 +1,77 @@
+name: K8s Custom Metrics Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/k8s/**"
+      - "monitoring/**"
+      - "scripts/setup-k8s-custom-metrics.sh"
+      - "scripts/smoke-k8s-custom-metrics.sh"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/k8s-custom-metrics-smoke.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/k8s/**"
+      - "monitoring/**"
+      - "scripts/setup-k8s-custom-metrics.sh"
+      - "scripts/smoke-k8s-custom-metrics.sh"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/k8s-custom-metrics-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Setup + Smoke (minikube)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Setup minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          cpus: 3
+          memory: 6144m
+          kubernetes-version: v1.30.0
+
+      - name: Verify cluster tools
+        run: |
+          kubectl version --client
+          helm version
+          minikube status
+
+      - name: Build API image in minikube Docker daemon
+        run: |
+          eval "$(minikube docker-env)"
+          docker build -t nasa-mission-intelligence-api:latest .
+
+      - name: Run automated setup and smoke checks
+        env:
+          KUBECTL_REQUEST_TIMEOUT_SECONDS: "5"
+          READY_TIMEOUT_SECONDS: "300"
+        run: |
+          chmod +x scripts/setup-k8s-custom-metrics.sh scripts/smoke-k8s-custom-metrics.sh
+          ./scripts/setup-k8s-custom-metrics.sh
+
+      - name: Debug snapshot on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get deploy,svc,hpa -A || true
+          kubectl get apiservice v1beta1.custom.metrics.k8s.io -o yaml || true
+          kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq . || true
+          kubectl describe deploy nasa-mission-intelligence-api -n default || true
+          kubectl describe pods -n default -l app.kubernetes.io/name=nasa-mission-intelligence-api || true
+          kubectl logs -n monitoring deploy/prometheus-adapter --tail=200 || true

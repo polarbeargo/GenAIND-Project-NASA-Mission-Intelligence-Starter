@@ -1,6 +1,6 @@
 prometheus:
   # Adjust if your Prometheus service name/namespace differs.
-  url: http://prometheus-kube-prometheus-prometheus.monitoring.svc
+  url: http://kube-prometheus-stack-prometheus.monitoring.svc
   port: 9090
   path: ""
 

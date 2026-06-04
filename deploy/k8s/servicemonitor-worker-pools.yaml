@@ -4,6 +4,7 @@ metadata:
   name: nasa-mission-intelligence-api
   labels:
     app.kubernetes.io/name: nasa-mission-intelligence-api
+    release: kube-prometheus-stack
 spec:
   selector:
     matchLabels:
