@@ -110,6 +110,7 @@ class TestWorkflowCaching(unittest.TestCase):
         workflow.retrieval_worker.run = MagicMock(
             return_value=RetrievalResult(
                 contexts=["Apollo 13 had an oxygen tank explosion."],
+                metadatas=[{"mission": "apollo13"}],
                 context_text="Apollo 13 had an oxygen tank explosion.",
             )
         )
@@ -143,6 +144,7 @@ class TestWorkflowCaching(unittest.TestCase):
         workflow.retrieval_worker.run = MagicMock(
             return_value=RetrievalResult(
                 contexts=["Apollo 13 had an oxygen tank explosion."],
+                metadatas=[{"mission": "apollo13"}],
                 context_text="Apollo 13 had an oxygen tank explosion.",
             )
         )
@@ -165,8 +167,10 @@ class TestWorkflowCaching(unittest.TestCase):
         self.assertEqual(first.answer, second.answer)
 
         self.assertEqual(workflow.retrieval_worker.run.call_count, 1)
-        self.assertEqual(workflow.analysis_worker.generate_answer.call_count, 1)
-        self.assertEqual(workflow.safety_worker.postflight.call_count, 1)
+        # Mission-filtered requests bypass answer-cache short-circuit to keep
+        # grounded-evidence checks active, so generation still runs each time.
+        self.assertEqual(workflow.analysis_worker.generate_answer.call_count, 2)
+        self.assertEqual(workflow.safety_worker.postflight.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -161,6 +161,7 @@ class TestAsyncEvalFallback(unittest.TestCase):
 
         # Force deterministic synchronous execution to avoid timing flake.
         workflow._eval_executor.submit = lambda fn, *args: fn(*args)
+        workflow._eval_job_executor.submit = lambda fn, *args: fn(*args)
 
         result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
 
@@ -433,6 +434,9 @@ class TestRedisEvalIntegration(unittest.TestCase):
             consumer_group=group_name,
             enabled=True,
         )
+        # Keep this test deterministic: consumer startup can race with the first
+        # request; explicitly treat consumer availability as ready.
+        workflow._evaluation_broker.has_active_consumers = lambda: True
         workflow._redis_job_store = RedisAsyncJobStore(self.redis, retention_ttl_seconds=120)
 
         _seed_common_mocks(workflow)

@@ -26,6 +26,7 @@ def test_client_cache_key_changes_with_conversation_history() -> None:
         backend="./chroma_db_openai:nasa_space_missions_text",
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history_a,
         enable_evaluation=True,
     )
@@ -34,6 +35,7 @@ def test_client_cache_key_changes_with_conversation_history() -> None:
         backend="./chroma_db_openai:nasa_space_missions_text",
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history_b,
         enable_evaluation=True,
     )
@@ -67,6 +69,7 @@ def test_streamlit_cache_lookup_is_history_aware() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history_used_for_write,
         enable_evaluation=True,
         response=response_payload,
@@ -77,6 +80,7 @@ def test_streamlit_cache_lookup_is_history_aware() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history_used_for_write,
         enable_evaluation=True,
     )
@@ -85,6 +89,7 @@ def test_streamlit_cache_lookup_is_history_aware() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=different_history,
         enable_evaluation=True,
     )
@@ -124,6 +129,7 @@ def test_streamlit_cache_separates_evaluation_mode() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history,
         enable_evaluation=True,
         response=eval_on_payload,
@@ -133,6 +139,7 @@ def test_streamlit_cache_separates_evaluation_mode() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history,
         enable_evaluation=False,
         response=eval_off_payload,
@@ -143,6 +150,7 @@ def test_streamlit_cache_separates_evaluation_mode() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history,
         enable_evaluation=True,
     )
@@ -151,6 +159,7 @@ def test_streamlit_cache_separates_evaluation_mode() -> None:
         backend=backend,
         n_docs=3,
         model="gpt-4o-mini",
+        mission_filter=None,
         conversation_history=history,
         enable_evaluation=False,
     )

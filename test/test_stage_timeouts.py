@@ -58,6 +58,12 @@ def make_input(evaluate: bool = True) -> ChatWorkflowInput:
     )
 
 
+def make_input_without_mission(evaluate: bool = True) -> ChatWorkflowInput:
+    payload = make_input(evaluate=evaluate)
+    payload.mission_filter = None
+    return payload
+
+
 class TestStageTimeouts(unittest.TestCase):
     def test_retrieval_failure_returns_safe_fallback(self):
         workflow = build_workflow()
@@ -67,7 +73,7 @@ class TestStageTimeouts(unittest.TestCase):
             return_value=SafetyPreflightResult(blocked_response=None)
         )
 
-        result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
+        result = workflow.run(make_input_without_mission(evaluate=True), openai_key="fake-key")
 
         self.assertFalse(result.blocked)
         self.assertEqual(result.contexts, [])

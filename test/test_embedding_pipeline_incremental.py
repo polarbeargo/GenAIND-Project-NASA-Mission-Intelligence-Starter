@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class TestEmbeddingPipelineIncremental(unittest.TestCase):
         pipeline.embedding_model = "text-embedding-3-small"
         pipeline.manifest_path = workdir / "manifest.json"
         pipeline.manifest = {"files": {}}
+        pipeline._collection_lock = threading.RLock()
         pipeline.get_embeddings_batch = lambda texts: [[float(i)] for i, _ in enumerate(texts)]
         return pipeline
 
@@ -165,7 +167,7 @@ class TestEmbeddingPipelineIncremental(unittest.TestCase):
                 "doc_ids": ["old_doc_1", "old_doc_2"],
             }
 
-            pipeline.scan_text_files_only = lambda _base: [existing_file]
+            pipeline.scan_text_files_only = lambda _base, missions=None: [existing_file]
             pipeline._process_file_incremental = lambda file_path, batch_size: {
                 "chunks": 2,
                 "added": 1,
