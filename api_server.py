@@ -31,6 +31,7 @@ from evidently_monitor import EvidentlyMonitor
 from observability import init_telemetry, telemetry_status
 from multi_agent import ChatWorkflowInput, MultiAgentChatWorkflow, WorkflowError
 from monitoring.security_dashboard import get_dashboard
+from monitoring.security_event_sink import DashboardSecurityEventSink
 from monitoring.stage_sli_events import StageLatencyEventStore
 from monitoring.worker_pool_events import WorkerPoolEventStore
 
@@ -43,7 +44,6 @@ try:
         VectorSecurityValidator,
         SecurityLevel,
         SecurityViolation,
-        SecurityAuditor,
     )
 except ImportError:
     PromptInjectionDetector = None
@@ -53,7 +53,6 @@ except ImportError:
     VectorSecurityValidator = None
     SecurityLevel = None
     SecurityViolation = Exception
-    SecurityAuditor = None
 
 load_project_env(__file__)
 
@@ -114,33 +113,7 @@ except ImportError:  # pragma: no cover - optional dependency
     PhoenixClient = None
 
 
-class SecurityDashboardAuditorBridge:
-    """Bridge workflow security audit calls into the in-process security dashboard."""
-
-    def __init__(self, dashboard):
-        self._dashboard = dashboard
-
-    def log_security_event(
-        self,
-        event_type: str,
-        severity,
-        user_id: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        severity_value = getattr(severity, "value", str(severity)).strip().lower() or "medium"
-        try:
-            self._dashboard.log_event(
-                event_type=event_type,
-                severity=severity_value,
-                user_id=user_id,
-                ip_address=user_id,
-                details=details,
-            )
-        except Exception as error:
-            logger.warning("Security dashboard bridge failed: %s", error)
-
-
-security_auditor_bridge = SecurityDashboardAuditorBridge(security_dashboard)
+security_event_sink = DashboardSecurityEventSink(security_dashboard)
 
 
 def _get_default_judge_mode() -> str:
@@ -944,7 +917,7 @@ chat_workflow = MultiAgentChatWorkflow(
     output_validator=OutputValidator,
     sensitive_info_filter=SensitiveInfoFilter,
     security_violation=SecurityViolation,
-    security_auditor=security_auditor_bridge,
+    security_auditor=security_event_sink,
     security_level=SecurityLevel,
     judge_timeout_seconds=_JUDGE_TIMEOUT_SECONDS,
     factoid_n_results=_get_depth_threshold("RETRIEVAL_FACTOID_N_RESULTS", 2),

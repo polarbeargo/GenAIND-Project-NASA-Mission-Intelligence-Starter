@@ -11,6 +11,7 @@ import llm_client
 import rag_client
 import ragas_evaluator
 from pydantic import BaseModel, ValidationError
+from security import SecurityEvent
 
 from multi_agent.models import (
     ChatWorkflowInput,
@@ -75,7 +76,7 @@ class SafetyWorker:
         self.output_validator = output_validator
         self.sensitive_info_filter = sensitive_info_filter
         self.security_violation = security_violation
-        self.security_auditor = security_auditor
+        self.audit_sink = security_auditor
         self.security_level = security_level
 
     def preflight(self, workflow_input: ChatWorkflowInput) -> SafetyPreflightResult:
@@ -170,13 +171,22 @@ class SafetyWorker:
         user_id: Optional[str],
         details: Optional[Dict[str, Any]],
     ) -> None:
-        if self.security_auditor is None or severity is None:
+        if self.audit_sink is None or severity is None:
             return
-        self.security_auditor.log_security_event(
+        event = SecurityEvent(
             event_type=event_type,
-            severity=severity,
+            severity=getattr(severity, "value", str(severity)).strip().lower() or "medium",
             user_id=user_id,
-            details=details,
+            details=details or {},
+        )
+        if hasattr(self.audit_sink, "emit"):
+            self.audit_sink.emit(event)
+            return
+        self.audit_sink.log_security_event(
+            event_type=event.event_type,
+            severity=event.severity,
+            user_id=event.user_id,
+            details=event.details,
         )
 
 

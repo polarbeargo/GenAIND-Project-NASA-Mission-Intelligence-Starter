@@ -9,9 +9,10 @@ https://genai.owasp.org/llm-top-10/
 import logging
 import os
 import re
-from threading import Lock
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
 from enum import Enum
+from threading import Lock
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,28 @@ class SecurityViolation(Exception):
         self.message = message
         self.details = details or {}
         super().__init__(f"[{level.value.upper()}] {message}")
+
+
+def _normalize_security_severity(severity: SecurityLevel | str) -> str:
+    return getattr(severity, "value", str(severity)).strip().lower() or SecurityLevel.MEDIUM.value
+
+
+@dataclass(frozen=True)
+class SecurityEvent:
+    """Domain event emitted when a security-relevant condition is observed."""
+
+    event_type: str
+    severity: str
+    user_id: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class SecurityEventSink(Protocol):
+    """Port for routing security events to logging, dashboards, or external systems."""
+
+    def emit(self, event: SecurityEvent) -> None:
+        """Handle one security event."""
 
 
 class PromptInjectionDetector:
@@ -329,22 +352,41 @@ class VectorSecurityValidator:
         return None
 
 
-class SecurityAuditor:
-    """Central audit logger for security events."""
-    
-    @staticmethod
-    def log_security_event(event_type: str, severity: SecurityLevel, user_id: Optional[str] = None,
-                          details: Optional[Dict] = None) -> None:
-        """Log security-relevant events."""
+class LoggerSecurityEventSink:
+    """Logger-backed implementation of the security event sink port."""
+
+    def emit(self, event: SecurityEvent) -> None:
         log_entry = {
-            "type": event_type,
-            "severity": severity.value,
-            "user": user_id or "anonymous",
-            "details": details or {},
+            "type": event.event_type,
+            "severity": _normalize_security_severity(event.severity),
+            "user": event.user_id or "anonymous",
+            "details": event.details,
         }
-        
-        if severity in [SecurityLevel.HIGH, SecurityLevel.CRITICAL]:
+
+        if log_entry["severity"] in {SecurityLevel.HIGH.value, SecurityLevel.CRITICAL.value}:
             logger.error(f"SECURITY EVENT: {log_entry}")
         else:
             logger.warning(f"Security event: {log_entry}")
+
+    @classmethod
+    def log_security_event(
+        cls,
+        event_type: str,
+        severity: SecurityLevel | str,
+        user_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Backwards-compatible convenience wrapper for legacy call sites."""
+        cls().emit(
+            SecurityEvent(
+                event_type=event_type,
+                severity=_normalize_security_severity(severity),
+                user_id=user_id,
+                details=details or {},
+            )
+        )
+
+
+class SecurityAuditor(LoggerSecurityEventSink):
+    """Backward-compatible alias for the logger-backed security sink."""
 
