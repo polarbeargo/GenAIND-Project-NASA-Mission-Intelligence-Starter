@@ -42,7 +42,7 @@ jobs:
       - name: Setup minikube
         uses: medyagh/setup-minikube@latest
         with:
-          cpus: 3
+          cpus: 2
           memory: 6144m
           kubernetes-version: v1.30.0
 
