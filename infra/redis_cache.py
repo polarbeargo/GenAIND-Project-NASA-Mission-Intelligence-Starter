@@ -35,7 +35,7 @@ class RedisL2Cache:
     ) -> str:
         """Generate cache key for retrieval results."""
         normalized = f"{query.strip().lower()}:{mission_filter or ''}:{collection_name}"
-        hash_val = hashlib.md5(normalized.encode()).hexdigest()
+        hash_val = hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()
         return f"cache:retrieval:{hash_val}"
 
     def _cache_key_response(
@@ -45,7 +45,7 @@ class RedisL2Cache:
         normalized = (
             f"{query.strip().lower()}:{mission_filter or ''}:{collection_name}:{model}:{evaluate}"
         )
-        hash_val = hashlib.md5(normalized.encode()).hexdigest()
+        hash_val = hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()
         return f"cache:response:{hash_val}"
 
     def get_retrieval(

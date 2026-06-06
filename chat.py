@@ -75,7 +75,7 @@ def _get_client_cache_key(
         f"{normalized_q}|{backend}|{n_docs}|{model}|{normalized_mission}|"
         f"{int(bool(enable_evaluation))}|{history_sig}"
     )
-    return hashlib.md5(cache_str.encode("utf-8")).hexdigest()
+    return hashlib.md5(cache_str.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 def _get_cached_response(
     question: str,
