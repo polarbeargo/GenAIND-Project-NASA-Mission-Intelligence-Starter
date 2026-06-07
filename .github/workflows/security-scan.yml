@@ -46,9 +46,16 @@ jobs:
       - name: 🔍 Bandit - Python Security Scanner
         run: |
           echo "Running Bandit security analysis..."
+          set +e
           bandit -r . -f json -o bandit-report.json \
             --exclude ./test/,./venv/,./.venv/,./.git/,./__pycache__/ \
             --skip B101,B601
+          STATUS=$?
+          set -e
+          if [ $STATUS -ne 0 ] && [ $STATUS -ne 1 ]; then
+            echo "Bandit execution failed with unexpected status ${STATUS}"
+            exit $STATUS
+          fi
 
       - name: Enforce Bandit thresholds
         run: |
