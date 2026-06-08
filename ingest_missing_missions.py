@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 import time
-from typing import List, Optional
+from typing import List
 
 from embedding_pipeline import ChromaEmbeddingPipelineTextOnly
 from openai_config import get_openai_api_key

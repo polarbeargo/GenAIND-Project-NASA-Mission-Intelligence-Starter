@@ -5,7 +5,7 @@ from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from openai_config import (
     get_openai_api_key,
