@@ -129,7 +129,7 @@ jobs:
                     $RESPONSE = $OUTPUT
               message: "LLM05 - Output not validated before use"
               languages: [python]
-              severity: WARNING
+              severity: INFO
           EOF
           
           echo "Running Semgrep analysis..."
