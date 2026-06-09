@@ -183,9 +183,24 @@ jobs:
 
       - name: 📋 pip-audit - Dependency Audit
         run: |
+          echo "Preparing runtime dependency list from pyproject.toml..."
+          python3 << 'PYTHON_SCRIPT'
+          import tomllib
+
+          with open('pyproject.toml', 'rb') as handle:
+              pyproject = tomllib.load(handle)
+
+          dependencies = pyproject.get('project', {}).get('dependencies', [])
+          with open('ci-runtime-requirements.txt', 'w', encoding='utf-8') as out:
+              for dep in dependencies:
+                  out.write(f"{dep}\n")
+
+          print(f"Wrote {len(dependencies)} runtime dependencies to ci-runtime-requirements.txt")
+          PYTHON_SCRIPT
+
           echo "Running pip-audit..."
           set +e
-          pip-audit --format json -o pip-audit-report.json
+          pip-audit --requirement ci-runtime-requirements.txt --format json -o pip-audit-report.json
           STATUS=$?
           set -e
           if [ $STATUS -ne 0 ] && [ $STATUS -ne 1 ]; then
