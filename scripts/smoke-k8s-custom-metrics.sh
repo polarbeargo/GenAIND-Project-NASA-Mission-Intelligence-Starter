@@ -31,14 +31,33 @@ METRICS=(
 )
 
 PF_PIDS=()
+PF_LOG_FILES=()
 
 log() {
   printf "[smoke-k8s-custom-metrics] %s\n" "$*"
 }
 
 die() {
+  emit_port_forward_diagnostics
   printf "[smoke-k8s-custom-metrics] ERROR: %s\n" "$*" >&2
   exit 1
+}
+
+emit_port_forward_diagnostics() {
+  local tail_lines="${PF_LOG_TAIL_LINES:-80}"
+  local had_logs=0
+
+  for log_file in "${PF_LOG_FILES[@]:-}"; do
+    if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+      had_logs=1
+      printf "[smoke-k8s-custom-metrics] --- port-forward log tail: %s (last %s lines) ---\n" "${log_file}" "${tail_lines}" >&2
+      tail -n "${tail_lines}" "${log_file}" >&2 || true
+    fi
+  done
+
+  if [[ "${had_logs}" -eq 0 ]]; then
+    printf "[smoke-k8s-custom-metrics] No port-forward logs captured yet.\n" >&2
+  fi
 }
 
 require_cmd() {
@@ -104,6 +123,7 @@ start_port_forward() {
   kubectl -n "${namespace}" port-forward "${resource}" "${local_port}:${remote_port}" >"${log_file}" 2>&1 &
   local pf_pid=$!
   PF_PIDS+=("${pf_pid}")
+  PF_LOG_FILES+=("${log_file}")
 
   sleep 1
   if ! kill -0 "${pf_pid}" >/dev/null 2>&1; then
