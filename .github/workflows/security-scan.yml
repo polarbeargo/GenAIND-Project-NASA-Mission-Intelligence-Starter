@@ -225,6 +225,52 @@ jobs:
               raise SystemExit('Dependency threshold failed: vulnerabilities must be 0 for CI gate')
           PYTHON_SCRIPT
 
+      - name: 📋 pip-audit - Full Environment (Informational)
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          echo "Running full-environment pip-audit (informational, non-blocking)..."
+          set +e
+          pip-audit --format json -o pip-audit-full-env-report.json
+          STATUS=$?
+          set -e
+          if [ $STATUS -ne 0 ] && [ $STATUS -ne 1 ]; then
+            echo "Full-environment pip-audit had an unexpected exit status ${STATUS}; continuing (informational step)."
+            printf '{"dependencies":[],"notice":"full environment pip-audit did not complete successfully"}\n' > pip-audit-full-env-report.json
+          fi
+
+      - name: Summarize full-environment audit (informational)
+        if: always()
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path('pip-audit-full-env-report.json')
+          dependencies = []
+          vulnerabilities = 0
+
+          if report_path.exists():
+              try:
+                  report = json.loads(report_path.read_text(encoding='utf-8'))
+                  dependencies = report.get('dependencies', []) or []
+                  vulnerabilities = sum(len(dep.get('vulns', [])) for dep in dependencies)
+              except Exception as exc:
+                  print(f"Informational audit summary parse warning: {exc}")
+
+          print(f"Informational full-environment vulnerabilities: {vulnerabilities}")
+
+            summary_target = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
+            if summary_target:
+              github_summary = Path(summary_target)
+              with github_summary.open('a', encoding='utf-8') as handle:
+                  handle.write("\n## Informational Full-Environment Dependency Audit\n")
+                  handle.write(f"- Vulnerabilities found: **{vulnerabilities}**\n")
+                  handle.write("- Gate impact: **non-blocking**\n")
+                  handle.write("- Scope: all packages installed in the CI environment\n")
+          PYTHON_SCRIPT
+
       - name: 🚨 OWASP LLM Top 10 Custom Validation
         run: |
           python3 << 'PYTHON_SCRIPT'
