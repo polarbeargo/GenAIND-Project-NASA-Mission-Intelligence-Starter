@@ -14,6 +14,8 @@ PROM_LOCAL_PORT="${PROM_LOCAL_PORT:-19090}"
 READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-180}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
 KUBECTL_REQUEST_TIMEOUT_SECONDS="${KUBECTL_REQUEST_TIMEOUT_SECONDS:-5}"
+HTTP_RETRY_ATTEMPTS="${HTTP_RETRY_ATTEMPTS:-6}"
+HTTP_RETRY_DELAY_SECONDS="${HTTP_RETRY_DELAY_SECONDS:-2}"
 
 kubectl_timeout_arg() {
   echo "--request-timeout=${KUBECTL_REQUEST_TIMEOUT_SECONDS}s"
@@ -109,20 +111,52 @@ start_port_forward() {
   fi
 }
 
+wait_for_http_ready() {
+  local url="$1"
+  local attempts="${2:-${HTTP_RETRY_ATTEMPTS}}"
+  local delay_seconds="${3:-${HTTP_RETRY_DELAY_SECONDS}}"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$delay_seconds"
+  done
+  return 1
+}
+
+curl_json_with_retries() {
+  local url="$1"
+  local jq_expr="$2"
+  local attempts="${3:-${HTTP_RETRY_ATTEMPTS}}"
+  local delay_seconds="${4:-${HTTP_RETRY_DELAY_SECONDS}}"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if curl -fsS --max-time 10 "$url" | jq -e "$jq_expr" >/dev/null; then
+      return 0
+    fi
+    sleep "$delay_seconds"
+  done
+  return 1
+}
+
 check_api_observability_endpoints() {
   local base_url="http://127.0.0.1:${API_LOCAL_PORT}"
 
+  wait_for_http_ready "${base_url}/monitoring/worker-pools/series" \
+    || die "API endpoint did not become reachable via port-forward: ${base_url}"
+
   log "Checking worker-pool series endpoint"
-  curl -fsS "${base_url}/monitoring/worker-pools/series" \
-    | jq -e '.stages and (.stages | length) > 0' >/dev/null
+  curl_json_with_retries "${base_url}/monitoring/worker-pools/series" '.stages and (.stages | length) > 0' \
+    || die "Worker-pool series endpoint check failed"
 
   log "Checking worker-pool timeseries endpoint"
-  curl -fsS "${base_url}/monitoring/worker-pools/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300" \
-    | jq -e '.series != null' >/dev/null
+  curl_json_with_retries "${base_url}/monitoring/worker-pools/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300" '.series != null' \
+    || die "Worker-pool timeseries endpoint check failed"
 
   log "Checking latency SLI timeseries endpoint"
-  curl -fsS "${base_url}/monitoring/latency-sli/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300" \
-    | jq -e '.series != null' >/dev/null
+  curl_json_with_retries "${base_url}/monitoring/latency-sli/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300" '.series != null' \
+    || die "Latency SLI timeseries endpoint check failed"
 }
 
 check_prometheus_query() {
