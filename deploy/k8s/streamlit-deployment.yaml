@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-mission-intelligence-streamlit
+  labels:
+    app.kubernetes.io/name: nasa-mission-intelligence-streamlit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nasa-mission-intelligence-streamlit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nasa-mission-intelligence-streamlit
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: wait-for-collection
+        image: nasa-mission-intelligence-api:latest
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "python", "-c"]
+        args:
+        - |
+          import chromadb, sys, time
+          from chromadb.config import Settings
+          path = "/app/chroma_db_openai"
+          collection = "nasa_space_missions_text"
+          for attempt in range(60):
+              try:
+                  client = chromadb.PersistentClient(path, settings=Settings(anonymized_telemetry=False))
+                  if any(x.name == collection for x in client.list_collections()):
+                      print(f"Collection {collection!r} ready after {attempt * 10}s")
+                      sys.exit(0)
+                  print(f"Attempt {attempt + 1}/60: collection not yet present, retrying in 10s")
+              except Exception as exc:
+                  print(f"Attempt {attempt + 1}/60: {exc}, retrying in 10s")
+              time.sleep(10)
+          print("TIMEOUT: collection never became ready after 600s")
+          sys.exit(1)
+        env:
+        - name: OTEL_SDK_DISABLED
+          value: "true"
+        volumeMounts:
+        - name: chroma-storage
+          mountPath: /app/chroma_db
+          subPath: chroma_db
+        - name: chroma-storage
+          mountPath: /app/chroma_db_openai
+          subPath: chroma_db_openai
+      containers:
+      - name: streamlit
+        image: nasa-mission-intelligence-api:latest
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "streamlit", "run", "chat.py"]
+        args:
+        - "--server.address=0.0.0.0"
+        - "--server.port=8501"
+        - "--browser.gatherUsageStats=false"
+        ports:
+        - name: http
+          containerPort: 8501
+        env:
+        - name: API_BASE_URL
+          value: "http://nasa-mission-intelligence-api:8000"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nasa-openai
+              key: OPENAI_API_KEY
+              optional: true
+        - name: CHROMA_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nasa-openai
+              key: OPENAI_API_KEY
+              optional: true
+        - name: OPENAI_BASE_URL
+          value: "https://openai.vocareum.com/v1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: OTEL_SDK_DISABLED
+          value: "true"
+        volumeMounts:
+        - name: chroma-storage
+          mountPath: /app/chroma_db
+          subPath: chroma_db
+        - name: chroma-storage
+          mountPath: /app/chroma_db_openai
+          subPath: chroma_db_openai
+        livenessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 12
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1024Mi"
+      volumes:
+      - name: chroma-storage
+        persistentVolumeClaim:
+          claimName: nasa-chroma-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nasa-mission-intelligence-streamlit
+  labels:
+    app.kubernetes.io/name: nasa-mission-intelligence-streamlit
+spec:
+  selector:
+    app.kubernetes.io/name: nasa-mission-intelligence-streamlit
+  ports:
+  - name: http
+    port: 8501
+    targetPort: http

@@ -10,6 +10,7 @@ import streamlit as st
 import os
 import json
 import time
+from urllib.parse import urlparse
 from urllib import error, request as urllib_request
 
 from env_utils import load_project_env
@@ -28,6 +29,94 @@ load_project_env(__file__)
 
 _EVAL_POLL_INTERVAL_SECONDS = 1.0
 _EVAL_PENDING_TIMEOUT_SECONDS = 90.0
+
+
+def _is_kubernetes_runtime() -> bool:
+    """Return True when running inside a Kubernetes pod."""
+    return bool(os.getenv("KUBERNETES_SERVICE_HOST"))
+
+
+def _default_api_base_url() -> str:
+    """Choose a practical API base URL for local vs Kubernetes runtime."""
+    configured = (os.getenv("API_BASE_URL") or "").strip()
+    if configured:
+        return configured
+    if _is_kubernetes_runtime():
+        # In-cluster, localhost points to the Streamlit pod itself.
+        return "http://nasa-mission-intelligence-api:8000"
+    return "http://localhost:8000"
+
+
+def _kubernetes_namespace() -> str:
+    """Best-effort namespace discovery for in-cluster service DNS."""
+    env_namespace = (os.getenv("POD_NAMESPACE") or "").strip()
+    if env_namespace:
+        return env_namespace
+    namespace_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    try:
+        with open(namespace_file, "r", encoding="utf-8") as handle:
+            discovered = handle.read().strip()
+            if discovered:
+                return discovered
+    except Exception:
+        pass
+    return "default"
+
+
+def _candidate_api_base_urls(api_base_url: str) -> List[str]:
+    """Build ordered candidate API base URLs with K8s-aware fallbacks."""
+    seen: set[str] = set()
+    candidates: List[str] = []
+
+    primary = (api_base_url or "").strip().rstrip("/")
+    parsed_primary = urlparse(primary)
+    primary_host = (parsed_primary.hostname or "").lower()
+    primary_is_localhost = primary_host in {"localhost", "127.0.0.1"}
+
+    # In Kubernetes, try stable in-cluster service endpoints before localhost.
+    append_primary_first = not (_is_kubernetes_runtime() and primary_is_localhost)
+    if primary and append_primary_first:
+        seen.add(primary)
+        candidates.append(primary)
+
+    if _is_kubernetes_runtime():
+        namespace = _kubernetes_namespace()
+        in_cluster = [
+            "http://nasa-mission-intelligence-api:8000",
+            f"http://nasa-mission-intelligence-api.{namespace}.svc.cluster.local:8000",
+            "http://nasa-mission-intelligence-api.default.svc.cluster.local:8000",
+        ]
+        for candidate in in_cluster:
+            candidate = candidate.rstrip("/")
+            if candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+
+    if primary and not append_primary_first:
+        seen.add(primary)
+        candidates.append(primary)
+
+    parsed = urlparse(primary)
+    if parsed.scheme and parsed.hostname in {"localhost", "127.0.0.1"}:
+        # Developer convenience fallback for containerized local Streamlit.
+        host_bridge = f"{parsed.scheme}://host.docker.internal:{parsed.port or 8000}"
+        if host_bridge not in seen:
+            seen.add(host_bridge)
+            candidates.append(host_bridge)
+
+    if not candidates:
+        candidates.append(_default_api_base_url().rstrip("/"))
+
+    return candidates
+
+
+def _should_try_next_candidate_on_http_error(base_url: str, status_code: int) -> bool:
+    """Return True when current endpoint likely isn't the intended API target."""
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    if _is_kubernetes_runtime() and host in {"localhost", "127.0.0.1"}:
+        return True
+    return status_code in {404, 502, 503, 504}
 
 st.set_page_config(
     page_title="NASA RAG Chat with Evaluation",
@@ -133,8 +222,20 @@ def _set_cached_response(
             "judge": response.get("judge", {}),
             "evaluation": evaluation_payload,
             "backend": response.get("backend", ""),
+            "api_base_url_used": response.get("api_base_url_used", ""),
             "cached": True,
         }
+
+
+def _render_request_route_debug(meta: Dict[str, object], execution_mode: str) -> None:
+    """Show a compact debug line with the effective request route."""
+    if execution_mode != "API (/chat)":
+        st.caption("Request Route: local://legacy")
+        return
+
+    api_base_used = str(meta.get("api_base_url_used") or "").strip() or "unknown"
+    cache_note = " | source=session-cache" if bool(meta.get("cached", False)) else ""
+    st.caption(f"Request Route: {api_base_used}{cache_note}")
 
 def call_chat_api(
     api_base_url: str,
@@ -144,38 +245,63 @@ def call_chat_api(
     retry_backoff_seconds: float = 0.35,
 ) -> Dict:
     """Send one chat turn to FastAPI /chat with bounded retry for transient failures."""
-    endpoint = f"{api_base_url.rstrip('/')}/chat"
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
-    for attempt in range(retries + 1):
-        req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
-        try:
-            with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
-                data = response.read().decode("utf-8")
-                return json.loads(data) if data else {}
-        except error.HTTPError as http_error:
-            details = ""
+    last_network_error = ""
+    last_http_error: Dict[str, object] | None = None
+    candidates = _candidate_api_base_urls(api_base_url)
+    for idx, base_url in enumerate(candidates):
+        endpoint = f"{base_url}/chat"
+        for attempt in range(retries + 1):
+            req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
             try:
-                details = http_error.read().decode("utf-8")
-            except Exception:
-                details = str(http_error)
-            return {
-                "error": f"API error {http_error.code}: {details or str(http_error)}",
-                "status_code": http_error.code,
-            }
-        except (error.URLError, TimeoutError) as network_error:
-            if attempt >= retries:
-                return {"error": f"Network error calling /chat: {network_error}"}
-            time.sleep(retry_backoff_seconds * (attempt + 1))
-        except json.JSONDecodeError as decode_error:
-            return {"error": f"Invalid JSON from /chat: {decode_error}"}
-        except Exception as request_error:
-            return {"error": f"Unexpected API call failure: {request_error}"}
+                with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
+                    data = response.read().decode("utf-8")
+                    result = json.loads(data) if data else {}
+                    if isinstance(result, dict):
+                        result.setdefault("api_base_url_used", base_url)
+                    return result
+            except error.HTTPError as http_error:
+                details = ""
+                try:
+                    details = http_error.read().decode("utf-8")
+                except Exception:
+                    details = str(http_error)
+                last_http_error = {
+                    "error": f"API error {http_error.code}: {details or str(http_error)}",
+                    "status_code": http_error.code,
+                    "api_base_url_used": base_url,
+                }
+                has_next = idx < (len(candidates) - 1)
+                if has_next and _should_try_next_candidate_on_http_error(base_url, int(http_error.code)):
+                    break
+                return last_http_error
+            except (error.URLError, TimeoutError) as network_error:
+                last_network_error = str(network_error)
+                if attempt < retries:
+                    time.sleep(retry_backoff_seconds * (attempt + 1))
+                    continue
+                # Try next candidate base URL after exhausting retries on this one.
+                break
+            except json.JSONDecodeError as decode_error:
+                return {
+                    "error": f"Invalid JSON from /chat: {decode_error}",
+                    "api_base_url_used": base_url,
+                }
+            except Exception as request_error:
+                return {
+                    "error": f"Unexpected API call failure: {request_error}",
+                    "api_base_url_used": base_url,
+                }
 
+    if last_http_error:
+        return last_http_error
+    if last_network_error:
+        return {"error": f"Network error calling /chat: {last_network_error}"}
     return {"error": "Unknown failure calling /chat"}
 
 
@@ -185,17 +311,22 @@ def call_evaluation_job_api(
     timeout_seconds: float = 2.0,
 ) -> Dict:
     """Fetch one async evaluation job result from FastAPI."""
-    endpoint = f"{api_base_url.rstrip('/')}/evaluation/{job_id}"
     headers = {
         "Accept": "application/json",
     }
-    req = urllib_request.Request(endpoint, headers=headers, method="GET")
-    try:
-        with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
-            data = response.read().decode("utf-8")
-            return json.loads(data) if data else {}
-    except Exception:
-        return {}
+    for base_url in _candidate_api_base_urls(api_base_url):
+        endpoint = f"{base_url}/evaluation/{job_id}"
+        req = urllib_request.Request(endpoint, headers=headers, method="GET")
+        try:
+            with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
+                data = response.read().decode("utf-8")
+                payload = json.loads(data) if data else {}
+                if isinstance(payload, dict):
+                    payload.setdefault("api_base_url_used", base_url)
+                return payload
+        except Exception:
+            continue
+    return {}
 
 
 def run_local_chat_turn(
@@ -274,6 +405,7 @@ def run_local_chat_turn(
         },
         "latency_ms": (time.perf_counter() - started) * 1000.0,
         "backend": backend_name,
+        "api_base_url_used": "local://legacy",
     }
 
 
@@ -370,7 +502,7 @@ def main():
         )
         api_base_url = st.text_input(
             "API Base URL",
-            value=os.getenv("API_BASE_URL", "http://localhost:8000"),
+            value=_default_api_base_url(),
             help="FastAPI server base URL used by Streamlit for /chat requests",
         ).strip() or "http://localhost:8000"
         api_timeout_seconds = st.slider("API timeout (seconds)", 5, 60, 25)
@@ -508,6 +640,7 @@ def main():
                 st.caption(
                     f"Latency: {latency_text}{cache_indicator} | Backend: {backend} | Judge: {judge_text} ({judge_source})"
                 )
+                _render_request_route_debug(meta, execution_mode)
     
     if prompt := st.chat_input("Ask about NASA space missions..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -550,6 +683,7 @@ def main():
                             "latency_ms": cached_result.get("latency_ms", 0.0),
                             "backend": cached_result.get("backend", backend_key),
                             "judge": cached_result.get("judge", {}),
+                            "api_base_url_used": cached_result.get("api_base_url_used", ""),
                             "cached_from_session": True,  # Flag for monitoring
                             "evaluation": cached_result.get("evaluation", {}),
                         }
@@ -591,11 +725,9 @@ def main():
                     retryable_network_error = bool(error_text) and (
                         "network error" in error_text.lower() or "timed out" in error_text.lower()
                     )
-                    timeout_or_retryable_error = retryable_http_error or retryable_network_error or (
-                        isinstance(result.get("answer"), str)
-                        and "timed out" in result.get("answer", "").lower()
-                    )
+                    timeout_or_retryable_error = retryable_http_error or retryable_network_error
                     if timeout_or_retryable_error and fallback_to_local and not result.get("cached_from_session"):
+                        prior_api_base = str(result.get("api_base_url_used", "")).strip()
                         st.info("API path degraded. Retrying with Local legacy mode...")
                         result = run_local_chat_turn(
                             prompt=prompt,
@@ -606,6 +738,8 @@ def main():
                             enable_evaluation=bool(enable_evaluation),
                             conversation_history=conversation_history_api,
                         )
+                        if prior_api_base:
+                            result["api_base_url_used"] = f"local://legacy (fallback from {prior_api_base})"
 
                 if result.get("error"):
                     response = f"Error: {result['error']}"
@@ -615,6 +749,7 @@ def main():
                         "latency_ms": result.get("latency_ms"),
                         "backend": result.get("backend", "n/a"),
                         "judge": result.get("judge") if isinstance(result.get("judge"), dict) else {},
+                        "api_base_url_used": result.get("api_base_url_used", ""),
                         "cached": False,
                     }
                 else:
@@ -626,6 +761,7 @@ def main():
                         "latency_ms": result.get("latency_ms"),
                         "backend": result.get("backend", "unknown"),
                         "judge": result.get("judge") if isinstance(result.get("judge"), dict) else {},
+                        "api_base_url_used": result.get("api_base_url_used", ""),
                         "cached": is_session_cached,
                     }
 
@@ -659,6 +795,8 @@ def main():
                         st.caption(
                             f"Latency: {latency_text}{cache_indicator} | Backend: {backend_value} | Judge: {confidence} ({source})"
                         )
+
+                    _render_request_route_debug(response_meta, execution_mode)
 
                 st.markdown(response)
         

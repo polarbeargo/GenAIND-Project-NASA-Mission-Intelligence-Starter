@@ -7,9 +7,13 @@ DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-nasa-mission-intelligence-api}"
 HPA_NAME="${HPA_NAME:-nasa-mission-intelligence-api}"
 KUBE_PROM_STACK_RELEASE="${KUBE_PROM_STACK_RELEASE:-kube-prometheus-stack}"
 PROMETHEUS_SERVICE_NAME="${PROMETHEUS_SERVICE_NAME:-${KUBE_PROM_STACK_RELEASE}-prometheus}"
+STREAMLIT_DEPLOYMENT_NAME="${STREAMLIT_DEPLOYMENT_NAME:-nasa-mission-intelligence-streamlit}"
+STREAMLIT_SERVICE_NAME="${STREAMLIT_SERVICE_NAME:-nasa-mission-intelligence-streamlit}"
+ENABLE_STREAMLIT_CHECKS="${ENABLE_STREAMLIT_CHECKS:-false}"
 
 API_LOCAL_PORT="${API_LOCAL_PORT:-18000}"
 PROM_LOCAL_PORT="${PROM_LOCAL_PORT:-19090}"
+STREAMLIT_LOCAL_PORT="${STREAMLIT_LOCAL_PORT:-18501}"
 
 READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-180}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
@@ -167,7 +171,7 @@ check_api_observability_endpoints() {
     || die "API endpoint did not become reachable via port-forward: ${base_url}"
 
   log "Checking worker-pool series endpoint"
-  curl_json_with_retries "${base_url}/monitoring/worker-pools/series" '.stages and (.stages | length) > 0' \
+  curl_json_with_retries "${base_url}/monitoring/worker-pools/series" '((.series // .stages // []) | length) > 0' \
     || die "Worker-pool series endpoint check failed"
 
   log "Checking worker-pool timeseries endpoint"
@@ -185,6 +189,28 @@ check_prometheus_query() {
   log "Checking Prometheus query for worker-pool utilization"
   curl -fsS "${prom_url}/api/v1/query?query=nasa_worker_pool_utilization_ratio" \
     | jq -e '.status == "success" and (.data.result | type == "array")' >/dev/null
+}
+
+check_streamlit_health() {
+  local base_url="http://127.0.0.1:${STREAMLIT_LOCAL_PORT}"
+  local health_url="${base_url}/_stcore/health"
+  local attempts="${HTTP_RETRY_ATTEMPTS}"
+  local delay_seconds="${HTTP_RETRY_DELAY_SECONDS}"
+
+  wait_for_http_ready "${health_url}" \
+    || die "Streamlit health endpoint did not become reachable via port-forward: ${base_url}"
+
+  log "Checking Streamlit health endpoint"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    local body
+    body="$(curl -fsS --max-time 10 "${health_url}" || true)"
+    if [[ "${body}" == "ok" || "${body}" == *"\"status\":\"ok\""* || "${body}" == *"\"status\": \"ok\""* ]]; then
+      return 0
+    fi
+    sleep "${delay_seconds}"
+  done
+
+  die "Streamlit health endpoint returned unexpected payload"
 }
 
 wait_for_hpa_current_metrics() {
@@ -243,6 +269,19 @@ main() {
     check_prometheus_query || die "Prometheus query check failed"
   else
     die "Prometheus service ${PROMETHEUS_SERVICE_NAME} not found in namespace ${MONITORING_NAMESPACE}"
+  fi
+
+  if [[ "${ENABLE_STREAMLIT_CHECKS}" == "true" ]]; then
+    if kubectl get deployment "${STREAMLIT_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" >/dev/null 2>&1; then
+      log "Waiting for Streamlit deployment readiness"
+      kubectl rollout status deployment/"${STREAMLIT_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+
+      log "Port-forwarding Streamlit service for UI health check"
+      start_port_forward "${APP_NAMESPACE}" "svc/${STREAMLIT_SERVICE_NAME}" "${STREAMLIT_LOCAL_PORT}" "8501" "/tmp/nasa-streamlit-port-forward.log"
+      check_streamlit_health || die "Streamlit health checks failed"
+    else
+      die "Streamlit deployment ${STREAMLIT_DEPLOYMENT_NAME} not found in namespace ${APP_NAMESPACE} while ENABLE_STREAMLIT_CHECKS=true"
+    fi
   fi
 
   log "All custom metrics, HPA, and observability smoke checks passed"
