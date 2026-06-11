@@ -7,9 +7,9 @@ This system is a **multi-agent RAG (Retrieval-Augmented Generation) pipeline** b
 ## Getting Started
 
 ### Prerequisites
-- Python 3.8+
+- Python 3.10+
 - uv
-- OpenAI API key
+- OpenAI-compatible API key in one of these env vars: `OPENAI_API_KEY` (preferred) or `CHROMA_OPENAI_API_KEY` (fallback)
 
 
 ### Installation
@@ -86,34 +86,7 @@ Throughput guardrail: when `EVALUATION_LOCAL_FALLBACK_ENABLED=false`, ensure asy
 
 ### **Integration Testing**
 
-
-   ```bash
-   # Run embedding pipeline (configurable CLI)
-   uv run python embedding_pipeline.py --data-path ./data_text --chroma-dir ./chroma_db_openai --collection-name nasa_space_missions_text
-
-   # Run quick embedding setup (one-command defaults)
-   uv run python setup_embeddings.py
-
-   # Start Phoenix observability server
-   uv run python -m phoenix.server.main serve
-
-   # Start NASA FastAPI server
-   uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
-
-   # Start async evaluation worker (required when EVALUATION_MODE=async and broker is enabled)
-   uv run python evaluation_worker.py
-
-   # Run all unittest test files
-   uv run python -m unittest discover -s test -p 'test_*.py' -v
-   
-   # Run all pytest-based tests 
-   uv run pytest test/ -v 2>&1
-
-   # Launch chat interface
-   uv run streamlit run chat.py
-   ```
-
-   Usage note: run this in a separate terminal alongside the API server so queued evaluation jobs are consumed and `/evaluation/{job_id}` can transition from `pending` to `completed`.
+See [Integration Testing Runbook](doc/integration-testing.md).
 
 ### Embedding with `uv run`
 
@@ -271,52 +244,40 @@ Monitor with: `curl http://localhost:8000/monitoring/latency-sli`
 
 **For detailed tuning profiles and tradeoff analysis**, see [HYBRID_RETRIEVAL_TUNING.md](HYBRID_RETRIEVAL_TUNING.md) for High-Throughput and High-Quality profile options.
 
-## Kubernetes Custom Metrics Quick Runbook
+## Kubernetes Runbooks
 
-If use the provided Kubernetes autoscaling manifests, run this once so HPA can read worker-pool custom metrics end-to-end.
+Use the provided Kubernetes runbooks when you want a production-like cluster setup with worker-pool custom metrics end to end.
 
+Runbooks:
 
-### Automated setup (recommended)
+- [Automated custom-metrics setup](doc/kubernetes-custom-metrics-automated-setup.md)
+- [Opt-in tracing profile (Phoenix/OTLP)](doc/kubernetes-custom-metrics-automated-setup.md#opt-in-tracing-profile-phoenixotlp)
+- [Production parity setup (API + Streamlit + HPA)](doc/kubernetes-custom-metrics-automated-setup.md#automated-setup-production-parity-api--streamlit--hpa)
+- [Full RAG in Kubernetes (PVC-backed Chroma)](doc/kubernetes-custom-metrics-automated-setup.md#full-rag-in-kubernetes-pvc-backed-chroma-production-pattern)
+- [Streamlit in Kubernetes](doc/kubernetes-custom-metrics-automated-setup.md#streamlit-in-kubernetes)
+- [Troubleshoot Image Drift](doc/kubernetes-custom-metrics-automated-setup.md#troubleshoot-image-drift)
 
-Use the bootstrap script to install/update Prometheus stack + Adapter, apply canonical API deployment/service + ServiceMonitor + HPA, then run smoke checks.
-
-Default one-command flow:
-
-```bash
-./scripts/setup-k8s-custom-metrics.sh
-```
-
-By default this applies [deploy/k8s/api-deployment.yaml](deploy/k8s/api-deployment.yaml).
+Quick start: build the local Minikube image first, then run production parity setup. After local code changes, use `rebuild-k8s-image-and-restart.sh` to avoid image drift.
 
 ```bash
-# Optional: override with a custom API manifest.
-API_MANIFEST_PATH=deploy/k8s/your-api-manifest.yaml ./scripts/setup-k8s-custom-metrics.sh
+eval "$(minikube docker-env)"
+docker build -t nasa-mission-intelligence-api:latest .
+./scripts/setup-k8s-production-parity.sh
 ```
 
-Run smoke checks only (custom metrics API, metric payloads, HPA current metrics, Latency SLI and Worker Pool observability endpoints, Prometheus query parity):
-
-```bash
-./scripts/smoke-k8s-custom-metrics.sh
-```
-
-Optional overrides:
-
-```bash
-APP_NAMESPACE=default \
-MONITORING_NAMESPACE=monitoring \
-DEPLOYMENT_NAME=nasa-mission-intelligence-api \
-HPA_NAME=nasa-mission-intelligence-api \
-./scripts/smoke-k8s-custom-metrics.sh
-```
-
-- User Manual: [doc/kubernetes-custom-metrics-user-manual.md](doc/kubernetes-custom-metrics-user-manual.md)
-- Fast troubleshooting guide: [doc/kubernetes-custom-metrics-fast-failure-checklist.md](doc/kubernetes-custom-metrics-fast-failure-checklist.md)
+![Rebuild and restart flow](images/rebuilt-restart.png)
 
 ## Latency SLI Usage
 
-1. Start API:
+1. Start API locally, or use the Kubernetes API via port-forward:
    ```bash
    uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
+   ```
+   Or, if you are using the Kubernetes deployment:
+   ```bash
+   kubectl port-forward -n default svc/nasa-mission-intelligence-streamlit 8501:8501
+
+   kubectl port-forward deploy/nasa-mission-intelligence-api 8000:8000 -n default
    ```
 2. Start Grafana (Docker with Infinity plugin):
    ```bash
