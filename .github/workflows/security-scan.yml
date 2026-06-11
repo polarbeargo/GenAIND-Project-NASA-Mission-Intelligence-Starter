@@ -261,8 +261,8 @@ jobs:
 
           print(f"Informational full-environment vulnerabilities: {vulnerabilities}")
 
-            summary_target = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
-            if summary_target:
+          summary_target = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
+          if summary_target:
               github_summary = Path(summary_target)
               with github_summary.open('a', encoding='utf-8') as handle:
                   handle.write("\n## Informational Full-Environment Dependency Audit\n")
@@ -292,39 +292,39 @@ jobs:
                   continue
               py_files.append(file_path)
           
-            # Check 1: LLM01 - Prompt Injection defenses are wired in runtime path.
-            print("\n✓ LLM01: Checking prompt-injection defenses are wired...")
-            workers_path = Path('multi_agent/workers.py')
-            workers_content = workers_path.read_text(encoding='utf-8', errors='ignore') if workers_path.exists() else ''
-            if 'prompt_injection_detector.detect_injection' not in workers_content:
+          # Check 1: LLM01 - Prompt Injection defenses are wired in runtime path.
+          print("\n✓ LLM01: Checking prompt-injection defenses are wired...")
+          workers_path = Path('multi_agent/workers.py')
+          workers_content = workers_path.read_text(encoding='utf-8', errors='ignore') if workers_path.exists() else ''
+          if 'prompt_injection_detector.detect_injection' not in workers_content:
               findings.append({
-                'vuln': 'LLM01',
-                'file': 'multi_agent/workers.py',
-                'issue': 'Prompt injection detector call not found in preflight',
-                'severity': 'HIGH'
+                  'vuln': 'LLM01',
+                  'file': 'multi_agent/workers.py',
+                  'issue': 'Prompt injection detector call not found in preflight',
+                  'severity': 'HIGH'
               })
-          
-            # Check 2: LLM02 - detect likely hardcoded secrets (high-confidence literals only).
-            print("✓ LLM02: Checking for likely hardcoded secrets...")
-            secret_literal_patterns = [
+
+          # Check 2: LLM02 - detect likely hardcoded secrets (high-confidence literals only).
+          print("✓ LLM02: Checking for likely hardcoded secrets...")
+          secret_literal_patterns = [
               r'(?i)(api[_-]?key|token|password)\s*=\s*["\'][A-Za-z0-9_\-]{20,}["\']',
               r'(?i)\bsk-[A-Za-z0-9]{20,}\b',
               r'(?i)\bghp_[A-Za-z0-9]{20,}\b',
-            ]
-            for py_file in py_files:
+          ]
+          for py_file in py_files:
               for i, line in enumerate(py_file.read_text(encoding='utf-8', errors='ignore').splitlines(), 1):
-                normalized = line.strip()
-                if not normalized or 'os.getenv(' in normalized or 'get_openai_api_key(' in normalized:
-                  continue
-                for pattern in secret_literal_patterns:
-                  if re.search(pattern, normalized):
-                    findings.append({
-                      'vuln': 'LLM02',
-                      'file': f'{py_file}:{i}',
-                      'issue': f'Likely hardcoded secret literal: {normalized[:80]}',
-                      'severity': 'HIGH'
-                    })
-                    break
+                  normalized = line.strip()
+                  if not normalized or 'os.getenv(' in normalized or 'get_openai_api_key(' in normalized:
+                      continue
+                  for pattern in secret_literal_patterns:
+                      if re.search(pattern, normalized):
+                          findings.append({
+                              'vuln': 'LLM02',
+                              'file': f'{py_file}:{i}',
+                              'issue': f'Likely hardcoded secret literal: {normalized[:80]}',
+                              'severity': 'HIGH'
+                          })
+                          break
           
           # Check 3: LLM07 - System Prompt Protection
           print("✓ LLM07: Verifying system prompt contains security constraints...")
@@ -352,14 +352,14 @@ jobs:
                   'severity': 'MEDIUM'
               })
 
-            # Check 5: LLM08 - Vector and embedding validation
-            print("✓ LLM08: Verifying vector source validation is implemented...")
-            if 'validate_embedding_source' not in workers_content:
+          # Check 5: LLM08 - Vector and embedding validation
+          print("✓ LLM08: Verifying vector source validation is implemented...")
+          if 'validate_embedding_source' not in workers_content:
               findings.append({
-                'vuln': 'LLM08',
-                'file': 'multi_agent/workers.py',
-                'issue': 'Vector source validation not found in preflight',
-                'severity': 'HIGH'
+                  'vuln': 'LLM08',
+                  'file': 'multi_agent/workers.py',
+                  'issue': 'Vector source validation not found in preflight',
+                  'severity': 'HIGH'
               })
           
           # Summary
