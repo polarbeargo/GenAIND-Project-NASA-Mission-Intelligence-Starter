@@ -16,6 +16,10 @@ STREAMLIT_HPA_PATH="${STREAMLIT_HPA_PATH:-${ROOT_DIR}/deploy/k8s/hpa-streamlit.y
 
 STREAMLIT_DEPLOYMENT_NAME="${STREAMLIT_DEPLOYMENT_NAME:-nasa-mission-intelligence-streamlit}"
 ENABLE_STREAMLIT_CHECKS="${ENABLE_STREAMLIT_CHECKS:-true}"
+ENABLE_TRACING_PROFILE="${ENABLE_TRACING_PROFILE:-false}"
+TRACING_PATCH_PATH="${TRACING_PATCH_PATH:-${ROOT_DIR}/deploy/k8s/api-tracing-opt-in-patch.yaml}"
+ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION:-false}"
+TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH:-${ROOT_DIR}/scripts/verify-k8s-tracing.sh}"
 
 log() {
   printf "[setup-k8s-production-parity] %s\n" "$*"
@@ -41,6 +45,12 @@ main() {
   ensure_file "${CHROMA_SEED_JOB_PATH}"
   ensure_file "${STREAMLIT_MANIFEST_PATH}"
   ensure_file "${STREAMLIT_HPA_PATH}"
+  if [[ "${ENABLE_TRACING_PROFILE}" == "true" ]]; then
+    ensure_file "${TRACING_PATCH_PATH}"
+    if [[ "${ENABLE_TRACING_VERIFICATION}" == "true" ]]; then
+      ensure_file "${TRACING_VERIFY_SCRIPT_PATH}"
+    fi
+  fi
 
   log "Current kube context: $(kubectl config current-context)"
 
@@ -60,6 +70,10 @@ main() {
   MONITORING_NAMESPACE="${MONITORING_NAMESPACE}" \
   DEPLOYMENT_NAME="${DEPLOYMENT_NAME}" \
   HPA_NAME="${HPA_NAME}" \
+  ENABLE_TRACING_PROFILE="${ENABLE_TRACING_PROFILE}" \
+  TRACING_PATCH_PATH="${TRACING_PATCH_PATH}" \
+  ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION}" \
+  TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH}" \
   "${SETUP_METRICS_SCRIPT_PATH}"
 
   log "Applying Streamlit deployment/service manifest: ${STREAMLIT_MANIFEST_PATH}"

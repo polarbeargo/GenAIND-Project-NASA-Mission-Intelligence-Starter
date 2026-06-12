@@ -1,0 +1,37 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        env:
+        # Enable OTEL SDK only when the tracing profile is explicitly applied.
+        - name: OTEL_SDK_DISABLED
+          value: "false"
+        # Prefer Phoenix endpoint when present; generic OTLP endpoint is fallback.
+        - name: PHOENIX_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: nasa-tracing
+              key: PHOENIX_ENDPOINT
+              optional: true
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: nasa-tracing
+              key: OTEL_EXPORTER_OTLP_ENDPOINT
+              optional: true
+        - name: PHOENIX_PROJECT_NAME
+          value: "nasa-mission-intelligence"
+        # Keep tracing overhead bounded under load.
+        - name: OTEL_TRACES_SAMPLE_RATE
+          value: "0.20"
+        - name: OTEL_BSP_MAX_QUEUE_SIZE
+          value: "1024"
+        - name: OTEL_BSP_MAX_EXPORT_BATCH_SIZE
+          value: "256"
+        - name: OTEL_BSP_SCHEDULE_DELAY_MS
+          value: "500"
+        - name: OTEL_BSP_EXPORT_TIMEOUT_MS
+          value: "30000"
+        - name: OTEL_OPENAI_HIDE_EMBEDDING_VECTORS
+          value: "true"

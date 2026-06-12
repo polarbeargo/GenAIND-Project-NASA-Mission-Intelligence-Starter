@@ -9,6 +9,10 @@ DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-nasa-mission-intelligence-api}"
 HPA_NAME="${HPA_NAME:-nasa-mission-intelligence-api}"
 KUBE_PROM_STACK_RELEASE="${KUBE_PROM_STACK_RELEASE:-kube-prometheus-stack}"
 ADAPTER_RELEASE="${ADAPTER_RELEASE:-prometheus-adapter}"
+ENABLE_TRACING_PROFILE="${ENABLE_TRACING_PROFILE:-false}"
+TRACING_PATCH_PATH="${TRACING_PATCH_PATH:-${ROOT_DIR}/deploy/k8s/api-tracing-opt-in-patch.yaml}"
+ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION:-false}"
+TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH:-${ROOT_DIR}/scripts/verify-k8s-tracing.sh}"
 
 API_MANIFEST_PATH="${API_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/api-deployment.yaml}"
 SERVICEMONITOR_PATH="${SERVICEMONITOR_PATH:-${ROOT_DIR}/deploy/k8s/servicemonitor-worker-pools.yaml}"
@@ -49,6 +53,12 @@ main() {
   ensure_file "${HPA_PATH}"
   ensure_file "${API_MANIFEST_PATH}"
   ensure_file "${SMOKE_SCRIPT_PATH}"
+  if [[ "${ENABLE_TRACING_PROFILE}" == "true" ]]; then
+    ensure_file "${TRACING_PATCH_PATH}"
+    if [[ "${ENABLE_TRACING_VERIFICATION}" == "true" ]]; then
+      ensure_file "${TRACING_VERIFY_SCRIPT_PATH}"
+    fi
+  fi
 
   log "Current kube context: $(kubectl config current-context)"
 
@@ -69,6 +79,13 @@ main() {
 
   wait_for_rollout
 
+  if [[ "${ENABLE_TRACING_PROFILE}" == "true" ]]; then
+    log "Applying opt-in tracing profile patch: ${TRACING_PATCH_PATH}"
+    kubectl patch deployment "${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
+      --type strategic --patch-file "${TRACING_PATCH_PATH}" >/dev/null
+    wait_for_rollout
+  fi
+
   log "Applying ServiceMonitor"
   kubectl apply -f "${SERVICEMONITOR_PATH}" >/dev/null
 
@@ -86,6 +103,13 @@ main() {
   DEPLOYMENT_NAME="${DEPLOYMENT_NAME}" \
   HPA_NAME="${HPA_NAME}" \
   "${SMOKE_SCRIPT_PATH}"
+
+  if [[ "${ENABLE_TRACING_PROFILE}" == "true" && "${ENABLE_TRACING_VERIFICATION}" == "true" ]]; then
+    log "Running tracing verification gate"
+    APP_NAMESPACE="${APP_NAMESPACE}" \
+    DEPLOYMENT_NAME="${DEPLOYMENT_NAME}" \
+    "${TRACING_VERIFY_SCRIPT_PATH}"
+  fi
 
   log "Automation complete. Custom metrics and HPA validation passed."
 }
