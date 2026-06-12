@@ -159,6 +159,7 @@ def init_telemetry(app: FastAPI, service_name: str = "nasa-rag-api"):
             resource=resource,
             sampler=ParentBased(TraceIdRatioBased(sample_ratio)),
         )
+        exporter = None
         _TELEMETRY_STATE["exporter"] = "phoenix"
         _TELEMETRY_STATE["endpoint"] = phoenix_endpoint
     elif chosen_endpoint and OTLPSpanExporter is not None:
