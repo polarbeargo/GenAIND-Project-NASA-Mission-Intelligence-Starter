@@ -199,8 +199,20 @@ jobs:
           PYTHON_SCRIPT
 
           echo "Running pip-audit..."
+          # Known unfixed CVEs (no upstream fix versions published yet).
+          # Keep this list short and remove entries as soon as patched releases exist.
+          KNOWN_UNFIXED_VULNS=(
+            "CVE-2026-45829"  # chromadb
+            "CVE-2026-6587"   # ragas
+            "CVE-2025-69872"  # diskcache (transitive)
+          )
+          IGNORE_ARGS=()
+          for vuln in "${KNOWN_UNFIXED_VULNS[@]}"; do
+            IGNORE_ARGS+=(--ignore-vuln "$vuln")
+          done
+
           set +e
-          pip-audit --requirement ci-runtime-requirements.txt --format json -o pip-audit-report.json
+          pip-audit --requirement ci-runtime-requirements.txt --format json -o pip-audit-report.json "${IGNORE_ARGS[@]}"
           STATUS=$?
           set -e
           if [ $STATUS -ne 0 ] && [ $STATUS -ne 1 ]; then
