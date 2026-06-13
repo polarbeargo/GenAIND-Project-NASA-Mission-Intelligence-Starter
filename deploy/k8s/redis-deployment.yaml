@@ -1,0 +1,102 @@
+# In-cluster Redis for async broker + job-store coordination.
+#
+# Architecture role:
+#   - Shared control plane for evaluation/judge broker streams and async job state.
+#   - Single-replica persistent Redis with PVC durability.
+#
+# Deployment suitability:
+#   - Recommended for local production-parity, staging, and small cluster testing.
+#   - Production-acceptable at current scale when you can tolerate brief recovery on pod/node failure
+#     and do not require automatic cross-zone failover.
+#   - Typical acceptable profile: modest traffic and evaluation worker scale up to ~10 replicas.
+#
+# Upgrade to managed HA Redis when:
+#   - You require automatic failover with stricter uptime/RTO goals.
+#   - You need multi-AZ durability, stronger auth/TLS posture, or higher sustained throughput.
+#
+# Notes:
+#   - This manifest is intended for internal cluster use only.
+#   - No password/auth is configured here; use external managed Redis for stricter production requirements.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nasa-redis-pvc
+  labels:
+    app.kubernetes.io/name: nasa-redis
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-redis
+  labels:
+    app.kubernetes.io/name: nasa-redis
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nasa-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nasa-redis
+        app.kubernetes.io/component: redis
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+        ports:
+        - name: redis
+          containerPort: 6379
+        livenessProbe:
+          tcpSocket:
+            port: redis
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 4
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: nasa-redis-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nasa-redis
+  labels:
+    app.kubernetes.io/name: nasa-redis
+spec:
+  selector:
+    app.kubernetes.io/name: nasa-redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis

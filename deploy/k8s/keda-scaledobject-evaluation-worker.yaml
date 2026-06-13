@@ -1,0 +1,55 @@
+# KEDA ScaledObject for Redis-Stream-Backed Evaluation Worker
+#
+# Architecture role:
+#   - Scales nasa-evaluation-worker deployment from eval:jobs Redis stream backlog depth
+#   - Independently from API/Streamlit HPA (which scales on request metrics)
+#   - Respects evaluation job arrival rate and processing latency
+#   - Scales down during idle to save compute
+#
+# Scaling behavior:
+#   - minReplicaCount: 1 (always at least one worker consuming from broker)
+#   - maxReplicaCount: 10 (cap to prevent resource exhaustion and cost explosion)
+#   - pendingEntriesCount: 5 (scale up when pending entries per replica > 5)
+#   - Scaler type: redis-streams (measures XPENDING consumer group lag, not LLEN)
+#
+# When to use:
+#   - Apply this ScaledObject only if ENABLE_EVALUATION_WORKER=true and Redis is available
+#   - KEDA >= 2.13 required for Redis stream triggers
+#   - Recommended for production where evaluation traffic is variable
+#
+# Thread-safety & reliability:
+#   - KEDA uses the same shared Redis client as the worker pods
+#   - No additional authentication or credential management needed
+#   - Failed scale operations do not block existing workers (best-effort scaling)
+#   - Scales independently from API/Streamlit, so one tier's traffic spike does not steal capacity
+#
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: nasa-evaluation-worker-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: nasa-evaluation-worker
+    kind: Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+  - type: redis-streams
+    metadata:
+      # redis-streams scaler: measures consumer group pending entry count (XPENDING).
+      # Must use redis-streams (not redis) since eval:jobs is a Redis Stream (XADD),
+      # not a List (LPUSH). Using redis would fail with "unsupported key type: stream".
+      # Full FQDN required: KEDA controller runs in keda namespace and cannot
+      # resolve short service names from other namespaces.
+      address: "nasa-redis.default.svc.cluster.local:6379"
+      stream: "eval:jobs"
+      consumerGroup: "eval-workers"
+      pendingEntriesCount: "5"  # Scale up when pending entries per replica > 5
+      databaseIndex: "0"
+      # If REDIS_PASSWORD is set, add: passwordFromEnv: REDIS_PASSWORD
+  # Optional: add CPU-based fallback to prevent sustained spike from being starved by KEDA only
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "75"  # If any worker hits 75% CPU, scale up even if backlog is low
