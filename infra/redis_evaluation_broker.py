@@ -164,3 +164,59 @@ class RedisEvaluationBroker:
         except Exception as error:
             logger.warning("Failed to ack evaluation message %s: %s", message_id, error)
             return False
+
+    def reclaim_stale(
+        self,
+        consumer_name: str,
+        min_idle_ms: int = 300_000,
+        count: int = 10,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Reclaim PEL entries idle longer than min_idle_ms (consumer-crash recovery).
+
+        Uses XAUTOCLAIM to atomically transfer stale pending messages to this
+        consumer so they are re-processed rather than stuck indefinitely.
+        Stale messages are re-delivered with an incremented _attempt counter so
+        existing retry/DLQ logic handles them identically to normal failures.
+        """
+        if not self._ensure_group():
+            return []
+        try:
+            result = self.redis._client.xautoclaim(
+                name=self.stream_name,
+                groupname=self.consumer_group,
+                consumername=consumer_name,
+                min_idle_time=max(1000, int(min_idle_ms)),
+                start_id="0-0",
+                count=max(1, int(count)),
+            )
+        except Exception as error:
+            logger.debug("XAUTOCLAIM not available or failed: %s", error)
+            return []
+
+        # xautoclaim returns (next_start_id, [(msg_id, fields), ...], [deleted_ids])
+        entries = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else []
+        messages: List[Tuple[str, Dict[str, Any]]] = []
+        for message_id, fields in entries or []:
+            payload_text = fields.get("payload") if isinstance(fields, dict) else None
+            if not payload_text:
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except Exception as decode_error:
+                payload = {
+                    "_decode_error": str(decode_error)[:160],
+                    "_raw_payload": str(payload_text)[:500],
+                }
+            if "job_id" not in payload and isinstance(fields, dict) and fields.get("job_id"):
+                payload["job_id"] = fields.get("job_id")
+            # Increment attempt so retry/DLQ budgets are respected correctly.
+            payload["_attempt"] = max(0, int(payload.get("_attempt", 0))) + 1
+            messages.append((message_id, payload))
+
+        if messages:
+            logger.info(
+                "Reclaimed %d stale evaluation PEL entries (min_idle=%dms)",
+                len(messages),
+                min_idle_ms,
+            )
+        return messages

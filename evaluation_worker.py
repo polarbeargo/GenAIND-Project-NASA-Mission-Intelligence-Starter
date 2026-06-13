@@ -275,6 +275,10 @@ def run() -> int:
     backoff_base = max(0.0, float(os.getenv("EVALUATION_WORKER_BACKOFF_BASE_SECONDS", "0.5")))
     backoff_max = max(backoff_base, float(os.getenv("EVALUATION_WORKER_BACKOFF_MAX_SECONDS", "8.0")))
     processing_ttl = max(30, int(os.getenv("EVALUATION_WORKER_PROCESSING_TTL_SECONDS", "300")))
+    reclaim_enabled = os.getenv("EVALUATION_WORKER_RECLAIM_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    reclaim_min_idle_ms = max(30_000, int(os.getenv("EVALUATION_WORKER_RECLAIM_MIN_IDLE_MS", "300000")))
+    reclaim_count = max(1, int(os.getenv("EVALUATION_WORKER_RECLAIM_COUNT", "10")))
+    reclaim_idle_cycles: int = 0
 
     consumer_name = _consumer_name()
     logger.info("Evaluation worker started as consumer=%s", consumer_name)
@@ -282,6 +286,29 @@ def run() -> int:
     while _RUNNING:
         messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=3000)
         if not messages:
+            # On idle, periodically reclaim stale PEL entries from crashed consumers.
+            if reclaim_enabled:
+                reclaim_idle_cycles += 1
+                if reclaim_idle_cycles >= 20:  # ~60 s at block_ms=3000
+                    reclaim_idle_cycles = 0
+                    stale = broker.reclaim_stale(
+                        consumer_name=consumer_name,
+                        min_idle_ms=reclaim_min_idle_ms,
+                        count=reclaim_count,
+                    )
+                    for s_id, s_payload in stale:
+                        _process_one_message(
+                            message_id=s_id,
+                            payload=s_payload,
+                            broker=broker,
+                            job_store=job_store,
+                            analysis_worker=analysis_worker,
+                            consumer_name=consumer_name,
+                            max_retries=max_retries,
+                            backoff_base=backoff_base,
+                            backoff_max=backoff_max,
+                            processing_ttl=processing_ttl,
+                        )
             continue
 
         for message_id, payload in messages:
@@ -304,3 +331,5 @@ def run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run())
+
+

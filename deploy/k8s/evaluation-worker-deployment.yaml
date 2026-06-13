@@ -1,0 +1,103 @@
+# Evaluation Worker Deployment
+#
+# Runs evaluation_worker.py as an independent scalable tier that consumes
+# async evaluation jobs from the Redis stream "eval:jobs".
+#
+# Architecture role:
+#   - Decouples heavy RAGAS scoring from the API/orchestrator request path.
+#   - Each replica is a named Redis consumer group member (hostname+PID),
+#     so jobs distribute automatically across replicas with no coordination code.
+#   - Scales independently from the API and Streamlit deployments.
+#   - SIGTERM → _RUNNING=False maps cleanly to Kubernetes pod termination.
+#
+# Required secret: nasa-openai (OPENAI_API_KEY)
+# Required infrastructure: Redis reachable via REDIS_HOST/REDIS_PORT.
+# The production-parity automation can provision an in-cluster nasa-redis service
+# automatically and inject those env vars into both API and worker deployments.
+#
+# Activate from API side:
+#   kubectl set env deploy/nasa-mission-intelligence-api \
+#     EVALUATION_BROKER_ENABLED=true \
+#     EVALUATION_LOCAL_FALLBACK_ENABLED=false
+#
+# Scale manually or via KEDA ScaledObject targeting "eval:jobs" stream length:
+#   kubectl scale deploy/nasa-evaluation-worker --replicas=3
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-evaluation-worker
+  labels:
+    app.kubernetes.io/name: nasa-evaluation-worker
+    app.kubernetes.io/component: evaluation-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nasa-evaluation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nasa-evaluation-worker
+        app.kubernetes.io/component: evaluation-worker
+    spec:
+      # Allow up to 60 s for in-flight evaluation jobs to complete before forced kill.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: worker
+        image: nasa-mission-intelligence-api:latest
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "python", "evaluation_worker.py"]
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nasa-openai
+              key: OPENAI_API_KEY
+              optional: true
+        - name: CHROMA_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nasa-openai
+              key: OPENAI_API_KEY
+              optional: true
+        - name: OPENAI_BASE_URL
+          value: "https://openai.vocareum.com/v1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        # Broker / job-store configuration — must match values used by the API.
+        - name: EVALUATION_BROKER_STREAM
+          value: "eval:jobs"
+        - name: EVALUATION_BROKER_GROUP
+          value: "eval-workers"
+        - name: EVALUATION_BROKER_DLQ_STREAM
+          value: "eval:jobs:dlq"
+        - name: ASYNC_JOB_RETENTION_SECONDS
+          value: "3600"
+        # Reliability knobs — tunable without image rebuild.
+        - name: EVALUATION_WORKER_MAX_RETRIES
+          value: "3"
+        - name: EVALUATION_WORKER_BACKOFF_BASE_SECONDS
+          value: "0.5"
+        - name: EVALUATION_WORKER_BACKOFF_MAX_SECONDS
+          value: "8.0"
+        - name: EVALUATION_WORKER_PROCESSING_TTL_SECONDS
+          value: "300"
+        # Stale-PEL (XAUTOCLAIM) reclaim — reclaims messages idle > 5 min.
+        - name: EVALUATION_WORKER_RECLAIM_ENABLED
+          value: "true"
+        - name: EVALUATION_WORKER_RECLAIM_MIN_IDLE_MS
+          value: "300000"
+        - name: EVALUATION_WORKER_RECLAIM_COUNT
+          value: "10"
+        # Suppress Phoenix OTLP noise when no collector is available.
+        - name: OTEL_SDK_DISABLED
+          value: "true"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1536Mi"
