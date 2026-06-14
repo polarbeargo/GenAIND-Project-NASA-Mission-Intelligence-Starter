@@ -1051,7 +1051,15 @@ class MultiAgentChatWorkflow:
             # Phase 2: try broker first; fall back to in-process executor.
             queued = self._judge_broker.enqueue(judge_job_id, enqueue_payload)
             judge_overloaded = False
-            if not queued:
+            use_local_fallback = not queued
+            if queued and not self._judge_broker.has_active_consumers(timeout_seconds=0.5):
+                logging.getLogger(__name__).warning(
+                    "Judge broker has no active consumers; running local async fallback for job %s",
+                    judge_job_id,
+                )
+                use_local_fallback = True
+
+            if use_local_fallback:
                 try:
                     self._judge_executor.submit(
                         self._run_async_judge,

@@ -72,6 +72,27 @@ class RedisJudgeBroker:
             logger.warning("Failed to enqueue judge job %s: %s", job_id, error)
             return False
 
+    def has_active_consumers(self, timeout_seconds: float = 0.0, poll_interval_seconds: float = 0.05) -> bool:
+        """Return True when at least one consumer is registered on the group."""
+        if not self._ensure_group():
+            return False
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        poll_interval = max(0.01, float(poll_interval_seconds))
+
+        while True:
+            try:
+                consumers = self.redis._client.xinfo_consumers(self.stream_name, self.consumer_group)
+                if consumers:
+                    return True
+            except Exception as error:
+                logger.debug("Failed to inspect judge consumers: %s", error)
+                return False
+
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_interval)
+
     def consume(
         self,
         consumer_name: str,

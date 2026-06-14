@@ -1,0 +1,31 @@
+# KEDA ScaledObject for Redis-Stream-Backed Judge Worker
+#
+# Architecture role:
+#   - Scales nasa-judge-worker deployment from judge:jobs Redis stream backlog depth
+#   - Independently from API/Streamlit HPA and evaluation worker KEDA scaler
+#   - Respects judge job arrival rate and scoring latency
+#   - Scales down during idle to save compute while keeping one warm consumer
+#
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: nasa-judge-worker-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: nasa-judge-worker
+    kind: Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+  - type: redis-streams
+    metadata:
+      address: "nasa-redis.default.svc.cluster.local:6379"
+      stream: "judge:jobs"
+      consumerGroup: "judge-workers"
+      pendingEntriesCount: "5"
+      databaseIndex: "0"
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "75"
