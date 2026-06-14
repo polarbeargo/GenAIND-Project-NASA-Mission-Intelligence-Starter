@@ -160,6 +160,48 @@ class TestAsyncJudgeFallback(unittest.TestCase):
         self.assertEqual(latest.get("job_id"), job_id)
         self.assertEqual(latest["judge"].get("source"), "llm")
 
+    def test_async_judge_falls_back_when_broker_has_no_consumers(self):
+        workflow = build_workflow(judge_broker_enabled=True)
+
+        workflow.retrieval_worker.run = MagicMock(
+            return_value=RetrievalResult(
+                contexts=["Apollo 13 experienced an oxygen tank explosion."],
+                metadatas=[{"mission": "apollo13"}],
+                context_text="Apollo 13 experienced an oxygen tank explosion.",
+            )
+        )
+        workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response=None)
+        )
+        workflow.analysis_worker.generate_answer = MagicMock(return_value="Apollo 13 had an oxygen tank explosion.")
+        workflow.safety_worker.postflight = MagicMock(
+            side_effect=lambda answer, contexts, client_ip: answer
+        )
+        workflow.judge_worker.judge = MagicMock(
+            return_value={
+                "groundedness_score": 0.81,
+                "safety_score": 0.91,
+                "task_success_score": 0.86,
+                "overall_score": 0.86,
+                "confidence": 0.9,
+                "passed": True,
+                "low_confidence": False,
+                "rationale": "no-consumer fallback",
+                "source": "llm",
+            }
+        )
+        workflow._judge_broker.enqueue = MagicMock(return_value=True)
+        workflow._judge_broker.has_active_consumers = MagicMock(return_value=False)
+        workflow._judge_executor.submit = lambda fn, *args: fn(*args)
+
+        result = workflow.run(make_input(), openai_key="fake-key")
+        self.assertEqual(result.judge.get("status"), "pending")
+        latest = workflow.get_last_judge_result()
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["judge"].get("source"), "llm")
+        workflow._judge_broker.enqueue.assert_called_once()
+        workflow._judge_broker.has_active_consumers.assert_called_once()
+
 
 @pytest.mark.redis
 class TestRedisJudgeIntegration(unittest.TestCase):
@@ -298,6 +340,23 @@ class TestRedisJudgeIntegration(unittest.TestCase):
         self.assertEqual(fields.get("reason"), "max_retries_exhausted")
         self.assertEqual(fields.get("attempt"), "2")
         self.assertEqual(fields.get("consumer"), "test-consumer")
+
+    def test_broker_reports_active_consumers(self):
+        stream_name = f"test:judge:jobs:{uuid.uuid4()}"
+        group_name = f"test-judge-workers-{uuid.uuid4().hex[:8]}"
+        broker = RedisJudgeBroker(
+            self.redis,
+            stream_name=stream_name,
+            consumer_group=group_name,
+            enabled=True,
+        )
+
+        self.assertTrue(broker.enqueue(f"job-{uuid.uuid4()}", {"question": "hello"}))
+        self.assertFalse(broker.has_active_consumers())
+        messages = broker.consume(consumer_name="test-consumer", count=1, block_ms=50)
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(broker.has_active_consumers())
+        broker.ack(messages[0][0])
 
     def test_broker_enabled_async_judge_end_to_end_with_external_worker_process(self):
         stream_name = f"test:judge:e2e:{uuid.uuid4()}"
