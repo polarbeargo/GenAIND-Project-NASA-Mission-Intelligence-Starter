@@ -14,14 +14,18 @@ CHROMA_SEED_JOB_PATH="${CHROMA_SEED_JOB_PATH:-${ROOT_DIR}/deploy/k8s/chroma-seed
 STREAMLIT_MANIFEST_PATH="${STREAMLIT_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/streamlit-deployment.yaml}"
 STREAMLIT_HPA_PATH="${STREAMLIT_HPA_PATH:-${ROOT_DIR}/deploy/k8s/hpa-streamlit.yaml}"
 EVALUATION_WORKER_MANIFEST_PATH="${EVALUATION_WORKER_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/evaluation-worker-deployment.yaml}"
+JUDGE_WORKER_MANIFEST_PATH="${JUDGE_WORKER_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/judge-worker-deployment.yaml}"
 REDIS_MANIFEST_PATH="${REDIS_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/redis-deployment.yaml}"
 KEDA_SCALER_PATH="${KEDA_SCALER_PATH:-${ROOT_DIR}/deploy/k8s/keda-scaledobject-evaluation-worker.yaml}"
+JUDGE_KEDA_SCALER_PATH="${JUDGE_KEDA_SCALER_PATH:-${ROOT_DIR}/deploy/k8s/keda-scaledobject-judge-worker.yaml}"
 
 STREAMLIT_DEPLOYMENT_NAME="${STREAMLIT_DEPLOYMENT_NAME:-nasa-mission-intelligence-streamlit}"
 EVALUATION_WORKER_DEPLOYMENT_NAME="${EVALUATION_WORKER_DEPLOYMENT_NAME:-nasa-evaluation-worker}"
+JUDGE_WORKER_DEPLOYMENT_NAME="${JUDGE_WORKER_DEPLOYMENT_NAME:-nasa-judge-worker}"
 REDIS_DEPLOYMENT_NAME="${REDIS_DEPLOYMENT_NAME:-nasa-redis}"
 ENABLE_STREAMLIT_CHECKS="${ENABLE_STREAMLIT_CHECKS:-true}"
 ENABLE_EVALUATION_WORKER="${ENABLE_EVALUATION_WORKER:-false}"
+ENABLE_JUDGE_WORKER="${ENABLE_JUDGE_WORKER:-false}"
 ENABLE_TRACING_PROFILE="${ENABLE_TRACING_PROFILE:-false}"
 TRACING_PATCH_PATH="${TRACING_PATCH_PATH:-${ROOT_DIR}/deploy/k8s/api-tracing-opt-in-patch.yaml}"
 ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION:-false}"
@@ -98,9 +102,11 @@ main() {
   ensure_file "${CHROMA_SEED_JOB_PATH}"
   ensure_file "${STREAMLIT_MANIFEST_PATH}"
   ensure_file "${STREAMLIT_HPA_PATH}"
-  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" ]]; then
+  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
     ensure_file "${EVALUATION_WORKER_MANIFEST_PATH}"
+    ensure_file "${JUDGE_WORKER_MANIFEST_PATH}"
     ensure_file "${KEDA_SCALER_PATH}"
+    ensure_file "${JUDGE_KEDA_SCALER_PATH}"
     if [[ -z "${REDIS_HOST}" ]]; then
       ensure_file "${REDIS_MANIFEST_PATH}"
       REDIS_ENABLED="true"
@@ -125,11 +131,11 @@ main() {
     install_metrics_server
   fi
 
-  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_KEDA}" == "true" ]]; then
+  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" || "${ENABLE_KEDA}" == "true" ]]; then
     install_keda
   fi
 
-  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" && "${REDIS_HOST}" == "nasa-redis" ]]; then
+  if [[ ( "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ) && "${REDIS_HOST}" == "nasa-redis" ]]; then
     log "Provisioning in-cluster Redis: ${REDIS_MANIFEST_PATH}"
     kubectl apply -f "${REDIS_MANIFEST_PATH}" >/dev/null
     log "Waiting for Redis rollout: ${REDIS_DEPLOYMENT_NAME}"
@@ -158,19 +164,25 @@ main() {
   TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH}" \
   "${SETUP_METRICS_SCRIPT_PATH}"
 
-  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" ]]; then
-    log "Enabling Redis-backed evaluation broker on API deployment"
+  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
+    log "Enabling Redis-backed broker configuration on API deployment"
     kubectl set env deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
       REDIS_ENABLED="${REDIS_ENABLED}" \
       REDIS_HOST="${REDIS_HOST}" \
       REDIS_PORT="${REDIS_PORT}" \
       REDIS_DB="${REDIS_DB}" \
-      EVALUATION_BROKER_ENABLED=true \
-      EVALUATION_LOCAL_FALLBACK_ENABLED=false >/dev/null
+      EVALUATION_BROKER_ENABLED="${ENABLE_EVALUATION_WORKER}" \
+      EVALUATION_LOCAL_FALLBACK_ENABLED="$([[ "${ENABLE_EVALUATION_WORKER}" == "true" ]] && printf 'false' || printf 'true')" \
+      JUDGE_BROKER_ENABLED="${ENABLE_JUDGE_WORKER}" >/dev/null
     if [[ -n "${REDIS_PASSWORD}" ]]; then
       kubectl set env deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" REDIS_PASSWORD="${REDIS_PASSWORD}" >/dev/null
     fi
 
+    log "Waiting for API rollout after broker env update: ${DEPLOYMENT_NAME}"
+    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+  fi
+
+  if [[ "${ENABLE_EVALUATION_WORKER}" == "true" ]]; then
     log "Applying evaluation worker deployment manifest: ${EVALUATION_WORKER_MANIFEST_PATH}"
     kubectl apply -f "${EVALUATION_WORKER_MANIFEST_PATH}" >/dev/null
     kubectl set env deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
@@ -182,14 +194,30 @@ main() {
       kubectl set env deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" REDIS_PASSWORD="${REDIS_PASSWORD}" >/dev/null
     fi
 
-    log "Waiting for API rollout after broker env update: ${DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
-
     log "Waiting for evaluation worker rollout: ${EVALUATION_WORKER_DEPLOYMENT_NAME}"
     kubectl rollout status deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
 
     log "Applying KEDA ScaledObject for evaluation worker auto-scaling: ${KEDA_SCALER_PATH}"
     kubectl apply -f "${KEDA_SCALER_PATH}" >/dev/null
+  fi
+
+  if [[ "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
+    log "Applying judge worker deployment manifest: ${JUDGE_WORKER_MANIFEST_PATH}"
+    kubectl apply -f "${JUDGE_WORKER_MANIFEST_PATH}" >/dev/null
+    kubectl set env deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
+      REDIS_ENABLED="${REDIS_ENABLED}" \
+      REDIS_HOST="${REDIS_HOST}" \
+      REDIS_PORT="${REDIS_PORT}" \
+      REDIS_DB="${REDIS_DB}" >/dev/null
+    if [[ -n "${REDIS_PASSWORD}" ]]; then
+      kubectl set env deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" REDIS_PASSWORD="${REDIS_PASSWORD}" >/dev/null
+    fi
+
+    log "Waiting for judge worker rollout: ${JUDGE_WORKER_DEPLOYMENT_NAME}"
+    kubectl rollout status deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+
+    log "Applying KEDA ScaledObject for judge worker auto-scaling: ${JUDGE_KEDA_SCALER_PATH}"
+    kubectl apply -f "${JUDGE_KEDA_SCALER_PATH}" >/dev/null
   fi
 
   log "Applying Streamlit deployment/service manifest: ${STREAMLIT_MANIFEST_PATH}"
