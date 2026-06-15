@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Any, Dict, List, Tuple
 
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class RedisEvaluationBroker:
         self.dead_letter_stream = dead_letter_stream or f"{stream_name}:dlq"
         self.enabled = bool(enabled)
         self._group_initialized = False
+        self._worker_label = "evaluation"
 
     def is_available(self) -> bool:
         return self.enabled and self.redis.is_available() and self.redis._client is not None
@@ -149,6 +151,7 @@ class RedisEvaluationBroker:
                 "payload": json.dumps(payload),
             }
             self.redis._client.xadd(self.dead_letter_stream, message)
+            get_async_reliability_metrics().record_dlq(worker=self._worker_label, reason=reason)
             return True
         except Exception as error:
             logger.warning("Failed to dead-letter evaluation message %s: %s", message_id, error)
@@ -214,6 +217,11 @@ class RedisEvaluationBroker:
             messages.append((message_id, payload))
 
         if messages:
+            get_async_reliability_metrics().record_reclaim(
+                worker=self._worker_label,
+                reclaimed_count=len(messages),
+                min_idle_ms=min_idle_ms,
+            )
             logger.info(
                 "Reclaimed %d stale evaluation PEL entries (min_idle=%dms)",
                 len(messages),

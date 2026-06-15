@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Any, Dict, List, Tuple
 
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class RedisJudgeBroker:
         self.dead_letter_stream = dead_letter_stream or f"{stream_name}:dlq"
         self.enabled = bool(enabled)
         self._group_initialized = False
+        self._worker_label = "judge"
 
     def is_available(self) -> bool:
         return self.enabled and self.redis.is_available() and self.redis._client is not None
@@ -158,6 +160,7 @@ class RedisJudgeBroker:
                 "payload": json.dumps(payload),
             }
             self.redis._client.xadd(self.dead_letter_stream, message)
+            get_async_reliability_metrics().record_dlq(worker=self._worker_label, reason=reason)
             return True
         except Exception as error:
             logger.warning("Failed to dead-letter judge message %s: %s", message_id, error)
@@ -173,3 +176,56 @@ class RedisJudgeBroker:
         except Exception as error:
             logger.warning("Failed to ack judge message %s: %s", message_id, error)
             return False
+
+    def reclaim_stale(
+        self,
+        consumer_name: str,
+        min_idle_ms: int = 300_000,
+        count: int = 10,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Reclaim PEL entries idle longer than min_idle_ms (consumer-crash recovery)."""
+        if not self._ensure_group():
+            return []
+        try:
+            result = self.redis._client.xautoclaim(
+                name=self.stream_name,
+                groupname=self.consumer_group,
+                consumername=consumer_name,
+                min_idle_time=max(1000, int(min_idle_ms)),
+                start_id="0-0",
+                count=max(1, int(count)),
+            )
+        except Exception as error:
+            logger.debug("XAUTOCLAIM not available or failed: %s", error)
+            return []
+
+        entries = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else []
+        messages: List[Tuple[str, Dict[str, Any]]] = []
+        for message_id, fields in entries or []:
+            payload_text = fields.get("payload") if isinstance(fields, dict) else None
+            if not payload_text:
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except Exception as decode_error:
+                payload = {
+                    "_decode_error": str(decode_error)[:160],
+                    "_raw_payload": str(payload_text)[:500],
+                }
+            if "job_id" not in payload and isinstance(fields, dict) and fields.get("job_id"):
+                payload["job_id"] = fields.get("job_id")
+            payload["_attempt"] = max(0, int(payload.get("_attempt", 0))) + 1
+            messages.append((message_id, payload))
+
+        if messages:
+            get_async_reliability_metrics().record_reclaim(
+                worker=self._worker_label,
+                reclaimed_count=len(messages),
+                min_idle_ms=min_idle_ms,
+            )
+            logger.info(
+                "Reclaimed %d stale judge PEL entries (min_idle=%dms)",
+                len(messages),
+                min_idle_ms,
+            )
+        return messages

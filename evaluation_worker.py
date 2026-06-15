@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict
 
 from env_utils import load_project_env
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import get_redis_client
 from infra.redis_evaluation_broker import RedisEvaluationBroker
 from infra.redis_job_store import RedisAsyncJobStore
@@ -130,7 +131,12 @@ def _process_one_message(
         return
 
     # --- Idempotency: duplicate in-flight ---
-    if not job_store.acquire_processing(job_id, processing_ttl_seconds=processing_ttl):
+    if not job_store.acquire_processing(
+        job_id,
+        processing_ttl_seconds=processing_ttl,
+        worker_type="evaluation",
+    ):
+        # Lock contention and acquire failures are recorded in job_store.
         logger.info("Skipping duplicate in-flight evaluation job_id=%s", job_id)
         broker.ack(message_id)
         return
@@ -193,6 +199,7 @@ def _process_one_message(
                 time.sleep(backoff)
 
             if broker.enqueue(job_id, retry_payload):
+                get_async_reliability_metrics().record_retry(worker="evaluation", reason="processing_error")
                 broker.ack(message_id)
                 job_store.release_processing(job_id)
                 logger.warning(

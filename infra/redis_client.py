@@ -185,6 +185,16 @@ class RedisClient:
             logger.debug(f"Redis hgetall failed for name={name}: {error}")
             return {}
 
+    def hincrbyfloat(self, name: str, key: str, amount: float = 1.0) -> float:
+        """Increment a hash field by float amount atomically."""
+        if not self._available or self._client is None:
+            return 0.0
+        try:
+            return float(self._client.hincrbyfloat(name, key, amount))
+        except Exception as error:
+            logger.debug(f"Redis hincrbyfloat failed for name={name} key={key}: {error}")
+            return 0.0
+
     def incr(self, key: str) -> int:
         """Increment counter by 1."""
         if not self._available or self._client is None:

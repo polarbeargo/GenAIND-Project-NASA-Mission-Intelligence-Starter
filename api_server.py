@@ -25,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 import rag_client
 import llm_client
 import ragas_evaluator
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import get_redis_client
 from openai_config import get_openai_api_key, get_openai_chat_model
 from evidently_monitor import EvidentlyMonitor
@@ -539,6 +540,71 @@ def _format_runtime_config_prometheus(config: Dict[str, Any]) -> str:
 
         lines.append(f'nasa_runtime_stage_pool_workers{{stage="{safe_stage}"}} {workers:.6f}')
         lines.append(f'nasa_runtime_stage_pool_queue_limit{{stage="{safe_stage}"}} {queue_limit:.6f}')
+
+    return "\n".join(lines) + "\n"
+
+
+def _format_async_reliability_prometheus() -> str:
+    """Render async worker reliability counters/gauges from Redis-backed metrics."""
+    lines: List[str] = [
+        "# HELP nasa_async_worker_retry_total Total async worker retries by worker and reason.",
+        "# TYPE nasa_async_worker_retry_total counter",
+        "# HELP nasa_async_worker_dlq_total Total async worker dead-letter events by worker and reason.",
+        "# TYPE nasa_async_worker_dlq_total counter",
+        "# HELP nasa_async_worker_reclaim_total Total reclaimed stale pending messages by worker.",
+        "# TYPE nasa_async_worker_reclaim_total counter",
+        "# HELP nasa_async_worker_reclaim_age_lower_bound_ms Lower-bound reclaimed idle age in milliseconds by worker.",
+        "# TYPE nasa_async_worker_reclaim_age_lower_bound_ms gauge",
+        "# HELP nasa_async_worker_lock_acquire_fail_total Total processing lock acquisition failures by worker and reason.",
+        "# TYPE nasa_async_worker_lock_acquire_fail_total counter",
+    ]
+
+    baseline: Dict[str, List[Tuple[Dict[str, str], float]]] = {
+        "nasa_async_worker_retry_total": [
+            ({"worker": "evaluation", "reason": "processing_error"}, 0.0),
+            ({"worker": "judge", "reason": "processing_error"}, 0.0),
+        ],
+        "nasa_async_worker_dlq_total": [
+            ({"worker": "evaluation", "reason": "max_retries_exhausted"}, 0.0),
+            ({"worker": "judge", "reason": "max_retries_exhausted"}, 0.0),
+        ],
+        "nasa_async_worker_reclaim_total": [
+            ({"worker": "evaluation"}, 0.0),
+            ({"worker": "judge"}, 0.0),
+        ],
+        "nasa_async_worker_reclaim_age_lower_bound_ms": [
+            ({"worker": "evaluation"}, 0.0),
+            ({"worker": "judge"}, 0.0),
+        ],
+        "nasa_async_worker_lock_acquire_fail_total": [
+            ({"worker": "evaluation", "reason": "contended"}, 0.0),
+            ({"worker": "judge", "reason": "contended"}, 0.0),
+            ({"worker": "evaluation_local", "reason": "contended"}, 0.0),
+        ],
+    }
+
+    emitted: set[Tuple[str, Tuple[Tuple[str, str], ...]]] = set()
+
+    def _append_sample(metric: str, labels: Dict[str, str], value: float) -> None:
+        label_items = [
+            f'{_prometheus_escape_label(str(k))}="{_prometheus_escape_label(str(v))}"'
+            for k, v in sorted(labels.items())
+        ]
+        label_text = "{" + ",".join(label_items) + "}" if label_items else ""
+        lines.append(f"{metric}{label_text} {float(value):.6f}")
+        emitted.add((metric, tuple(sorted((str(k), str(v)) for k, v in labels.items()))))
+
+    snapshot = get_async_reliability_metrics().snapshot()
+    for metric, samples in snapshot.items():
+        for labels, value in samples:
+            _append_sample(metric, labels, value)
+
+    for metric, samples in baseline.items():
+        for labels, value in samples:
+            key = (metric, tuple(sorted((str(k), str(v)) for k, v in labels.items())))
+            if key in emitted:
+                continue
+            _append_sample(metric, labels, value)
 
     return "\n".join(lines) + "\n"
 
@@ -1445,6 +1511,7 @@ def monitoring_worker_pools_prometheus() -> Response:
     report = _capture_worker_pool_report()
     payload = _format_worker_pool_prometheus(report)
     payload += _format_runtime_config_prometheus(monitoring_config())
+    payload += _format_async_reliability_prometheus()
     return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 

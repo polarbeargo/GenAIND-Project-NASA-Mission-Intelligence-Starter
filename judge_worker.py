@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict
 
 from env_utils import load_project_env
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import get_redis_client
 from infra.redis_judge_broker import RedisJudgeBroker
 from infra.redis_job_store import RedisAsyncJobStore
@@ -122,6 +123,10 @@ def run() -> int:
     backoff_base = max(0.0, float(os.getenv("JUDGE_WORKER_BACKOFF_BASE_SECONDS", "0.5")))
     backoff_max = max(backoff_base, float(os.getenv("JUDGE_WORKER_BACKOFF_MAX_SECONDS", "8.0")))
     processing_ttl = max(30, int(os.getenv("JUDGE_WORKER_PROCESSING_TTL_SECONDS", "300")))
+    reclaim_enabled = os.getenv("JUDGE_WORKER_RECLAIM_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    reclaim_min_idle_ms = max(30_000, int(os.getenv("JUDGE_WORKER_RECLAIM_MIN_IDLE_MS", "300000")))
+    reclaim_count = max(1, int(os.getenv("JUDGE_WORKER_RECLAIM_COUNT", "10")))
+    reclaim_idle_cycles: int = 0
 
     consumer_name = _consumer_name()
     logger.info("Judge worker started as consumer=%s", consumer_name)
@@ -129,7 +134,19 @@ def run() -> int:
     while _RUNNING:
         messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=3000)
         if not messages:
-            continue
+            if reclaim_enabled:
+                reclaim_idle_cycles += 1
+                if reclaim_idle_cycles >= 20:  # ~60 s at block_ms=3000
+                    reclaim_idle_cycles = 0
+                    stale = broker.reclaim_stale(
+                        consumer_name=consumer_name,
+                        min_idle_ms=reclaim_min_idle_ms,
+                        count=reclaim_count,
+                    )
+                    for message_id, payload in stale:
+                        messages.append((message_id, payload))
+            if not messages:
+                continue
 
         for message_id, payload in messages:
             job_id = str(payload.get("job_id", ""))
@@ -162,7 +179,11 @@ def run() -> int:
                 broker.ack(message_id)
                 continue
 
-            if not job_store.acquire_processing(job_id, processing_ttl_seconds=processing_ttl):
+            if not job_store.acquire_processing(
+                job_id,
+                processing_ttl_seconds=processing_ttl,
+                worker_type="judge",
+            ):
                 logger.info("Skipping duplicate in-flight judge job_id=%s", job_id)
                 broker.ack(message_id)
                 continue
@@ -239,6 +260,7 @@ def run() -> int:
                         time.sleep(backoff)
 
                     if broker.enqueue(job_id, retry_payload):
+                        get_async_reliability_metrics().record_retry(worker="judge", reason="processing_error")
                         broker.ack(message_id)
                         job_store.release_processing(job_id)
                         logger.warning(

@@ -1,0 +1,57 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nasa-worker-reliability-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: nasa-worker-reliability-rules
+    app.kubernetes.io/part-of: nasa-mission-intelligence
+spec:
+  groups:
+    - name: nasa-worker-reliability
+      interval: 30s
+      rules:
+        - alert: NASAAsyncWorkerHighRetryRate
+          expr: sum by (worker) (rate(nasa_async_worker_retry_total[5m])) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High async retry rate ({{ $labels.worker }})"
+            description: "Retry rate has been above 0.2/s for 10m. Check upstream dependency health and queue pressure."
+
+        - alert: NASAAsyncWorkerDLQRateNonZero
+          expr: sum by (worker) (rate(nasa_async_worker_dlq_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Async jobs entering DLQ ({{ $labels.worker }})"
+            description: "DLQ rate is non-zero for 5m. Inspect DLQ stream and worker logs immediately."
+
+        - alert: NASAAsyncWorkerLockAcquireFailures
+          expr: sum by (worker) (rate(nasa_async_worker_lock_acquire_fail_total[5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Frequent lock acquire failures ({{ $labels.worker }})"
+            description: "Lock acquire failures suggest duplicate processing contention or lock leaks."
+
+        - alert: NASAAsyncWorkerStaleReclaimPressure
+          expr: max by (worker) (nasa_async_worker_reclaim_age_lower_bound_ms) > 300000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Stale pending reclaim age elevated ({{ $labels.worker }})"
+            description: "Reclaimed idle age is over 5 minutes, indicating lagging or crashed consumers."
+
+        - alert: NASAAsyncWorkerReclaimRateHigh
+          expr: sum by (worker) (rate(nasa_async_worker_reclaim_total[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High stale message reclaim rate ({{ $labels.worker }})"
+            description: "Frequent XAUTOCLAIM recovery indicates worker instability or processing stalls."

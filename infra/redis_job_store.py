@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,15 @@ class RedisAsyncJobStore:
     def _is_terminal_status(status: str) -> bool:
         return status in {"completed", "error", "dead_lettered", "poisoned", "skipped"}
 
-    def acquire_processing(self, job_id: str, processing_ttl_seconds: int = 300) -> bool:
+    def acquire_processing(
+        self,
+        job_id: str,
+        processing_ttl_seconds: int = 300,
+        worker_type: str = "unknown",
+    ) -> bool:
         """Acquire a best-effort distributed idempotency lock for one job."""
         if not self.redis.is_available() or self.redis._client is None:
+            get_async_reliability_metrics().record_lock_acquire_fail(worker=worker_type, reason="redis_unavailable")
             return False
 
         try:
@@ -58,9 +65,15 @@ class RedisAsyncJobStore:
                 nx=True,
                 ex=ttl,
             )
+            if not locked:
+                get_async_reliability_metrics().record_lock_acquire_fail(
+                    worker=worker_type,
+                    reason="contended",
+                )
             return bool(locked)
         except Exception as error:
             logger.warning("Failed to acquire processing lock for job %s: %s", job_id, error)
+            get_async_reliability_metrics().record_lock_acquire_fail(worker=worker_type, reason="error")
             return False
 
     def release_processing(self, job_id: str) -> bool:

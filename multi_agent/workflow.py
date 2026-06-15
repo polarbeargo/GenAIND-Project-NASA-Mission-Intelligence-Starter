@@ -1311,7 +1311,11 @@ class MultiAgentChatWorkflow:
         # Cross-pod idempotency: only one worker/pod should execute a job.
         if self._redis_job_store.is_completed(job_id):
             return
-        if not self._redis_job_store.acquire_processing(job_id, processing_ttl_seconds=300):
+        if not self._redis_job_store.acquire_processing(
+            job_id,
+            processing_ttl_seconds=300,
+            worker_type="evaluation_local",
+        ):
             return
 
         if not self._evaluation_breaker.allow():
