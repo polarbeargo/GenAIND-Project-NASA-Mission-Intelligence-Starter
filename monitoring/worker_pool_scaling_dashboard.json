@@ -15,6 +15,14 @@
       "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_PROMETHEUS_ASYNC",
+      "label": "Prometheus (Async/KEDA)",
+      "description": "Grafana Prometheus datasource for async worker/KEDA metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
     }
   ],
   "__requires": [
@@ -429,7 +437,7 @@
         "type": "yesoreyeram-infinity-datasource",
         "uid": "${DS_INFINITY}"
       },
-      "description": "Inspect current inflight work, queued backlog, and queue age together to understand whether autoscaling is reacting in time.",
+      "description": "Inspect API-local executor inflight work, queued backlog, and queue age. Broker-backed judge/evaluation async load appears in dedicated KEDA panels.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -514,7 +522,7 @@
           "url": "$api_base_url/monitoring/worker-pools/series"
         }
       ],
-      "title": "Inflight / Queued Estimate by Stage",
+      "title": "Inflight / Queued Estimate by Stage (API Local Pools)",
       "type": "table"
     },
     {
@@ -685,7 +693,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Prometheus-native quick view for utilization ratio by selected stage; when Stage is empty, this panel shows all stages.",
+      "description": "Prometheus-native quick view for API-local utilization ratio by stage. Async judge/evaluation broker load is shown in KEDA panels.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -724,7 +732,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 32
       },
       "id": 7,
       "options": {
@@ -743,13 +751,136 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "nasa_worker_pool_utilization_ratio{stage=~\".*${stage:regex}.*\"}",
+          "expr": "nasa_worker_pool_utilization_ratio{stage=~\"${stage:regex}\"}",
           "legendFormat": "stage={{stage}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Prometheus Utilization Ratio (Selected Stage or All When Empty)",
+      "title": "Prometheus Utilization Ratio (API Local, Selected Stage or All)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS_ASYNC}"
+      },
+      "description": "KEDA redis-stream trigger values for async evaluation and judge workers (XPENDING-like demand signal).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS_ASYNC}"
+          },
+          "editorMode": "code",
+          "expr": "kube_horizontalpodautoscaler_status_target_metric{namespace=\"default\",horizontalpodautoscaler=~\"keda-hpa-nasa-(evaluation|judge)-worker-scaler\",metric_name=~\"s0-redis-streams-(eval|judge)-jobs\"}",
+          "legendFormat": "{{horizontalpodautoscaler}} {{metric_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Async Redis Stream Backlog Signal (Judge/Evaluation)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS_ASYNC}"
+      },
+      "description": "Consumer activity and scaling response for async workers via KEDA-generated HPA current/desired replicas.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS_ASYNC}"
+          },
+          "editorMode": "code",
+          "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"default\",horizontalpodautoscaler=~\"keda-hpa-nasa-(evaluation|judge)-worker-scaler\"}",
+          "legendFormat": "{{horizontalpodautoscaler}} current",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS_ASYNC}"
+          },
+          "editorMode": "code",
+          "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"default\",horizontalpodautoscaler=~\"keda-hpa-nasa-(evaluation|judge)-worker-scaler\"}",
+          "legendFormat": "{{horizontalpodautoscaler}} desired",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Async Worker Consumer Activity (Current vs Desired Replicas)",
       "type": "timeseries"
     }
   ],
@@ -781,21 +912,22 @@
       {
         "current": {
           "selected": true,
-          "text": "retrieval",
-          "value": "retrieval"
+          "text": "All",
+          "value": ".*"
         },
+        "allValue": ".*",
         "datasource": {
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(nasa_runtime_stage_pool_workers, stage)",
+        "definition": "label_values(nasa_worker_pool_utilization_ratio, stage)",
         "hide": 0,
-        "includeAll": false,
-        "label": "Stage (Prometheus, empty=all)",
+        "includeAll": true,
+        "label": "Stage (Prometheus)",
         "multi": false,
         "name": "stage",
         "query": {
-          "query": "label_values(nasa_runtime_stage_pool_workers, stage)",
+          "query": "label_values(nasa_worker_pool_utilization_ratio, stage)",
           "refId": "PromVarStage"
         },
         "refresh": 1,
@@ -956,6 +1088,6 @@
   "timezone": "",
   "title": "NASA Worker Pool Scaling",
   "uid": "nasa-worker-pool-scaling",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }
