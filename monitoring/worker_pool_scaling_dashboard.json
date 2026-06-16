@@ -1112,16 +1112,33 @@
       {
         "current": {
           "selected": true,
-          "text": "http://host.docker.internal:8000",
-          "value": "http://host.docker.internal:8000"
+          "text": "http://nasa-mission-intelligence-api.default.svc.cluster.local:8000",
+          "value": "http://nasa-mission-intelligence-api.default.svc.cluster.local:8000"
         },
         "hide": 0,
         "includeAll": false,
         "label": "API Base URL",
         "multi": false,
         "name": "api_base_url",
-        "query": "http://host.docker.internal:8000",
-        "type": "textbox"
+        "query": "http://localhost:8000,http://host.docker.internal:8000,http://nasa-mission-intelligence-api.default.svc.cluster.local:8000",
+        "type": "textbox",
+        "options": [
+          {
+            "selected": false,
+            "text": "http://localhost:8000",
+            "value": "http://localhost:8000"
+          },
+          {
+            "selected": false,
+            "text": "http://host.docker.internal:8000",
+            "value": "http://host.docker.internal:8000"
+          },
+          {
+            "selected": true,
+            "text": "http://nasa-mission-intelligence-api.default.svc.cluster.local:8000",
+            "value": "http://nasa-mission-intelligence-api.default.svc.cluster.local:8000"
+          }
+        ]
       },
       {
         "current": {
