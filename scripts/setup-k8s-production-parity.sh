@@ -18,6 +18,8 @@ JUDGE_WORKER_MANIFEST_PATH="${JUDGE_WORKER_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s
 REDIS_MANIFEST_PATH="${REDIS_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/redis-deployment.yaml}"
 KEDA_SCALER_PATH="${KEDA_SCALER_PATH:-${ROOT_DIR}/deploy/k8s/keda-scaledobject-evaluation-worker.yaml}"
 JUDGE_KEDA_SCALER_PATH="${JUDGE_KEDA_SCALER_PATH:-${ROOT_DIR}/deploy/k8s/keda-scaledobject-judge-worker.yaml}"
+WORKER_RELIABILITY_RULES_PATH="${WORKER_RELIABILITY_RULES_PATH:-${ROOT_DIR}/deploy/k8s/prometheus-rules-worker-reliability.yaml}"
+ENABLE_WORKER_RELIABILITY_ALERTS="${ENABLE_WORKER_RELIABILITY_ALERTS:-true}"
 
 STREAMLIT_DEPLOYMENT_NAME="${STREAMLIT_DEPLOYMENT_NAME:-nasa-mission-intelligence-streamlit}"
 EVALUATION_WORKER_DEPLOYMENT_NAME="${EVALUATION_WORKER_DEPLOYMENT_NAME:-nasa-evaluation-worker}"
@@ -39,6 +41,17 @@ ENABLE_METRICS_SERVER="${ENABLE_METRICS_SERVER:-true}"
 ENABLE_KEDA="${ENABLE_KEDA:-false}"
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-keda}"
 KEDA_HELM_REPO="${KEDA_HELM_REPO:-https://kedacore.github.io/charts}"
+
+is_loopback_redis_host() {
+  case "${1:-}" in
+    ""|localhost|127.0.0.1|::1)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 log() {
   printf "[setup-k8s-production-parity] %s\n" "$*"
@@ -102,12 +115,15 @@ main() {
   ensure_file "${CHROMA_SEED_JOB_PATH}"
   ensure_file "${STREAMLIT_MANIFEST_PATH}"
   ensure_file "${STREAMLIT_HPA_PATH}"
+  if [[ "${ENABLE_WORKER_RELIABILITY_ALERTS}" == "true" ]]; then
+    ensure_file "${WORKER_RELIABILITY_RULES_PATH}"
+  fi
   if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
     ensure_file "${EVALUATION_WORKER_MANIFEST_PATH}"
     ensure_file "${JUDGE_WORKER_MANIFEST_PATH}"
     ensure_file "${KEDA_SCALER_PATH}"
     ensure_file "${JUDGE_KEDA_SCALER_PATH}"
-    if [[ -z "${REDIS_HOST}" ]]; then
+    if is_loopback_redis_host "${REDIS_HOST}"; then
       ensure_file "${REDIS_MANIFEST_PATH}"
       REDIS_ENABLED="true"
       REDIS_HOST="nasa-redis"
@@ -158,6 +174,8 @@ main() {
   MONITORING_NAMESPACE="${MONITORING_NAMESPACE}" \
   DEPLOYMENT_NAME="${DEPLOYMENT_NAME}" \
   HPA_NAME="${HPA_NAME}" \
+  ENABLE_WORKER_RELIABILITY_ALERTS="${ENABLE_WORKER_RELIABILITY_ALERTS}" \
+  WORKER_RELIABILITY_RULES_PATH="${WORKER_RELIABILITY_RULES_PATH}" \
   ENABLE_TRACING_PROFILE="${ENABLE_TRACING_PROFILE}" \
   TRACING_PATCH_PATH="${TRACING_PATCH_PATH}" \
   ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION}" \
