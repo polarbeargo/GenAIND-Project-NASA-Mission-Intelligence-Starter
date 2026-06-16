@@ -254,6 +254,7 @@ Runbooks:
 - [Opt-in tracing profile (Phoenix/OTLP)](doc/kubernetes-custom-metrics-automated-setup.md#opt-in-tracing-profile-phoenixotlp)
 - [Production parity setup (API + Streamlit + HPA)](doc/kubernetes-custom-metrics-automated-setup.md#automated-setup-production-parity-api--streamlit--hpa)
 - [Full RAG in Kubernetes (PVC-backed Chroma)](doc/kubernetes-custom-metrics-automated-setup.md#full-rag-in-kubernetes-pvc-backed-chroma-production-pattern)
+- [Async Evaluation Worker with KEDA Auto-scaling](doc/k8s-evaluation-worker-setup.md)
 - [Streamlit in Kubernetes](doc/kubernetes-custom-metrics-automated-setup.md#streamlit-in-kubernetes)
 - [Troubleshoot Image Drift](doc/kubernetes-custom-metrics-automated-setup.md#troubleshoot-image-drift)
 
@@ -266,6 +267,71 @@ docker build -t nasa-mission-intelligence-api:latest .
 ```
 
 ![Rebuild and restart flow](images/rebuilt-restart.png)
+
+Optional: run Phoenix in a separate terminal to inspect traces locally.
+
+```bash
+uv run python -m phoenix.server.main serve
+```
+
+Optional: enable the broker-backed evaluation and judge workers in Kubernetes when Redis is available.
+This moves async evaluation and LLM-as-a-Judge work off the API pod and enables independent scaling/recovery.
+The setup automatically installs metrics-server and KEDA if not already present. If you do not provide `REDIS_HOST`,
+the automation provisions an in-cluster Redis service (`nasa-redis`) automatically.
+
+```bash
+eval "$(minikube docker-env)"
+docker build -t nasa-mission-intelligence-api:latest .
+ENABLE_EVALUATION_WORKER=true \
+ENABLE_JUDGE_WORKER=true \
+ENABLE_KEDA=true \
+ENABLE_METRICS_SERVER=true \
+ENABLE_WORKER_RELIABILITY_ALERTS=true \
+./scripts/setup-k8s-production-parity.sh
+```
+
+![Production parity with async workers](images/production_parity.gif)
+
+Use an external Redis instead of the built-in in-cluster deployment:
+
+```bash
+eval "$(minikube docker-env)"
+docker build -t nasa-mission-intelligence-api:latest .
+REDIS_ENABLED=true \
+REDIS_HOST=<your-redis-host> \
+ENABLE_EVALUATION_WORKER=true \
+ENABLE_JUDGE_WORKER=true \
+ENABLE_KEDA=true \
+ENABLE_METRICS_SERVER=true \
+ENABLE_WORKER_RELIABILITY_ALERTS=true \
+./scripts/setup-k8s-production-parity.sh
+```
+
+What this does:
+- applies [deploy/k8s/redis-deployment.yaml](deploy/k8s/redis-deployment.yaml) when `REDIS_HOST` is not provided
+- applies [deploy/k8s/evaluation-worker-deployment.yaml](deploy/k8s/evaluation-worker-deployment.yaml)
+- applies [deploy/k8s/judge-worker-deployment.yaml](deploy/k8s/judge-worker-deployment.yaml)
+- applies [deploy/k8s/keda-scaledobject-evaluation-worker.yaml](deploy/k8s/keda-scaledobject-evaluation-worker.yaml) to scale the worker tier with KEDA's `redis-streams` trigger
+- applies [deploy/k8s/keda-scaledobject-judge-worker.yaml](deploy/k8s/keda-scaledobject-judge-worker.yaml) to scale the judge tier with the same `redis-streams` trigger type
+- applies [deploy/k8s/prometheus-rules-worker-reliability.yaml](deploy/k8s/prometheus-rules-worker-reliability.yaml) when `ENABLE_WORKER_RELIABILITY_ALERTS=true` (default)
+- updates the API deployment to `EVALUATION_BROKER_ENABLED=true`
+- updates the API deployment to `JUDGE_BROKER_ENABLED=true`
+- disables local async evaluation fallback on the API (`EVALUATION_LOCAL_FALLBACK_ENABLED=false`)
+- waits for Redis, API, evaluation-worker, and judge-worker rollouts to complete
+
+Important:
+- Built-in Redis provisioning is intended for local production-parity and small-cluster testing.
+- If you use external Redis, set both `REDIS_ENABLED=true` and `REDIS_HOST`.
+- Built-in Redis provisioning does not configure `REDIS_PASSWORD`; use external Redis if password-based auth is required.
+- The evaluation autoscaler must use KEDA's `redis-streams` trigger because `eval:jobs` is a Redis Stream created with `XADD`, not a Redis list.
+- The judge autoscaler must also use KEDA's `redis-streams` trigger because `judge:jobs` is a Redis Stream created with `XADD`.
+- The KEDA trigger must point at the full Redis service FQDN (`nasa-redis.default.svc.cluster.local:6379`) because the KEDA controller runs outside the `default` namespace.
+- If the judge broker is enabled but no external consumers are active yet, the API now waits briefly for consumer registration and then falls back to its local bounded judge executor instead of silently black-holing jobs.
+- Reliability PrometheusRule automation can be disabled with `ENABLE_WORKER_RELIABILITY_ALERTS=false` for lightweight demo runs.
+
+Troubleshooting:
+- If ScaledObject events show `lookup nasa-redis ... no such host`, the trigger is using a short service name instead of the full FQDN.
+- If KEDA operator logs show `ERR unsupported key type: stream`, the manifest is using the `redis` list scaler instead of `redis-streams`.
 
 ## Latency SLI Usage
 
@@ -306,7 +372,7 @@ docker build -t nasa-mission-intelligence-api:latest .
 
 Use this dashboard to monitor queue pressure and utilization trends per worker stage, and correlate those trends with latency SLI over the same time window.
 
-1. Start Prometheus (required for the Prometheus panel and stage auto-discovery variable):
+1. Start Docker Prometheus (required for NASA worker pool metrics):
    ```bash
    cat >/tmp/nasa-prometheus.yml <<'EOF'
    global:
@@ -323,24 +389,54 @@ Use this dashboard to monitor queue pressure and utilization trends per worker s
      -v /tmp/nasa-prometheus.yml:/etc/prometheus/prometheus.yml \
      prom/prometheus:latest
    ```
-2. Import dashboard:
+
+2. *(Kubernetes only)* Port-forward in-cluster Prometheus for async worker metrics (KEDA/HPA panels):
+   ```bash
+   # Run in a separate terminal to keep port-forward alive
+   kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 39090:9090
+   ```
+   This exposes in-cluster Prometheus on `http://127.0.0.1:39090` for panels 8-9 (async Redis stream backlog and HPA replica metrics).
+   If panels 8-9 show no data, first confirm this command is still running and restart it if the port-forward session was closed.
+
+3. Import dashboard:
    - Open Grafana at `http://127.0.0.1:3000`
    - Go to Dashboards -> Import
    - Upload [monitoring/worker_pool_scaling_dashboard.json](monitoring/worker_pool_scaling_dashboard.json)
-   - Map `DS_INFINITY` to your Infinity datasource
-   - Map `DS_PROMETHEUS` to your Prometheus datasource
-   - If Grafana runs in Docker, set Prometheus datasource URL to `http://host.docker.internal:9090`
-3. Set dashboard variables:
+   - Datasources will be auto-mapped if already configured; otherwise:
+     - Map `DS_INFINITY` to your Infinity datasource
+     - Map `DS_PROMETHEUS` to your Prometheus datasource (Docker Prometheus at `http://host.docker.internal:9090`)
+   - *(Kubernetes only)* Ensure in-cluster Prometheus datasource exists at `http://host.docker.internal:39090` (created automatically if missing)
+
+4. Set dashboard variables:
    - `API Base URL`: default `http://host.docker.internal:8000` when Grafana runs in Docker
-   - `Stage (Prometheus, empty=all)`: leave empty to view all stages, or choose one stage
+   - `Stage`: select specific stage or "All" to view all stages
    - `Worker Stage`: `safety|retrieval|generation|judge|evaluation`
    - `Latency Stage`: `preflight|retrieval|generation|evaluation`
-4. Verify APIs and Prometheus:
+
+5. Verify APIs and Prometheus:
    ```bash
+   # Check worker pool data (panels 1-6)
    curl "http://127.0.0.1:8000/monitoring/worker-pools/series"
    curl "http://127.0.0.1:8000/monitoring/worker-pools/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300"
+   
+   # Check NASA metrics in Docker Prometheus (panel 7)
    curl "http://127.0.0.1:9090/api/v1/query?query=nasa_worker_pool_utilization_ratio"
+   
+   # Check KEDA metrics in in-cluster Prometheus (panels 8-9, Kubernetes only)
+   curl "http://127.0.0.1:39090/api/v1/query?query=kube_horizontalpodautoscaler_status_current_replicas"
+
+   # Check reliability metrics (panels 10-12)
+   curl "http://127.0.0.1:9090/api/v1/query?query=nasa_async_worker_retry_total"
+   curl "http://127.0.0.1:9090/api/v1/query?query=nasa_async_worker_dlq_total"
+   curl "http://127.0.0.1:9090/api/v1/query?query=nasa_async_worker_reclaim_total"
+   curl "http://127.0.0.1:9090/api/v1/query?query=nasa_async_worker_lock_acquire_fail_total"
    ```
+
+6. *(Kubernetes optional)* Apply sample reliability alerts:
+   ```bash
+   kubectl apply -f deploy/k8s/prometheus-rules-worker-reliability.yaml
+   ```
+   The sample rule set alerts on high retry rate, any DLQ activity, elevated stale reclaim age/rate, and sustained lock-acquire failures.
 
 ### Worker-Pool SLI Environment Knobs
 
