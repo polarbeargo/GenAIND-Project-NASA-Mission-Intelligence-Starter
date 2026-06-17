@@ -190,6 +190,40 @@ def _get_judge_broker_group() -> str:
     return value or "judge-workers"
 
 
+def _validate_broker_lane_isolation(
+    *,
+    evaluation_broker_enabled: bool,
+    evaluation_stream: str,
+    evaluation_group: str,
+    judge_broker_enabled: bool,
+    judge_stream: str,
+    judge_group: str,
+) -> None:
+    """Fail fast when async broker lanes collide across critical workloads.
+
+    Evaluation and judge jobs have different SLO and failure profiles. If both
+    broker paths are enabled but share a stream/group lane, one workload can
+    starve the other under burst traffic. Enforce lane isolation at startup so
+    misconfiguration is detected before serving traffic.
+    """
+    if not (evaluation_broker_enabled and judge_broker_enabled):
+        return
+
+    collisions = []
+    if evaluation_stream == judge_stream:
+        collisions.append(f"stream={evaluation_stream!r}")
+    if evaluation_group == judge_group:
+        collisions.append(f"consumer_group={evaluation_group!r}")
+
+    if collisions:
+        raise RuntimeError(
+            "Broker lane collision detected between evaluation and judge: "
+            + ", ".join(collisions)
+            + ". Configure distinct EVALUATION_BROKER_STREAM/JUDGE_BROKER_STREAM "
+            + "and EVALUATION_BROKER_GROUP/JUDGE_BROKER_GROUP."
+        )
+
+
 def _get_breaker_failure_threshold() -> int:
     return _parse_int_range("STAGE_BREAKER_FAILURE_THRESHOLD", 3, min_val=1, max_val=10)
 
@@ -956,6 +990,21 @@ _QUEUE_SUBMIT_TIMEOUT_SECONDS = _get_stage_submit_timeout_seconds()
 _BREAKER_FAILURE_THRESHOLD = _get_breaker_failure_threshold()
 _BREAKER_RECOVERY_SECONDS = _get_breaker_recovery_seconds()
 _EVALUATION_LOCAL_FALLBACK_ENABLED = _get_evaluation_local_fallback_enabled()
+_EVALUATION_BROKER_ENABLED = _get_bool_env("EVALUATION_BROKER_ENABLED", default=False)
+_JUDGE_BROKER_ENABLED = _get_bool_env("JUDGE_BROKER_ENABLED", default=False)
+_EVALUATION_BROKER_STREAM = _get_evaluation_broker_stream()
+_EVALUATION_BROKER_GROUP = _get_evaluation_broker_group()
+_JUDGE_BROKER_STREAM = _get_judge_broker_stream()
+_JUDGE_BROKER_GROUP = _get_judge_broker_group()
+
+_validate_broker_lane_isolation(
+    evaluation_broker_enabled=_EVALUATION_BROKER_ENABLED,
+    evaluation_stream=_EVALUATION_BROKER_STREAM,
+    evaluation_group=_EVALUATION_BROKER_GROUP,
+    judge_broker_enabled=_JUDGE_BROKER_ENABLED,
+    judge_stream=_JUDGE_BROKER_STREAM,
+    judge_group=_JUDGE_BROKER_GROUP,
+)
 
 _STAGE_WORKER_COUNTS = {
     "safety": _get_profiled_stage_worker_count("SAFETY_WORKERS", 2, 3, 4),
@@ -1012,13 +1061,13 @@ chat_workflow = MultiAgentChatWorkflow(
     evaluation_queue_limit=_STAGE_QUEUE_LIMITS["evaluation"],
     queue_submit_timeout_seconds=_QUEUE_SUBMIT_TIMEOUT_SECONDS,
     preflight_retrieval_mode=_PREFLIGHT_RETRIEVAL_MODE,
-    evaluation_broker_enabled=_get_bool_env("EVALUATION_BROKER_ENABLED", default=False),
+    evaluation_broker_enabled=_EVALUATION_BROKER_ENABLED,
     evaluation_local_fallback_enabled=_EVALUATION_LOCAL_FALLBACK_ENABLED,
-    evaluation_broker_stream=_get_evaluation_broker_stream(),
-    evaluation_broker_group=_get_evaluation_broker_group(),
-    judge_broker_enabled=_get_bool_env("JUDGE_BROKER_ENABLED", default=False),
-    judge_broker_stream=_get_judge_broker_stream(),
-    judge_broker_group=_get_judge_broker_group(),
+    evaluation_broker_stream=_EVALUATION_BROKER_STREAM,
+    evaluation_broker_group=_EVALUATION_BROKER_GROUP,
+    judge_broker_enabled=_JUDGE_BROKER_ENABLED,
+    judge_broker_stream=_JUDGE_BROKER_STREAM,
+    judge_broker_group=_JUDGE_BROKER_GROUP,
     redis_l2_cache_enabled=_get_bool_env("REDIS_L2_CACHE_ENABLED", default=True),
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),

@@ -43,6 +43,16 @@ spec:
           value: "https://openai.vocareum.com/v1"
         - name: PYTHONUNBUFFERED
           value: "1"
+        # Explicitly pin isolated broker lanes so evaluation and judge cannot
+        # accidentally share one queue/consumer group under env drift.
+        - name: EVALUATION_BROKER_STREAM
+          value: "eval:jobs"
+        - name: EVALUATION_BROKER_GROUP
+          value: "eval-workers"
+        - name: JUDGE_BROKER_STREAM
+          value: "judge:jobs"
+        - name: JUDGE_BROKER_GROUP
+          value: "judge-workers"
         livenessProbe:
           httpGet:
             path: /monitoring/worker-pools/series
