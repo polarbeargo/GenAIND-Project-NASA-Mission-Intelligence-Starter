@@ -37,6 +37,10 @@ REDIS_HOST="${REDIS_HOST:-}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 REDIS_DB="${REDIS_DB:-0}"
 REDIS_PASSWORD="${REDIS_PASSWORD:-}"
+EVALUATION_BROKER_STREAM="${EVALUATION_BROKER_STREAM:-eval:jobs}"
+EVALUATION_BROKER_GROUP="${EVALUATION_BROKER_GROUP:-eval-workers}"
+JUDGE_BROKER_STREAM="${JUDGE_BROKER_STREAM:-judge:jobs}"
+JUDGE_BROKER_GROUP="${JUDGE_BROKER_GROUP:-judge-workers}"
 ENABLE_METRICS_SERVER="${ENABLE_METRICS_SERVER:-true}"
 ENABLE_KEDA="${ENABLE_KEDA:-false}"
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-keda}"
@@ -51,6 +55,15 @@ is_loopback_redis_host() {
       return 1
       ;;
   esac
+}
+
+validate_broker_lane_isolation() {
+  if [[ "${EVALUATION_BROKER_STREAM}" == "${JUDGE_BROKER_STREAM}" ]]; then
+    die "Broker lane collision: EVALUATION_BROKER_STREAM and JUDGE_BROKER_STREAM must be distinct"
+  fi
+  if [[ "${EVALUATION_BROKER_GROUP}" == "${JUDGE_BROKER_GROUP}" ]]; then
+    die "Broker lane collision: EVALUATION_BROKER_GROUP and JUDGE_BROKER_GROUP must be distinct"
+  fi
 }
 
 log() {
@@ -119,6 +132,7 @@ main() {
     ensure_file "${WORKER_RELIABILITY_RULES_PATH}"
   fi
   if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
+    validate_broker_lane_isolation
     ensure_file "${EVALUATION_WORKER_MANIFEST_PATH}"
     ensure_file "${JUDGE_WORKER_MANIFEST_PATH}"
     ensure_file "${KEDA_SCALER_PATH}"
@@ -189,6 +203,10 @@ main() {
       REDIS_HOST="${REDIS_HOST}" \
       REDIS_PORT="${REDIS_PORT}" \
       REDIS_DB="${REDIS_DB}" \
+      EVALUATION_BROKER_STREAM="${EVALUATION_BROKER_STREAM}" \
+      EVALUATION_BROKER_GROUP="${EVALUATION_BROKER_GROUP}" \
+      JUDGE_BROKER_STREAM="${JUDGE_BROKER_STREAM}" \
+      JUDGE_BROKER_GROUP="${JUDGE_BROKER_GROUP}" \
       EVALUATION_BROKER_ENABLED="${ENABLE_EVALUATION_WORKER}" \
       EVALUATION_LOCAL_FALLBACK_ENABLED="$([[ "${ENABLE_EVALUATION_WORKER}" == "true" ]] && printf 'false' || printf 'true')" \
       JUDGE_BROKER_ENABLED="${ENABLE_JUDGE_WORKER}" >/dev/null
@@ -207,7 +225,9 @@ main() {
       REDIS_ENABLED="${REDIS_ENABLED}" \
       REDIS_HOST="${REDIS_HOST}" \
       REDIS_PORT="${REDIS_PORT}" \
-      REDIS_DB="${REDIS_DB}" >/dev/null
+      REDIS_DB="${REDIS_DB}" \
+      EVALUATION_BROKER_STREAM="${EVALUATION_BROKER_STREAM}" \
+      EVALUATION_BROKER_GROUP="${EVALUATION_BROKER_GROUP}" >/dev/null
     if [[ -n "${REDIS_PASSWORD}" ]]; then
       kubectl set env deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" REDIS_PASSWORD="${REDIS_PASSWORD}" >/dev/null
     fi
@@ -226,7 +246,9 @@ main() {
       REDIS_ENABLED="${REDIS_ENABLED}" \
       REDIS_HOST="${REDIS_HOST}" \
       REDIS_PORT="${REDIS_PORT}" \
-      REDIS_DB="${REDIS_DB}" >/dev/null
+      REDIS_DB="${REDIS_DB}" \
+      JUDGE_BROKER_STREAM="${JUDGE_BROKER_STREAM}" \
+      JUDGE_BROKER_GROUP="${JUDGE_BROKER_GROUP}" >/dev/null
     if [[ -n "${REDIS_PASSWORD}" ]]; then
       kubectl set env deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" REDIS_PASSWORD="${REDIS_PASSWORD}" >/dev/null
     fi
