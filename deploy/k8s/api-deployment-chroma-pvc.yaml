@@ -27,6 +27,10 @@ spec:
       labels:
         app.kubernetes.io/name: nasa-mission-intelligence-api
     spec:
+      # Graceful shutdown window for rolling updates / scale-down. Must exceed the
+      # preStop sleep plus the worst-case in-flight /chat turn so live requests are
+      # never cut mid-flight.
+      terminationGracePeriodSeconds: 45
       securityContext:
         fsGroup: 1000
       initContainers:
@@ -83,6 +87,13 @@ spec:
       - name: api
         image: nasa-mission-intelligence-api:latest
         imagePullPolicy: IfNotPresent
+        # preStop runs BEFORE SIGTERM. The sleep lets Service endpoint deregistration
+        # propagate across nodes (kube-proxy/iptables) so no new traffic is routed to a
+        # terminating pod while the server finishes already-accepted requests.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
         ports:
         - name: http
           containerPort: 8000

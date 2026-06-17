@@ -49,7 +49,21 @@ spec:
         image: nasa-mission-intelligence-api:latest
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "python", "evaluation_worker.py"]
+        # preStop writes the drain marker BEFORE SIGTERM. The worker checks this marker
+        # at the top of its consume loop and stops claiming new jobs, so termination only
+        # ever finishes in-flight work instead of pulling a fresh job into a dying pod.
+        # The short sleep gives the loop one cycle to observe the marker and exit a
+        # blocking XREADGROUP before SIGTERM. terminationGracePeriodSeconds still bounds
+        # the worst-case in-flight job.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "touch \"$WORKER_DRAIN_MARKER_PATH\"; sleep 3"]
         env:
+        # Single source of truth for the drain marker path, shared by the preStop hook
+        # above and the Python loop's drain check.
+        - name: WORKER_DRAIN_MARKER_PATH
+          value: "/tmp/worker-drain"
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:

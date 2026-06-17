@@ -38,11 +38,27 @@ class _DummySecurityViolation(Exception):
 
 
 _RUNNING = True
+_DRAIN_MARKER_PATH = os.getenv("WORKER_DRAIN_MARKER_PATH", "/tmp/worker-drain").strip()
 
 
 def _stop_worker(*_args):
     global _RUNNING
     _RUNNING = False
+
+
+def _drain_requested() -> bool:
+    """Return True when graceful drain has been requested.
+
+    Drain is signaled either by SIGTERM/SIGINT (``_RUNNING`` flipped to False) or by a
+    Kubernetes preStop hook writing the drain marker file. Checking the marker lets the
+    worker stop claiming new jobs *before* SIGTERM arrives, closing the last-moment
+    claim race during rolling updates and KEDA scale-down. The check is a single stat
+    syscall per loop iteration and touches no shared mutable state, so it stays cheap
+    and thread-safe in this single-consumer loop.
+    """
+    if not _RUNNING:
+        return True
+    return bool(_DRAIN_MARKER_PATH) and os.path.exists(_DRAIN_MARKER_PATH)
 
 
 def _consumer_name() -> str:
@@ -290,7 +306,7 @@ def run() -> int:
     consumer_name = _consumer_name()
     logger.info("Evaluation worker started as consumer=%s", consumer_name)
 
-    while _RUNNING:
+    while not _drain_requested():
         messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=3000)
         if not messages:
             # On idle, periodically reclaim stale PEL entries from crashed consumers.
@@ -332,6 +348,11 @@ def run() -> int:
                 processing_ttl=processing_ttl,
             )
 
+    if _RUNNING and _DRAIN_MARKER_PATH and os.path.exists(_DRAIN_MARKER_PATH):
+        logger.info(
+            "preStop drain marker detected at %s; stopped claiming new evaluation jobs",
+            _DRAIN_MARKER_PATH,
+        )
     logger.info("Evaluation worker stopped")
     return 0
 

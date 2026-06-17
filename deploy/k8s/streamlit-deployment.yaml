@@ -14,6 +14,8 @@ spec:
       labels:
         app.kubernetes.io/name: nasa-mission-intelligence-streamlit
     spec:
+      # Graceful shutdown window; must exceed the preStop sleep so active sessions drain.
+      terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
       initContainers:
@@ -58,6 +60,13 @@ spec:
         - "--server.address=0.0.0.0"
         - "--server.port=8501"
         - "--browser.gatherUsageStats=false"
+        # preStop runs BEFORE SIGTERM. The sleep lets Service endpoint deregistration
+        # propagate so the Service stops routing new sessions to a terminating pod
+        # before Streamlit shuts down.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
         ports:
         - name: http
           containerPort: 8501
