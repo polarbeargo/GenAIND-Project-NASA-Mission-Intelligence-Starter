@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import math
-from numbers import Number
 import os
 import time
 import uuid
@@ -13,7 +12,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from env_utils import load_project_env
 from fastapi import FastAPI, HTTPException, status, Request, Response
@@ -25,6 +24,7 @@ from starlette.concurrency import run_in_threadpool
 import rag_client
 import llm_client
 import ragas_evaluator
+from phoenix_annotations import collect_annotation_scores, post_span_annotations
 from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import get_redis_client
 from openai_config import get_openai_api_key, get_openai_chat_model
@@ -107,12 +107,6 @@ def _profiled_float(name: str, interactive: float, balanced: float, throughput: 
     profile = _get_api_profile()
     default = interactive if profile == "interactive" else (throughput if profile == "throughput" and throughput is not None else balanced)
     return _parse_float_range(name, default, min_val, max_val)
-
-try:
-    from phoenix.client import Client as PhoenixClient
-except ImportError:  # pragma: no cover - optional dependency
-    PhoenixClient = None
-
 
 security_event_sink = DashboardSecurityEventSink(security_dashboard)
 
@@ -203,7 +197,7 @@ def _validate_broker_lane_isolation(
 
     Evaluation and judge jobs have different SLO and failure profiles. If both
     broker paths are enabled but share a stream/group lane, one workload can
-    starve the other under burst traffic. Enforce lane isolation at startup so
+    starve the other under burst traffic. Enforce lane isolation at startup hence
     misconfiguration is detected before serving traffic.
     """
     if not (evaluation_broker_enabled and judge_broker_enabled):
@@ -380,47 +374,12 @@ def _phoenix_base_url() -> str:
     return endpoint.rstrip("/")
 
 
-@lru_cache(maxsize=2)
-def _get_phoenix_client(base_url: str):
-    if PhoenixClient is None:
-        return None
-    return PhoenixClient(base_url=base_url)
-
-
 def _collect_numeric_scores(*payloads: Any) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
-    for payload in payloads:
-        if not isinstance(payload, dict):
-            continue
-        for key, value in payload.items():
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, Number):
-                score = float(value)
-                if 0.0 <= score <= 1.0:
-                    scores[str(key)] = score
-    return scores
+    return collect_annotation_scores(*payloads, passthrough_keys={"latency_ms"})
 
 
 def _post_phoenix_annotations(span_id: str, scores: Dict[str, float]) -> None:
-    if not span_id or not scores or PhoenixClient is None:
-        return
-
-    try:
-        client = _get_phoenix_client(_phoenix_base_url())
-        if client is None:
-            return
-
-        for name, score in scores.items():
-            client.spans.add_span_annotation(
-                span_id=span_id,
-                annotation_name=name,
-                annotator_kind="CODE",
-                score=score,
-                sync=False,
-            )
-    except Exception as error:  # pragma: no cover - telemetry must not break API responses
-        logger.warning("Failed to post Phoenix annotations for span %s: %s", span_id, error)
+    post_span_annotations(span_id=span_id, scores=scores, base_url=_phoenix_base_url(), logger=logger)
 
 
 def _prometheus_escape_label(value: str) -> str:
@@ -1244,6 +1203,8 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         span.set_attribute("session.id", session_id)
         span.set_attribute("user.id", client_ip)
         span.set_attribute("openinference.span.kind", "CHAIN")
+        span_context = span.get_span_context()
+        trace_span_id = format(span_context.span_id, "016x") if span_context and span_context.is_valid else None
 
         workflow_input = ChatWorkflowInput(
             question=request.question,
@@ -1256,6 +1217,8 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             judge_mode=request.judge_mode,
             conversation_history=_normalize_conversation_history(request.conversation_history),
             client_ip=client_ip,
+            trace_span_id=trace_span_id,
+            session_id=session_id,
         )
 
         try:
@@ -1273,14 +1236,14 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             span.set_attribute("judge_passed", bool(workflow_result.judge.get("passed", True)))
             span.set_attribute("error", False)
 
-            span_context = span.get_span_context()
-            if span_context and span_context.is_valid:
+            if trace_span_id:
                 annotation_scores = _collect_numeric_scores(
                     workflow_result.evaluation,
                     workflow_result.judge,
+                    {"latency_ms": latency_ms},
                 )
                 _post_phoenix_annotations(
-                    span_id=format(span_context.span_id, "016x"),
+                    span_id=trace_span_id,
                     scores=annotation_scores,
                 )
 

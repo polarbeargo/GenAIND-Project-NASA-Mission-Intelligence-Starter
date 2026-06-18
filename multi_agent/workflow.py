@@ -31,6 +31,7 @@ from multi_agent.models import (
     RetrievalResult,
     WorkflowError,
 )
+from phoenix_annotations import collect_annotation_scores, phoenix_base_url, post_span_annotations
 from multi_agent.retrieval_depth import (
     HeuristicRetrievalDepthConfig,
     HeuristicRetrievalDepthPolicy,
@@ -1047,6 +1048,9 @@ class MultiAgentChatWorkflow:
                 "answer": answer,
                 "contexts": contexts_for_quality,
                 "client_ip": effective_input.client_ip,
+                "trace_span_id": effective_input.trace_span_id,
+                "session_id": effective_input.session_id,
+                "phoenix_base_url": phoenix_base_url(),
             }
             # Phase 2: try broker first; fall back to in-process executor.
             queued = self._judge_broker.enqueue(judge_job_id, enqueue_payload)
@@ -1068,6 +1072,7 @@ class MultiAgentChatWorkflow:
                         effective_input,
                         answer,
                         contexts_for_quality,
+                        effective_input.trace_span_id,
                     )
                 except StageOverloadError:
                     judge_overloaded = True
@@ -1474,6 +1479,7 @@ class MultiAgentChatWorkflow:
         workflow_input: ChatWorkflowInput,
         answer: str,
         contexts,
+        trace_span_id: str | None = None,
     ) -> None:
         started = time.perf_counter()
         
@@ -1490,6 +1496,8 @@ class MultiAgentChatWorkflow:
                 "timestamp_ms": round(time.time() * 1000),
                 "question": workflow_input.question,
                 "client_ip": workflow_input.client_ip,
+                "trace_span_id": trace_span_id,
+                "session_id": workflow_input.session_id,
                 "judge": result,
                 "latency_ms": round(latency_ms, 2),
             }
@@ -1500,6 +1508,16 @@ class MultiAgentChatWorkflow:
             
             # Store in L2 (Redis)
             self._redis_job_store.set_result(judge_job_id, payload)
+
+            # When async judge runs in-process fallback mode, post annotations to
+            # the originating request span so Phoenix metrics include final scores.
+            if trace_span_id:
+                annotation_scores = collect_annotation_scores(
+                    result,
+                    {"latency_ms": latency_ms},
+                    passthrough_keys={"latency_ms"},
+                )
+                post_span_annotations(trace_span_id, annotation_scores, logger=logging.getLogger(__name__))
             
             logging.getLogger(__name__).info(
                 "Async judge completed: passed=%s low_confidence=%s overall=%s",
@@ -1514,6 +1532,8 @@ class MultiAgentChatWorkflow:
                 "timestamp_ms": round(time.time() * 1000),
                 "question": workflow_input.question,
                 "client_ip": workflow_input.client_ip,
+                "trace_span_id": trace_span_id,
+                "session_id": workflow_input.session_id,
                 "judge": {
                     "status": "error",
                     "passed": False,

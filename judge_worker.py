@@ -26,6 +26,7 @@ from infra.redis_judge_broker import RedisJudgeBroker
 from infra.redis_job_store import RedisAsyncJobStore
 from multi_agent.models import ChatWorkflowInput
 from multi_agent.workers import JudgeWorker
+from phoenix_annotations import collect_annotation_scores, post_span_annotations
 
 load_project_env(__file__)
 
@@ -221,11 +222,16 @@ def run() -> int:
                     contexts=contexts,
                 )
                 latency_ms = (time.perf_counter() - started) * 1000.0
+                trace_span_id = str(payload.get("trace_span_id", "")).strip()
+                session_id = str(payload.get("session_id", "")).strip()
+                trace_base_url = str(payload.get("phoenix_base_url", "")).strip() or None
                 final_payload = {
                     "job_id": job_id,
                     "timestamp_ms": round(time.time() * 1000),
                     "question": workflow_input.question,
                     "client_ip": str(payload.get("client_ip", "worker")),
+                    "trace_span_id": trace_span_id or None,
+                    "session_id": session_id or None,
                     "judge": result,
                     "latency_ms": round(latency_ms, 2),
                 }
@@ -237,6 +243,20 @@ def run() -> int:
                     latency_ms,
                 )
                 job_store.set_result(job_id, final_payload)
+
+                if trace_span_id:
+                    annotation_scores = collect_annotation_scores(
+                        result,
+                        {"latency_ms": latency_ms},
+                        passthrough_keys={"latency_ms"},
+                    )
+                    post_span_annotations(
+                        trace_span_id,
+                        annotation_scores,
+                        base_url=trace_base_url,
+                        logger=logger,
+                    )
+
                 broker.ack(message_id)
             except Exception as error:
                 latency_ms = (time.perf_counter() - started) * 1000.0

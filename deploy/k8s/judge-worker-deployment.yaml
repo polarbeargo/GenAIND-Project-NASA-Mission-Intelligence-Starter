@@ -76,6 +76,12 @@ spec:
               optional: true
         - name: OPENAI_BASE_URL
           value: "https://openai.vocareum.com/v1"
+        - name: PHOENIX_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: nasa-tracing
+              key: PHOENIX_ENDPOINT
+              optional: true
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: JUDGE_BROKER_STREAM

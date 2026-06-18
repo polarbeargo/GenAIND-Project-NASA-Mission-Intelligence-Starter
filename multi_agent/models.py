@@ -29,6 +29,8 @@ class ChatWorkflowInput:
     judge_mode: str
     conversation_history: List[Dict[str, str]]
     client_ip: str
+    trace_span_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 @dataclass
