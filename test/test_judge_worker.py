@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from multi_agent.models import ChatWorkflowInput, RetrievalResult, SafetyPreflightResult
 from multi_agent.workflow import MultiAgentChatWorkflow
@@ -258,6 +258,68 @@ class TestWorkflowJudgeModes(unittest.TestCase):
         self.assertTrue(self.REQUIRED_JUDGE_KEYS.issubset(sync_result.judge.keys()))
         self.assertTrue(self.REQUIRED_JUDGE_KEYS.issubset(async_result.judge.keys()))
         self.assertTrue(self.REQUIRED_JUDGE_KEYS.issubset(off_result.judge.keys()))
+
+    def test_async_judge_persists_trace_context_and_includes_latency_annotation_score(self):
+        self.workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response=None)
+        )
+        self.workflow.judge_worker.judge = MagicMock(
+            return_value={
+                "groundedness_score": 0.75,
+                "safety_score": 0.88,
+                "task_success_score": 0.82,
+                "overall_score": 0.81,
+                "confidence": 0.86,
+                "passed": True,
+                "low_confidence": False,
+                "rationale": "Async judge done",
+                "source": "llm",
+            }
+        )
+        self.workflow._judge_broker.enqueue = MagicMock(return_value=False)
+        self.workflow._judge_executor.submit = lambda fn, *args: fn(*args)
+        self.workflow._redis_job_store.set_result = MagicMock(return_value=True)
+
+        workflow_input = make_workflow_input("async")
+        workflow_input.trace_span_id = "abc123def4567890"
+        workflow_input.session_id = "session-123"
+
+        with patch("multi_agent.workflow.post_span_annotations") as post_annotations_mock:
+            result = self.workflow.run(workflow_input, openai_key="fake-key")
+
+        self.assertEqual(result.judge.get("status"), "pending")
+
+        self.workflow._redis_job_store.set_result.assert_called_once()
+        persisted_payload = self.workflow._redis_job_store.set_result.call_args[0][1]
+        self.assertEqual(persisted_payload.get("trace_span_id"), "abc123def4567890")
+        self.assertEqual(persisted_payload.get("session_id"), "session-123")
+
+        post_annotations_mock.assert_called_once()
+        annotation_scores = post_annotations_mock.call_args[0][1]
+        self.assertIn("latency_ms", annotation_scores)
+        self.assertGreaterEqual(annotation_scores["latency_ms"], 0.0)
+
+    def test_async_judge_broker_enqueue_payload_includes_trace_and_session(self):
+        self.workflow.safety_worker.preflight = MagicMock(
+            return_value=SafetyPreflightResult(blocked_response=None)
+        )
+
+        self.workflow._judge_broker.enqueue = MagicMock(return_value=True)
+        self.workflow._judge_broker.has_active_consumers = MagicMock(return_value=True)
+        self.workflow._judge_executor.submit = MagicMock()
+
+        workflow_input = make_workflow_input("async")
+        workflow_input.trace_span_id = "feedfacecafebeef"
+        workflow_input.session_id = "session-broker-1"
+
+        result = self.workflow.run(workflow_input, openai_key="fake-key")
+
+        self.assertEqual(result.judge.get("status"), "pending")
+        self.workflow._judge_broker.enqueue.assert_called_once()
+        enqueue_payload = self.workflow._judge_broker.enqueue.call_args[0][1]
+        self.assertEqual(enqueue_payload.get("trace_span_id"), "feedfacecafebeef")
+        self.assertEqual(enqueue_payload.get("session_id"), "session-broker-1")
+        self.workflow._judge_executor.submit.assert_not_called()
 
 
 if __name__ == "__main__":
