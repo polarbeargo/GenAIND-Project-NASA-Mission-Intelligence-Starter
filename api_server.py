@@ -602,6 +602,58 @@ def _format_async_reliability_prometheus() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_security_prometheus(snapshot: Dict[str, Any]) -> str:
+    """Render security dashboard state in Prometheus exposition format."""
+    lines: List[str] = [
+        "# HELP nasa_security_event_total Cumulative security events by event_type and severity.",
+        "# TYPE nasa_security_event_total counter",
+        "# HELP nasa_security_events_last_hour Security events observed over the last hour.",
+        "# TYPE nasa_security_events_last_hour gauge",
+        "# HELP nasa_security_critical_events_last_hour Critical security events observed over the last hour.",
+        "# TYPE nasa_security_critical_events_last_hour gauge",
+        "# HELP nasa_security_rate_limit_events_last_hour Rate limit exceeded events observed over the last hour.",
+        "# TYPE nasa_security_rate_limit_events_last_hour gauge",
+        "# HELP nasa_security_active_threats Current active high/critical unresolved threats.",
+        "# TYPE nasa_security_active_threats gauge",
+        "# HELP nasa_security_alerts_recent Number of recent raised alerts stored by the dashboard.",
+        "# TYPE nasa_security_alerts_recent gauge",
+        "# HELP nasa_security_coverage OWASP LLM Top 10 coverage observed from runtime events (1=true,0=false).",
+        "# TYPE nasa_security_coverage gauge",
+        "# HELP nasa_security_generated_at_unix Snapshot generation unix timestamp in seconds.",
+        "# TYPE nasa_security_generated_at_unix gauge",
+    ]
+
+    event_severity_counts = snapshot.get("event_severity_counts", {}) or {}
+    for key, count in sorted(event_severity_counts.items()):
+        if isinstance(key, tuple) and len(key) == 2:
+            event_type, severity = key
+        else:
+            event_type, severity = str(key), "unknown"
+        safe_event_type = _prometheus_escape_label(str(event_type))
+        safe_severity = _prometheus_escape_label(str(severity))
+        lines.append(
+            f'nasa_security_event_total{{event_type="{safe_event_type}",severity="{safe_severity}"}} {float(count):.6f}'
+        )
+
+    lines.extend(
+        [
+            f'nasa_security_events_last_hour {float(snapshot.get("events_last_hour", 0.0)):.6f}',
+            f'nasa_security_critical_events_last_hour {float(snapshot.get("critical_events_last_hour", 0.0)):.6f}',
+            f'nasa_security_rate_limit_events_last_hour {float(snapshot.get("rate_limit_events_last_hour", 0.0)):.6f}',
+            f'nasa_security_active_threats {float(snapshot.get("active_threats", 0.0)):.6f}',
+            f'nasa_security_alerts_recent {float(snapshot.get("alert_count", 0.0)):.6f}',
+        ]
+    )
+
+    coverage = snapshot.get("coverage", {}) or {}
+    for vulnerability, covered in sorted(coverage.items()):
+        safe_vulnerability = _prometheus_escape_label(str(vulnerability))
+        lines.append(f'nasa_security_coverage{{vulnerability="{safe_vulnerability}"}} {1.0 if covered else 0.0:.6f}')
+
+    lines.append(f'nasa_security_generated_at_unix {float(snapshot.get("generated_at_unix", 0.0)):.6f}')
+    return "\n".join(lines) + "\n"
+
+
 def _worker_pool_series(report: Dict[str, Any]) -> Dict[str, Any]:
     """Convert worker-pool snapshots into a row-oriented JSON series for dashboards."""
     rows: List[Dict[str, Any]] = []
@@ -1592,6 +1644,13 @@ def monitoring_security_events(
 def monitoring_security_coverage() -> Dict[str, Any]:
     """Return OWASP LLM Top 10 coverage based on observed event types."""
     return security_dashboard.get_vulnerability_coverage()
+
+
+@app.get("/monitoring/security/prometheus", response_class=Response)
+def monitoring_security_prometheus() -> Response:
+    """Return security telemetry in Prometheus text format."""
+    payload = _format_security_prometheus(security_dashboard.get_metrics_snapshot())
+    return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.post("/collections/warm-cache")

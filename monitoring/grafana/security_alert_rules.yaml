@@ -1,0 +1,105 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: nasa-security-alerts
+    folder: NASA Security
+    interval: 1m
+    rules:
+      - uid: nasa-rate-limit-spike
+        title: NASA Rate Limit Spike
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: ${DS_PROMETHEUS}
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              datasource:
+                type: prometheus
+                uid: ${DS_PROMETHEUS}
+              editorMode: code
+              expr: nasa_security_rate_limit_events_last_hour
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              refId: C
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 100
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    type: last
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "Rate-limit events exceeded threshold"
+          description: "Rate-limit events in the last hour crossed 100. Investigate abusive traffic, bot bursts, or upstream quota pressure."
+        labels:
+          severity: warning
+          service: nasa-mission-intelligence
+          category: security
+
+      - uid: nasa-critical-security-spike
+        title: NASA Critical Security Spike
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: ${DS_PROMETHEUS}
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              datasource:
+                type: prometheus
+                uid: ${DS_PROMETHEUS}
+              editorMode: code
+              expr: nasa_security_critical_events_last_hour
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              refId: C
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 3
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    type: last
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "Critical security events spike"
+          description: "Critical security events in the last hour crossed 3. Escalate incident response and inspect recent prompts/traffic."
+        labels:
+          severity: critical
+          service: nasa-mission-intelligence
+          category: security

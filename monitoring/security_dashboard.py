@@ -11,7 +11,6 @@ Tracks OWASP LLM security events and provides monitoring endpoints:
 import json
 import logging
 import threading
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -95,12 +94,13 @@ class SecurityDashboard:
         self.log_file = log_file or Path(__file__).parent / "security_events.log"
         
         self.event_counts: Dict[str, int] = defaultdict(int)
+        self.event_severity_counts: Dict[tuple[str, str], int] = defaultdict(int)
         self.severity_counts: Dict[Severity, int] = defaultdict(int)
         self.user_attack_map: Dict[str, int] = defaultdict(int)
         self.ip_attack_map: Dict[str, int] = defaultdict(int)
+        self._lock = threading.RLock()
         
         self.active_threats: List[SecurityEvent] = []
-        self.threat_lock = threading.Lock()
         
         self.last_alert_time: Dict[str, datetime] = {}
         self.recent_alerts: deque = deque(maxlen=100)
@@ -154,22 +154,21 @@ class SecurityDashboard:
             ip_address=ip_address,
             details=details or {},
         )
-        
-        self.events.append(event)
-        
-        self.event_counts[event_type] += 1
-        self.severity_counts[severity_enum] += 1
-        if user_id:
-            self.user_attack_map[user_id] += 1
-        if ip_address:
-            self.ip_attack_map[ip_address] += 1
-        
-        with self.threat_lock:
+
+        with self._lock:
+            self.events.append(event)
+            self.event_counts[event_type] += 1
+            self.event_severity_counts[(event_type_enum.value, severity_enum.value)] += 1
+            self.severity_counts[severity_enum] += 1
+            if user_id:
+                self.user_attack_map[user_id] += 1
+            if ip_address:
+                self.ip_attack_map[ip_address] += 1
             if severity_enum in [Severity.HIGH, Severity.CRITICAL]:
                 self.active_threats.append(event)
-        
+            self._check_alert_thresholds(event)
+
         self._write_to_log(event)
-        self._check_alert_thresholds(event)
         
         logger.warning(
             f"[{severity_enum.value.upper()}] {event_type}: user={user_id}, ip={ip_address}"
@@ -202,6 +201,18 @@ class SecurityDashboard:
                     "INJECTION_SPIKE",
                     f"High injection attempt rate: {minute_injections} in last minute"
                 )
+
+        if event.event_type == EventType.RATE_LIMIT_EXCEEDED:
+            hour_rate_limits = sum(
+                1 for e in self.events
+                if e.event_type == EventType.RATE_LIMIT_EXCEEDED
+                and e.timestamp > one_hour_ago
+            )
+            if hour_rate_limits >= self.ALERT_THRESHOLDS["rate_limit_per_hour"]:
+                self._raise_alert(
+                    "RATE_LIMIT_SPIKE",
+                    f"High rate-limit events: {hour_rate_limits} in last hour"
+                )
         
         if event.severity == Severity.CRITICAL:
             hour_criticals = sum(
@@ -232,14 +243,15 @@ class SecurityDashboard:
         Returns:
             Dictionary with event statistics
         """
-        now = datetime.now()
-        one_hour_ago = now - timedelta(hours=1)
-        one_day_ago = now - timedelta(days=1)
-        
-        hour_events = [e for e in self.events if e.timestamp > one_hour_ago]
-        day_events = [e for e in self.events if e.timestamp > one_day_ago]
-        
-        return {
+        with self._lock:
+            now = datetime.now()
+            one_hour_ago = now - timedelta(hours=1)
+            one_day_ago = now - timedelta(days=1)
+
+            hour_events = [e for e in self.events if e.timestamp > one_hour_ago]
+            day_events = [e for e in self.events if e.timestamp > one_day_ago]
+
+            return {
             "total_events": len(self.events),
             "events_last_hour": len(hour_events),
             "events_last_day": len(day_events),
@@ -258,7 +270,7 @@ class SecurityDashboard:
             ),
             "active_threats": len(self.active_threats),
             "dashboard_timestamp": now.isoformat(),
-        }
+            }
     
     def get_alerts(self) -> List[Dict[str, Any]]:
         """Get recent security alerts.
@@ -266,7 +278,8 @@ class SecurityDashboard:
         Returns:
             List of recent alerts
         """
-        return list(self.recent_alerts)
+        with self._lock:
+            return list(self.recent_alerts)
     
     def get_events(self, limit: int = 50, severity: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get recent security events.
@@ -278,7 +291,8 @@ class SecurityDashboard:
         Returns:
             List of recent events
         """
-        events_list = list(self.events)
+        with self._lock:
+            events_list = list(self.events)
         events_list.reverse()
         
         if severity:
@@ -292,19 +306,19 @@ class SecurityDashboard:
         Returns:
             Dictionary with threat information
         """
-        with self.threat_lock:
+        with self._lock:
             critical_threats = [t for t in self.active_threats if t.severity == Severity.CRITICAL]
             high_threats = [t for t in self.active_threats if t.severity == Severity.HIGH]
-        
-        return {
-            "active_threat_count": len(self.active_threats),
-            "critical_threats": len(critical_threats),
-            "high_severity_threats": len(high_threats),
-            "threat_types": list(set(t.event_type.value for t in self.active_threats)),
-            "most_recent_threat": (
-                self.active_threats[-1].to_dict() if self.active_threats else None
-            ),
-        }
+
+            return {
+                "active_threat_count": len(self.active_threats),
+                "critical_threats": len(critical_threats),
+                "high_severity_threats": len(high_threats),
+                "threat_types": list(set(t.event_type.value for t in self.active_threats)),
+                "most_recent_threat": (
+                    self.active_threats[-1].to_dict() if self.active_threats else None
+                ),
+            }
     
     def get_vulnerability_coverage(self) -> Dict[str, Any]:
         """Get coverage of OWASP LLM Top 10 protections.
@@ -312,30 +326,75 @@ class SecurityDashboard:
         Returns:
             Dictionary showing which vulnerabilities have been detected
         """
-        coverage_map = {
-            "LLM01_PromptInjection": any(e.event_type == EventType.INJECTION_ATTEMPT for e in self.events),
-            "LLM02_SensitiveInfoDisclosure": any(e.event_type == EventType.INFO_LEAK_DETECTED for e in self.events),
-            "LLM04_DataPoisoning": any(e.event_type == EventType.POISONED_RESULTS for e in self.events),
-            "LLM05_ImproperOutput": any(
-                e.event_type in [EventType.OUTPUT_VALIDATION_CRITICAL, EventType.OUTPUT_VALIDATION_WARNING]
-                for e in self.events
-            ),
-            "LLM07_SystemPromptLeakage": any(
-                e.event_type in [EventType.JAILBREAK_ATTEMPT, EventType.SYSTEM_PROMPT_LEAK]
-                for e in self.events
-            ),
-            "LLM08_VectorWeakness": any(e.event_type == EventType.VECTOR_VALIDATION_FAILED for e in self.events),
-            "LLM10_UnboundedConsumption": any(
-                e.event_type in [
-                    EventType.RATE_LIMIT_EXCEEDED,
-                    EventType.TOKEN_LIMIT_EXCEEDED,
-                    EventType.COST_THRESHOLD_EXCEEDED,
-                ]
-                for e in self.events
-            ),
-        }
+        with self._lock:
+            coverage_map = {
+                "LLM01_PromptInjection": any(e.event_type == EventType.INJECTION_ATTEMPT for e in self.events),
+                "LLM02_SensitiveInfoDisclosure": any(e.event_type == EventType.INFO_LEAK_DETECTED for e in self.events),
+                "LLM04_DataPoisoning": any(e.event_type == EventType.POISONED_RESULTS for e in self.events),
+                "LLM05_ImproperOutput": any(
+                    e.event_type in [EventType.OUTPUT_VALIDATION_CRITICAL, EventType.OUTPUT_VALIDATION_WARNING]
+                    for e in self.events
+                ),
+                "LLM07_SystemPromptLeakage": any(
+                    e.event_type in [EventType.JAILBREAK_ATTEMPT, EventType.SYSTEM_PROMPT_LEAK]
+                    for e in self.events
+                ),
+                "LLM08_VectorWeakness": any(e.event_type == EventType.VECTOR_VALIDATION_FAILED for e in self.events),
+                "LLM10_UnboundedConsumption": any(
+                    e.event_type in [
+                        EventType.RATE_LIMIT_EXCEEDED,
+                        EventType.TOKEN_LIMIT_EXCEEDED,
+                        EventType.COST_THRESHOLD_EXCEEDED,
+                    ]
+                    for e in self.events
+                ),
+            }
         
         return coverage_map
+
+    def get_metrics_snapshot(self) -> Dict[str, Any]:
+        """Return thread-safe metric snapshot for Prometheus rendering."""
+        with self._lock:
+            now = datetime.now()
+            one_hour_ago = now - timedelta(hours=1)
+            events = list(self.events)
+            hour_events = [e for e in events if e.timestamp > one_hour_ago]
+            coverage = {
+                "LLM01_PromptInjection": any(e.event_type == EventType.INJECTION_ATTEMPT for e in events),
+                "LLM02_SensitiveInfoDisclosure": any(e.event_type == EventType.INFO_LEAK_DETECTED for e in events),
+                "LLM04_DataPoisoning": any(e.event_type == EventType.POISONED_RESULTS for e in events),
+                "LLM05_ImproperOutput": any(
+                    e.event_type in [EventType.OUTPUT_VALIDATION_CRITICAL, EventType.OUTPUT_VALIDATION_WARNING]
+                    for e in events
+                ),
+                "LLM07_SystemPromptLeakage": any(
+                    e.event_type in [EventType.JAILBREAK_ATTEMPT, EventType.SYSTEM_PROMPT_LEAK]
+                    for e in events
+                ),
+                "LLM08_VectorWeakness": any(e.event_type == EventType.VECTOR_VALIDATION_FAILED for e in events),
+                "LLM10_UnboundedConsumption": any(
+                    e.event_type in [
+                        EventType.RATE_LIMIT_EXCEEDED,
+                        EventType.TOKEN_LIMIT_EXCEEDED,
+                        EventType.COST_THRESHOLD_EXCEEDED,
+                    ]
+                    for e in events
+                ),
+            }
+            return {
+                "event_counts": dict(self.event_counts),
+                "event_severity_counts": dict(self.event_severity_counts),
+                "severity_counts": {s.value: c for s, c in self.severity_counts.items()},
+                "events_last_hour": len(hour_events),
+                "critical_events_last_hour": sum(1 for e in hour_events if e.severity == Severity.CRITICAL),
+                "rate_limit_events_last_hour": sum(
+                    1 for e in hour_events if e.event_type == EventType.RATE_LIMIT_EXCEEDED
+                ),
+                "active_threats": len(self.active_threats),
+                "alert_count": len(self.recent_alerts),
+                "coverage": coverage,
+                "generated_at_unix": now.timestamp(),
+            }
     
     def export_events(self, file_path: Path) -> int:
         """Export events to CSV file.
@@ -350,31 +409,34 @@ class SecurityDashboard:
             import csv
             
             with open(file_path, "w", newline="") as f:
-                if not self.events:
+                with self._lock:
+                    events_copy = list(self.events)
+                if not events_copy:
                     return 0
-                
-                writer = csv.DictWriter(f, fieldnames=self.events[0].to_dict().keys())
+
+                writer = csv.DictWriter(f, fieldnames=events_copy[0].to_dict().keys())
                 writer.writeheader()
-                
-                for event in self.events:
+
+                for event in events_copy:
                     writer.writerow(event.to_dict())
             
-            logger.info(f"Exported {len(self.events)} events to {file_path}")
-            return len(self.events)
+            logger.info(f"Exported {len(events_copy)} events to {file_path}")
+            return len(events_copy)
         except Exception as e:
             logger.error(f"Failed to export events: {e}")
             return 0
     
     def reset(self) -> None:
         """Reset all statistics and event history."""
-        self.events.clear()
-        self.event_counts.clear()
-        self.severity_counts.clear()
-        self.user_attack_map.clear()
-        self.ip_attack_map.clear()
-        
-        with self.threat_lock:
+        with self._lock:
+            self.events.clear()
+            self.event_counts.clear()
+            self.event_severity_counts.clear()
+            self.severity_counts.clear()
+            self.user_attack_map.clear()
+            self.ip_attack_map.clear()
             self.active_threats.clear()
+            self.recent_alerts.clear()
         
         logger.info("SecurityDashboard reset")
 
