@@ -181,6 +181,17 @@ check_api_observability_endpoints() {
   log "Checking latency SLI timeseries endpoint"
   curl_json_with_retries "${base_url}/monitoring/latency-sli/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300" '.series != null' \
     || die "Latency SLI timeseries endpoint check failed"
+
+  log "Checking security Prometheus endpoint"
+  for ((attempt = 1; attempt <= HTTP_RETRY_ATTEMPTS; attempt++)); do
+    if curl -fsS --max-time 10 "${base_url}/monitoring/security/prometheus" | grep -q '^nasa_security_events_last_hour '; then
+      break
+    fi
+    if [[ "${attempt}" -eq "${HTTP_RETRY_ATTEMPTS}" ]]; then
+      die "Security Prometheus endpoint check failed"
+    fi
+    sleep "${HTTP_RETRY_DELAY_SECONDS}"
+  done
 }
 
 check_prometheus_query() {
@@ -189,6 +200,22 @@ check_prometheus_query() {
   log "Checking Prometheus query for worker-pool utilization"
   curl -fsS "${prom_url}/api/v1/query?query=nasa_worker_pool_utilization_ratio" \
     | jq -e '.status == "success" and (.data.result | type == "array")' >/dev/null
+
+  log "Checking Prometheus query for security metrics"
+  curl -fsS "${prom_url}/api/v1/query?query=nasa_security_events_last_hour" \
+    | jq -e '.status == "success" and (.data.result | type == "array")' >/dev/null
+
+  log "Checking Prometheus target health for /monitoring/security/prometheus"
+  curl -fsS "${prom_url}/api/v1/targets" \
+    | jq -e '
+      .status == "success"
+      and any(
+        .data.activeTargets[]?;
+        .health == "up"
+        and (.labels.namespace // "") == "'"${APP_NAMESPACE}"'"
+        and ((.discoveredLabels.__metrics_path__ // "") == "/monitoring/security/prometheus")
+      )
+    ' >/dev/null
 }
 
 check_streamlit_health() {

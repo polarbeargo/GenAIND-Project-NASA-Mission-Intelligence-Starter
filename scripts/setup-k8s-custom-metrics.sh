@@ -16,10 +16,13 @@ TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH:-${ROOT_DIR}/scripts/ve
 
 API_MANIFEST_PATH="${API_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/api-deployment.yaml}"
 SERVICEMONITOR_PATH="${SERVICEMONITOR_PATH:-${ROOT_DIR}/deploy/k8s/servicemonitor-worker-pools.yaml}"
+SECURITY_SERVICEMONITOR_PATH="${SECURITY_SERVICEMONITOR_PATH:-${ROOT_DIR}/deploy/k8s/servicemonitor-security-metrics.yaml}"
 ADAPTER_VALUES_PATH="${ADAPTER_VALUES_PATH:-${ROOT_DIR}/deploy/k8s/prometheus-adapter-values.yaml}"
 HPA_PATH="${HPA_PATH:-${ROOT_DIR}/deploy/k8s/hpa-api-worker-pools.yaml}"
 WORKER_RELIABILITY_RULES_PATH="${WORKER_RELIABILITY_RULES_PATH:-${ROOT_DIR}/deploy/k8s/prometheus-rules-worker-reliability.yaml}"
 ENABLE_WORKER_RELIABILITY_ALERTS="${ENABLE_WORKER_RELIABILITY_ALERTS:-true}"
+ENABLE_SECURITY_GRAFANA_PROVISIONING="${ENABLE_SECURITY_GRAFANA_PROVISIONING:-true}"
+GRAFANA_SECURITY_PROVISION_SCRIPT_PATH="${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH:-${ROOT_DIR}/scripts/provision-grafana-security-assets.sh}"
 
 SMOKE_SCRIPT_PATH="${ROOT_DIR}/scripts/smoke-k8s-custom-metrics.sh"
 
@@ -51,10 +54,14 @@ main() {
   require_cmd jq
 
   ensure_file "${SERVICEMONITOR_PATH}"
+  ensure_file "${SECURITY_SERVICEMONITOR_PATH}"
   ensure_file "${ADAPTER_VALUES_PATH}"
   ensure_file "${HPA_PATH}"
   ensure_file "${API_MANIFEST_PATH}"
   ensure_file "${SMOKE_SCRIPT_PATH}"
+  if [[ "${ENABLE_SECURITY_GRAFANA_PROVISIONING}" == "true" ]]; then
+    ensure_file "${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH}"
+  fi
   if [[ "${ENABLE_WORKER_RELIABILITY_ALERTS}" == "true" ]]; then
     ensure_file "${WORKER_RELIABILITY_RULES_PATH}"
   fi
@@ -93,6 +100,16 @@ main() {
 
   log "Applying ServiceMonitor"
   kubectl apply -f "${SERVICEMONITOR_PATH}" >/dev/null
+
+  log "Applying security ServiceMonitor"
+  kubectl apply -f "${SECURITY_SERVICEMONITOR_PATH}" >/dev/null
+
+  if [[ "${ENABLE_SECURITY_GRAFANA_PROVISIONING}" == "true" ]]; then
+    log "Provisioning Grafana security dashboard and alert files"
+    MONITORING_NAMESPACE="${MONITORING_NAMESPACE}" \
+    KUBE_PROM_STACK_RELEASE="${KUBE_PROM_STACK_RELEASE}" \
+    "${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH}"
+  fi
 
   if [[ "${ENABLE_WORKER_RELIABILITY_ALERTS}" == "true" ]]; then
     log "Applying worker reliability PrometheusRule: ${WORKER_RELIABILITY_RULES_PATH}"
