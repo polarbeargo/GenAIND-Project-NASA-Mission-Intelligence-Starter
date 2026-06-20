@@ -235,6 +235,16 @@ class TestChatContractAPI(unittest.TestCase):
         self.assertIn("count", body)
         self.assertIn("events", body)
 
+    def test_monitoring_security_prometheus_contract(self):
+        response = self.client.get("/monitoring/security/prometheus")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/plain", response.headers.get("content-type", ""))
+        body = response.text
+        self.assertIn("nasa_security_event_total", body)
+        self.assertIn("nasa_security_rate_limit_events_last_hour", body)
+        self.assertIn("nasa_security_critical_events_last_hour", body)
+
     def test_chat_workflow_error_logs_security_event(self):
         with (
             patch("api_server.get_openai_api_key", return_value="test-key"),
