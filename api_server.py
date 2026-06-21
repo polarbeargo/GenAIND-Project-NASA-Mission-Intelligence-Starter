@@ -654,6 +654,72 @@ def _format_security_prometheus(snapshot: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_analytics_prometheus(snapshot: Dict[str, Any]) -> str:
+    """Render curated Evidently analytics and sink health in Prometheus format."""
+    lines: List[str] = [
+        "# HELP nasa_monitoring_requests_total Total monitored chat interactions.",
+        "# TYPE nasa_monitoring_requests_total counter",
+        "# HELP nasa_monitoring_errors_total Total monitored interactions marked as errors.",
+        "# TYPE nasa_monitoring_errors_total counter",
+        "# HELP nasa_monitoring_error_rate_percent Monitored error rate percentage.",
+        "# TYPE nasa_monitoring_error_rate_percent gauge",
+        "# HELP nasa_monitoring_latency_avg_ms Average monitored latency in milliseconds.",
+        "# TYPE nasa_monitoring_latency_avg_ms gauge",
+        "# HELP nasa_monitoring_latency_p95_ms P95 monitored latency in milliseconds.",
+        "# TYPE nasa_monitoring_latency_p95_ms gauge",
+        "# HELP nasa_monitoring_rag_scored_requests_total Total monitored requests carrying RAG scores.",
+        "# TYPE nasa_monitoring_rag_scored_requests_total counter",
+        "# HELP nasa_monitoring_rag_retrieval_quality_avg Average retrieval quality score from monitored RAG requests.",
+        "# TYPE nasa_monitoring_rag_retrieval_quality_avg gauge",
+        "# HELP nasa_monitoring_rag_faithfulness_avg Average faithfulness score from monitored RAG requests.",
+        "# TYPE nasa_monitoring_rag_faithfulness_avg gauge",
+        "# HELP nasa_monitoring_rag_response_relevancy_avg Average response relevancy score from monitored RAG requests.",
+        "# TYPE nasa_monitoring_rag_response_relevancy_avg gauge",
+        "# HELP nasa_monitoring_rag_context_precision_avg Average context precision score from monitored RAG requests.",
+        "# TYPE nasa_monitoring_rag_context_precision_avg gauge",
+        "# HELP nasa_monitoring_sink_queue_depth Pending records in monitoring sink write queue.",
+        "# TYPE nasa_monitoring_sink_queue_depth gauge",
+        "# HELP nasa_monitoring_sink_queue_capacity Maximum records in monitoring sink write queue.",
+        "# TYPE nasa_monitoring_sink_queue_capacity gauge",
+        "# HELP nasa_monitoring_sink_dropped_total Monitoring records that overflowed queue and required synchronous fallback.",
+        "# TYPE nasa_monitoring_sink_dropped_total counter",
+        "# HELP nasa_monitoring_sink_write_failures_total Monitoring sink write failures.",
+        "# TYPE nasa_monitoring_sink_write_failures_total counter",
+        "# HELP nasa_monitoring_mirror_write_failures_total Monitoring mirror sink write failures.",
+        "# TYPE nasa_monitoring_mirror_write_failures_total counter",
+        "# HELP nasa_monitoring_sink_info Monitoring sink metadata labels.",
+        "# TYPE nasa_monitoring_sink_info gauge",
+        "# HELP nasa_monitoring_generated_at_unix Snapshot generation unix timestamp in seconds.",
+        "# TYPE nasa_monitoring_generated_at_unix gauge",
+    ]
+
+    sink_path = _prometheus_escape_label(str(snapshot.get("sink_path", "unknown")))
+    sink_type = _prometheus_escape_label(str(snapshot.get("sink_type", "unknown")))
+    mirror_sinks = _prometheus_escape_label(str(snapshot.get("mirror_sinks", "")))
+    lines.extend(
+        [
+            f'nasa_monitoring_requests_total {float(snapshot.get("requests_total", 0.0)):.6f}',
+            f'nasa_monitoring_errors_total {float(snapshot.get("errors_total", 0.0)):.6f}',
+            f'nasa_monitoring_error_rate_percent {float(snapshot.get("error_rate_percent", 0.0)):.6f}',
+            f'nasa_monitoring_latency_avg_ms {float(snapshot.get("avg_latency_ms", 0.0)):.6f}',
+            f'nasa_monitoring_latency_p95_ms {float(snapshot.get("p95_latency_ms", 0.0)):.6f}',
+            f'nasa_monitoring_rag_scored_requests_total {float(snapshot.get("rag_scored_requests", 0.0)):.6f}',
+            f'nasa_monitoring_rag_retrieval_quality_avg {float(snapshot.get("rag_avg_retrieval_quality", 0.0)):.6f}',
+            f'nasa_monitoring_rag_faithfulness_avg {float(snapshot.get("rag_avg_faithfulness", 0.0)):.6f}',
+            f'nasa_monitoring_rag_response_relevancy_avg {float(snapshot.get("rag_avg_response_relevancy", 0.0)):.6f}',
+            f'nasa_monitoring_rag_context_precision_avg {float(snapshot.get("rag_avg_context_precision", 0.0)):.6f}',
+            f'nasa_monitoring_sink_queue_depth {float(snapshot.get("sink_queue_depth", 0.0)):.6f}',
+            f'nasa_monitoring_sink_queue_capacity {float(snapshot.get("sink_queue_capacity", 0.0)):.6f}',
+            f'nasa_monitoring_sink_dropped_total {float(snapshot.get("sink_dropped_total", 0.0)):.6f}',
+            f'nasa_monitoring_sink_write_failures_total {float(snapshot.get("sink_write_failures_total", 0.0)):.6f}',
+            f'nasa_monitoring_mirror_write_failures_total {float(snapshot.get("mirror_write_failures_total", 0.0)):.6f}',
+            f'nasa_monitoring_sink_info{{path="{sink_path}",type="{sink_type}",mirrors="{mirror_sinks}"}} 1',
+            f'nasa_monitoring_generated_at_unix {float(snapshot.get("generated_at_unix", 0.0)):.6f}',
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _worker_pool_series(report: Dict[str, Any]) -> Dict[str, Any]:
     """Convert worker-pool snapshots into a row-oriented JSON series for dashboards."""
     rows: List[Dict[str, Any]] = []
@@ -942,6 +1008,11 @@ async def lifespan(app: FastAPI):
         logger.info("Workflow executors shut down")
     except Exception as error:
         logger.warning("Workflow shutdown encountered an error: %s", str(error)[:120])
+    try:
+        monitor.shutdown()
+        logger.info("Monitoring sink writer shut down")
+    except Exception as error:
+        logger.warning("Monitoring sink shutdown encountered an error: %s", str(error)[:120])
     logger.info("Shutting down NASA RAG API")
 
 
@@ -1385,6 +1456,13 @@ def monitoring_report(reference_rows: int = 100) -> Dict[str, str]:
 def monitoring_analytics() -> Dict[str, Any]:
     """Return latency/error rollups from monitoring logs."""
     return monitor.get_analytics_summary()
+
+
+@app.get("/monitoring/analytics/prometheus", response_class=Response)
+def monitoring_analytics_prometheus() -> Response:
+    """Return curated analytics and sink health metrics in Prometheus text format."""
+    payload = _format_analytics_prometheus(monitor.get_prometheus_curated_snapshot())
+    return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/monitoring/rag")
