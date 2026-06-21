@@ -1,0 +1,162 @@
+---
+# PostgreSQL Deployment for centralized Evidently monitoring sink
+# Enables cluster-wide consistent analytics and drift reports
+# Optional: enable with ENABLE_MONITORING_POSTGRES=true in setup-k8s-production-parity.sh
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nasa-postgres-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nasa-postgres-init
+  namespace: default
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS nasa_monitoring;
+    \c nasa_monitoring
+    CREATE TABLE IF NOT EXISTS monitoring_interactions (
+      id SERIAL PRIMARY KEY,
+      question_id VARCHAR(255) NOT NULL,
+      question_length INTEGER NOT NULL,
+      is_error DOUBLE PRECISION NOT NULL,
+      latency_ms DOUBLE PRECISION,
+      retrieval_quality DOUBLE PRECISION,
+      metric_values JSONB NOT NULL DEFAULT '{}'::jsonb,
+      raw_record JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_created_at ON monitoring_interactions(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_question_id ON monitoring_interactions(question_id);
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nasa-postgres
+  namespace: default
+  labels:
+    app: nasa-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: nasa-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  sessionAffinity: None
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-postgres
+  namespace: default
+  labels:
+    app: nasa-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nasa-postgres
+  template:
+    metadata:
+      labels:
+        app: nasa-postgres
+    spec:
+      initContainers:
+        - name: init-postgres-dirs
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /var/lib/postgresql/data
+              chmod 0700 /var/lib/postgresql/data
+              chown 999:999 /var/lib/postgresql/data
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: "nasa_monitoring"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nasa-postgres-secret
+                  key: password
+            - name: POSTGRES_INITDB_ARGS
+              value: "-c max_connections=200 -c shared_buffers=256MB -c effective_cache_size=1GB"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U postgres
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: nasa-postgres-pvc
+        - name: postgres-init
+          configMap:
+            name: nasa-postgres-init
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nasa-postgres-secret
+  namespace: default
+type: Opaque
+stringData:
+  password: "postgres"
+  dsn: "postgresql://postgres:postgres@nasa-postgres:5432/nasa_monitoring?sslmode=prefer"

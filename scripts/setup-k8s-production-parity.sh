@@ -45,6 +45,18 @@ ENABLE_METRICS_SERVER="${ENABLE_METRICS_SERVER:-true}"
 ENABLE_KEDA="${ENABLE_KEDA:-false}"
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-keda}"
 KEDA_HELM_REPO="${KEDA_HELM_REPO:-https://kedacore.github.io/charts}"
+ENABLE_MONITORING_POSTGRES="${ENABLE_MONITORING_POSTGRES:-false}"
+POSTGRES_MANIFEST_PATH="${POSTGRES_MANIFEST_PATH:-${ROOT_DIR}/deploy/k8s/postgres-deployment.yaml}"
+POSTGRES_DEPLOYMENT_NAME="${POSTGRES_DEPLOYMENT_NAME:-nasa-postgres}"
+MONITORING_POSTGRES_DSN="${MONITORING_POSTGRES_DSN:-}"
+MONITORING_POSTGRES_HOST="${MONITORING_POSTGRES_HOST:-nasa-postgres}"
+MONITORING_POSTGRES_PORT="${MONITORING_POSTGRES_PORT:-5432}"
+MONITORING_POSTGRES_DB="${MONITORING_POSTGRES_DB:-nasa_monitoring}"
+MONITORING_POSTGRES_USER="${MONITORING_POSTGRES_USER:-postgres}"
+MONITORING_POSTGRES_PASSWORD="${MONITORING_POSTGRES_PASSWORD:-postgres}"
+MONITORING_POSTGRES_SSLMODE="${MONITORING_POSTGRES_SSLMODE:-prefer}"
+MONITORING_PRIMARY_SINK="${MONITORING_PRIMARY_SINK:-file}"
+SERVICEMONITOR_EVIDENTLY_PATH="${SERVICEMONITOR_EVIDENTLY_PATH:-${ROOT_DIR}/deploy/k8s/servicemonitor-evidently-monitor.yaml}"
 
 is_loopback_redis_host() {
   case "${1:-}" in
@@ -64,6 +76,26 @@ validate_broker_lane_isolation() {
   if [[ "${EVALUATION_BROKER_GROUP}" == "${JUDGE_BROKER_GROUP}" ]]; then
     die "Broker lane collision: EVALUATION_BROKER_GROUP and JUDGE_BROKER_GROUP must be distinct"
   fi
+}
+
+is_loopback_postgres_host() {
+  case "${1:-}" in
+    ""|localhost|127.0.0.1|nasa-postgres)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_postgres() {
+  log "Provisioning in-cluster PostgreSQL for centralized monitoring: ${POSTGRES_MANIFEST_PATH}"
+  kubectl apply -f "${POSTGRES_MANIFEST_PATH}" >/dev/null
+  log "Waiting for PostgreSQL rollout: ${POSTGRES_DEPLOYMENT_NAME}"
+  kubectl rollout status deployment/"${POSTGRES_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null || \
+    die "PostgreSQL deployment failed to become ready"
+  log "PostgreSQL ready. Monitoring sink will use: postgresql://${MONITORING_POSTGRES_USER}@${MONITORING_POSTGRES_HOST}:${MONITORING_POSTGRES_PORT}/${MONITORING_POSTGRES_DB}"
 }
 
 log() {
@@ -128,6 +160,9 @@ main() {
   ensure_file "${CHROMA_SEED_JOB_PATH}"
   ensure_file "${STREAMLIT_MANIFEST_PATH}"
   ensure_file "${STREAMLIT_HPA_PATH}"
+  if [[ "${ENABLE_MONITORING_POSTGRES}" == "true" ]]; then
+    ensure_file "${POSTGRES_MANIFEST_PATH}"
+  fi
   if [[ "${ENABLE_WORKER_RELIABILITY_ALERTS}" == "true" ]]; then
     ensure_file "${WORKER_RELIABILITY_RULES_PATH}"
   fi
@@ -161,8 +196,20 @@ main() {
     install_metrics_server
   fi
 
+  log "Applying Prometheus ServiceMonitor for Evidently metrics: ${SERVICEMONITOR_EVIDENTLY_PATH}"
+  kubectl apply -f "${SERVICEMONITOR_EVIDENTLY_PATH}" >/dev/null || \
+    log "Warn: ServiceMonitor deployment may require kube-prometheus-stack (non-fatal if using standalone Prometheus)"
+
   if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" || "${ENABLE_KEDA}" == "true" ]]; then
     install_keda
+  fi
+
+  if [[ "${ENABLE_MONITORING_POSTGRES}" == "true" ]]; then
+    install_postgres
+    MONITORING_PRIMARY_SINK="postgres"
+    if [[ -z "${MONITORING_POSTGRES_DSN}" ]]; then
+      MONITORING_POSTGRES_DSN="postgresql://${MONITORING_POSTGRES_USER}:${MONITORING_POSTGRES_PASSWORD}@${MONITORING_POSTGRES_HOST}:${MONITORING_POSTGRES_PORT}/${MONITORING_POSTGRES_DB}?sslmode=${MONITORING_POSTGRES_SSLMODE}"
+    fi
   fi
 
   if [[ ( "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ) && "${REDIS_HOST}" == "nasa-redis" ]]; then
@@ -174,6 +221,23 @@ main() {
 
   log "Applying PVC-backed API manifest for full RAG parity: ${API_MANIFEST_PATH}"
   kubectl apply -f "${API_MANIFEST_PATH}" >/dev/null
+
+  log "Waiting for API to become ready before wiring monitoring configuration"
+  kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+
+  if [[ "${ENABLE_MONITORING_POSTGRES}" == "true" || "${MONITORING_PRIMARY_SINK}" != "file" ]]; then
+    log "Wiring Evidently monitoring sink configuration to API deployment"
+    kubectl set env deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
+      MONITORING_PRIMARY_SINK="${MONITORING_PRIMARY_SINK}" \
+      MONITORING_POSTGRES_DSN="${MONITORING_POSTGRES_DSN}" \
+      MONITORING_POSTGRES_HOST="${MONITORING_POSTGRES_HOST}" \
+      MONITORING_POSTGRES_PORT="${MONITORING_POSTGRES_PORT}" \
+      MONITORING_POSTGRES_DB="${MONITORING_POSTGRES_DB}" \
+      MONITORING_POSTGRES_USER="${MONITORING_POSTGRES_USER}" \
+      MONITORING_POSTGRES_SSLMODE="${MONITORING_POSTGRES_SSLMODE}" >/dev/null
+    log "Waiting for API rollout after monitoring sink env update: ${DEPLOYMENT_NAME}"
+    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+  fi
 
   log "Recreating Chroma seed job for idempotent collection bootstrap"
   kubectl delete job nasa-chroma-seed -n "${APP_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
