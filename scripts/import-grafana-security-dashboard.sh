@@ -4,8 +4,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GRAFANA_URL="${GRAFANA_URL:-http://127.0.0.1:3000}"
-GRAFANA_USER="${GRAFANA_USER:-admin}"
-GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
+GRAFANA_USER="${GRAFANA_USER:-}"
+GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-}"
+GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-monitoring}"
+GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-kube-prometheus-stack-grafana}"
 DASHBOARD_FILE="${DASHBOARD_FILE:-${ROOT_DIR}/monitoring/grafana/security_dashboard.json}"
 PROMETHEUS_DATASOURCE_UID="${PROMETHEUS_DATASOURCE_UID:-}"
 VERIFY_DASHBOARD_FUNCTIONS="${VERIFY_DASHBOARD_FUNCTIONS:-true}"
@@ -33,6 +35,30 @@ require_cmd() {
 
 ensure_file() {
   [[ -f "$1" ]] || die "Required file not found: $1"
+}
+
+resolve_grafana_credentials() {
+  if [[ -n "${GRAFANA_USER}" && -n "${GRAFANA_PASSWORD}" ]]; then
+    return 0
+  fi
+
+  if command -v kubectl >/dev/null 2>&1; then
+    local secret_user
+    local secret_password
+    secret_user="$(kubectl get secret -n "${GRAFANA_NAMESPACE}" "${GRAFANA_SECRET_NAME}" -o jsonpath='{.data.admin-user}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+    secret_password="$(kubectl get secret -n "${GRAFANA_NAMESPACE}" "${GRAFANA_SECRET_NAME}" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+
+    if [[ -n "${secret_user}" && -n "${secret_password}" ]]; then
+      GRAFANA_USER="${secret_user}"
+      GRAFANA_PASSWORD="${secret_password}"
+      log "Using Grafana credentials from Kubernetes secret ${GRAFANA_NAMESPACE}/${GRAFANA_SECRET_NAME}"
+      return 0
+    fi
+  fi
+
+  GRAFANA_USER="${GRAFANA_USER:-admin}"
+  GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
+  log "Using fallback Grafana credentials (admin/admin)."
 }
 
 grafana_api() {
@@ -157,6 +183,7 @@ main() {
   require_cmd curl
   require_cmd jq
   ensure_file "${DASHBOARD_FILE}"
+  resolve_grafana_credentials
 
   TMP_DIR="$(mktemp -d)"
   trap cleanup EXIT

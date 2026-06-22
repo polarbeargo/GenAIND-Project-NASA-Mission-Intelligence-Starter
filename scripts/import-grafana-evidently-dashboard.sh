@@ -5,8 +5,10 @@
 set -Eeuo pipefail
 
 GRAFANA_URL="${GRAFANA_URL:-http://127.0.0.1:3000}"
-GRAFANA_USER="${GRAFANA_USER:-admin}"
-GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
+GRAFANA_USER="${GRAFANA_USER:-}"
+GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-}"
+GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-monitoring}"
+GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-kube-prometheus-stack-grafana}"
 DASHBOARD_JSON_PATH="${DASHBOARD_JSON_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../monitoring/grafana" && pwd)/evidently_monitor_dashboard.json}"
 PROMETHEUS_UID="${PROMETHEUS_UID:-prometheus}"  # Standard uid in kube-prometheus-stack
 DASHBOARD_UID="evidently-monitor"
@@ -28,38 +30,49 @@ ensure_file() {
   [[ -f "$1" ]] || die "Required file not found: $1"
 }
 
-get_or_create_datasource_uid() {
-  local ds_name="$1"
-  log "Checking for Prometheus datasource: ${ds_name}"
-  
-  local response=$(curl -s -X GET \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $(get_grafana_token)" \
-    "${GRAFANA_URL}/api/datasources/name/${ds_name}" || echo "{}")
-  
-  local uid=$(echo "$response" | jq -r '.uid // empty' 2>/dev/null || echo "")
-  
-  if [[ -z "$uid" || "$uid" == "null" ]]; then
-    log "Prometheus datasource not found, attempting to create default reference"
-    echo "prometheus"
-  else
-    echo "$uid"
+resolve_grafana_credentials() {
+  if [[ -n "${GRAFANA_USER}" && -n "${GRAFANA_PASSWORD}" ]]; then
+    return 0
   fi
+
+  if command -v kubectl >/dev/null 2>&1; then
+    local secret_user
+    local secret_password
+    secret_user="$(kubectl get secret -n "${GRAFANA_NAMESPACE}" "${GRAFANA_SECRET_NAME}" -o jsonpath='{.data.admin-user}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+    secret_password="$(kubectl get secret -n "${GRAFANA_NAMESPACE}" "${GRAFANA_SECRET_NAME}" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+
+    if [[ -n "${secret_user}" && -n "${secret_password}" ]]; then
+      GRAFANA_USER="${secret_user}"
+      GRAFANA_PASSWORD="${secret_password}"
+      log "Using Grafana credentials from Kubernetes secret ${GRAFANA_NAMESPACE}/${GRAFANA_SECRET_NAME}"
+      return 0
+    fi
+  fi
+
+  # Final fallback for local Docker Grafana defaults.
+  GRAFANA_USER="${GRAFANA_USER:-admin}"
+  GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
+  log "Using fallback Grafana credentials (admin/admin)."
 }
 
-get_grafana_token() {
-  local response=$(curl -s -X POST \
+get_or_create_datasource_uid() {
+  local ds_name="$1"
+  printf "[import-grafana-evidently-dashboard] Checking for Prometheus datasource: %s\n" "${ds_name}" >&2
+  
+  local response
+  response=$(curl -s -X GET \
     -H "Content-Type: application/json" \
-    -d "{\"name\": \"import-token-$(date +%s)\", \"role\": \"Admin\"}" \
-    "http://${GRAFANA_USER}:${GRAFANA_PASSWORD}@127.0.0.1:3000/api/auth/keys" 2>/dev/null || echo "{}")
+    -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+    "${GRAFANA_URL}/api/datasources/name/${ds_name}" || echo "{}")
   
-  local key=$(echo "$response" | jq -r '.key // empty' 2>/dev/null || echo "")
+  local uid
+  uid=$(echo "$response" | jq -r '.uid // empty' 2>/dev/null || echo "")
   
-  if [[ -z "$key" ]]; then
-    # Fallback: basic auth with password
-    echo ""
+  if [[ -z "$uid" || "$uid" == "null" ]]; then
+    printf "[import-grafana-evidently-dashboard] Prometheus datasource not found, using fallback UID: %s\n" "${PROMETHEUS_UID}" >&2
+    echo "${PROMETHEUS_UID}"
   else
-    echo "$key"
+    echo "$uid"
   fi
 }
 
@@ -76,7 +89,13 @@ import_dashboard() {
   # Substitute datasource placeholder
   dashboard_json=$(echo "$dashboard_json" | jq \
     --arg ds_uid "$ds_uid" \
-    '.panels[].datasource.uid = $ds_uid' \
+    '.panels |= map(
+      if (.datasource.type? == "prometheus") then
+        .datasource.uid = $ds_uid
+      else
+        .
+      end
+    )' \
     2>/dev/null || echo "$dashboard_json")
   
   # Prepare import payload (overwrite=true allows re-import)
@@ -132,6 +151,7 @@ verify_grafana_connectivity() {
 main() {
   require_cmd curl
   require_cmd jq
+  resolve_grafana_credentials
   
   log "Evidently Monitor Dashboard Import"
   log "Dashboard: ${DASHBOARD_JSON_PATH}"
