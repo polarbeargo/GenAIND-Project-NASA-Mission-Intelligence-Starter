@@ -9,6 +9,7 @@ metadata:
   name: nasa-evidently-monitor
   namespace: default
   labels:
+    release: kube-prometheus-stack
     app.kubernetes.io/name: nasa-mission-intelligence-api
     app.kubernetes.io/component: monitoring
 spec:
