@@ -14,8 +14,9 @@ import os
 import signal
 import socket
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from evidently_monitor import EvidentlyMonitor
 from env_utils import load_project_env
 from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import get_redis_client
@@ -80,7 +81,22 @@ def _coerce_workflow_input(payload: dict) -> ChatWorkflowInput:
         judge_mode="off",
         conversation_history=[],
         client_ip="worker",
+        interaction_id=str(payload.get("interaction_id", "") or "") or None,
     )
+
+
+def _shared_monitoring_sink_configured() -> bool:
+    sink_type = (os.getenv("MONITORING_PRIMARY_SINK") or "file").strip().lower()
+    central_path = (os.getenv("MONITORING_CENTRAL_SINK_PATH") or "").strip()
+    explicit_dsn = (os.getenv("MONITORING_POSTGRES_DSN") or "").strip()
+    postgres_host = (os.getenv("MONITORING_POSTGRES_HOST") or "").strip()
+    postgres_db = (os.getenv("MONITORING_POSTGRES_DB") or "").strip()
+
+    if sink_type == "postgres":
+        return bool(explicit_dsn or (postgres_host and postgres_db))
+    if sink_type == "shared_file":
+        return bool(central_path or (os.getenv("MONITORING_INTERACTIONS_LOG_PATH") or "").strip())
+    return bool(central_path)
 
 
 def _to_int(value: Any, default: int) -> int:
@@ -106,6 +122,7 @@ def _process_one_message(
     backoff_base: float,
     backoff_max: float,
     processing_ttl: int,
+    monitor: Optional[EvidentlyMonitor] = None,
 ) -> None:
     """Process a single message from the evaluation broker.
 
@@ -183,6 +200,21 @@ def _process_one_message(
                 "question": workflow_input.question,
             }
         )
+        interaction_id = (workflow_input.interaction_id or "").strip()
+        if monitor is not None and interaction_id:
+            monitor.log_interaction(
+                question=workflow_input.question,
+                answer=answer,
+                model=workflow_input.model,
+                backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}",
+                context_count=len(contexts),
+                mission=workflow_input.mission_filter,
+                evaluation=final_payload,
+                error=False,
+                interaction_id=interaction_id,
+                record_kind="evaluation_update",
+                synchronous=True,
+            )
         job_store.set_result(job_id, final_payload)
         broker.ack(message_id)
     except Exception as error:
@@ -293,6 +325,15 @@ def run() -> int:
         logger=logger,
         security_violation=_DummySecurityViolation,
     )
+    monitor: Optional[EvidentlyMonitor] = None
+    if _shared_monitoring_sink_configured():
+        try:
+            monitor = EvidentlyMonitor()
+            logger.info("Evaluation worker monitoring updates enabled via shared sink")
+        except Exception as error:
+            logger.warning("Failed to initialize shared monitoring sink for evaluation worker: %s", str(error)[:200])
+    else:
+        logger.info("Evaluation worker has no shared monitoring sink configured; async completions will only update the job store")
 
     max_retries = max(0, int(os.getenv("EVALUATION_WORKER_MAX_RETRIES", "3")))
     backoff_base = max(0.0, float(os.getenv("EVALUATION_WORKER_BACKOFF_BASE_SECONDS", "0.5")))
@@ -346,6 +387,7 @@ def run() -> int:
                 backoff_base=backoff_base,
                 backoff_max=backoff_max,
                 processing_ttl=processing_ttl,
+                monitor=monitor,
             )
 
     if _RUNNING and _DRAIN_MARKER_PATH and os.path.exists(_DRAIN_MARKER_PATH):

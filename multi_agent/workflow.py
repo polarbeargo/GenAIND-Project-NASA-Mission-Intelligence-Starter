@@ -11,7 +11,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
 from threading import Lock, Semaphore
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 import rag_client
 from monitoring.stage_sli_events import StageLatencyEventStore
@@ -314,6 +314,7 @@ class MultiAgentChatWorkflow:
         judge_broker_stream: str = "judge:jobs",
         judge_broker_group: str = "judge-workers",
         redis_l2_cache_enabled: bool = False,
+        evaluation_completion_callback: Callable[[ChatWorkflowInput, str, List[str], Dict[str, Any]], None] | None = None,
     ):
         self.retrieval_worker = RetrievalWorker(get_collection_fn=get_collection_fn)
         self.safety_worker = SafetyWorker(
@@ -378,6 +379,7 @@ class MultiAgentChatWorkflow:
         self._evaluation_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._judge_lock = Lock()
         self._evaluation_lock = Lock()
+        self._evaluation_completion_callback = evaluation_completion_callback
         self._retrieval_cache_ttl = max(60, int(retrieval_cache_ttl_seconds))
         self._answer_cache_ttl = max(60, int(answer_cache_ttl_seconds))
         self._retrieval_cache_max_entries = max(100, int(retrieval_cache_max_entries))
@@ -1223,6 +1225,7 @@ class MultiAgentChatWorkflow:
             "collection_name": workflow_input.collection_name,
             "model": workflow_input.model,
             "evaluate": workflow_input.evaluate,
+            "interaction_id": workflow_input.interaction_id,
             "answer": answer,
             "contexts": contexts,
             "submitted_at_ms": submitted_at_ms,
@@ -1393,6 +1396,14 @@ class MultiAgentChatWorkflow:
                 }
             )
             self._record_evaluation_job(job_id, payload)
+            if self._evaluation_completion_callback is not None:
+                try:
+                    self._evaluation_completion_callback(workflow_input, answer, contexts, dict(payload))
+                except Exception as callback_error:
+                    logging.getLogger(__name__).warning(
+                        "Async evaluation completion callback failed: %s",
+                        str(callback_error)[:120],
+                    )
         except Exception as error:
             if isinstance(error, TimeoutError):
                 try:

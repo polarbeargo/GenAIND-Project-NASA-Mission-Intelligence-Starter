@@ -759,6 +759,9 @@ class EvidentlyMonitor:
         evaluation: Optional[Dict[str, float]] = None,
         error: bool = False,
         latency_ms: Optional[float] = None,
+        interaction_id: Optional[str] = None,
+        record_kind: str = "interaction",
+        synchronous: bool = False,
     ) -> None:
         """Log an interaction (success or error) for drift monitoring."""
         record: Dict[str, Any] = {
@@ -772,13 +775,20 @@ class EvidentlyMonitor:
             "answer_length": len(answer or ""),
             "question_length": len(question or ""),
             "is_error": 1.0 if error else 0.0,
+            "record_kind": str(record_kind or "interaction"),
         }
+        if interaction_id:
+            record["interaction_id"] = str(interaction_id)
         if latency_ms is not None:
             record["latency_ms"] = float(latency_ms)
         if evaluation:
             for key, value in evaluation.items():
                 if isinstance(value, (int, float)):
                     record[f"metric_{key}"] = float(value)
+
+        if synchronous:
+            self._persist_batch([record])
+            return
 
         try:
             self._write_queue.put_nowait(record)
@@ -814,7 +824,7 @@ class EvidentlyMonitor:
         return "high"
 
     def _prepare_rag_dataframe(self) -> pd.DataFrame:
-        dataset = self.load_dataframe()
+        dataset = self._canonicalize_dataset(self.load_dataframe())
         if dataset.empty:
             return dataset
 
@@ -851,6 +861,51 @@ class EvidentlyMonitor:
         ].mean(axis=1, skipna=True)
         dataset["score_band"] = dataset["retrieval_quality"].apply(self._score_band)
         return dataset
+
+    @staticmethod
+    def _canonicalize_dataset(dataset: pd.DataFrame) -> pd.DataFrame:
+        if dataset.empty:
+            return dataset
+
+        if "interaction_id" not in dataset.columns and "record_kind" not in dataset.columns:
+            return dataset
+
+        canonical = dataset.copy()
+        canonical["_row_order"] = range(len(canonical))
+
+        if "interaction_id" not in canonical.columns:
+            canonical["interaction_id"] = canonical["_row_order"].apply(lambda value: f"legacy-{value}")
+        else:
+            canonical["interaction_id"] = canonical["interaction_id"].astype("string")
+            missing_mask = canonical["interaction_id"].isna() | canonical["interaction_id"].eq("")
+            if missing_mask.any():
+                canonical.loc[missing_mask, "interaction_id"] = canonical.loc[missing_mask, "_row_order"].apply(
+                    lambda value: f"legacy-{value}"
+                )
+
+        if "record_kind" not in canonical.columns:
+            canonical["record_kind"] = "interaction"
+        else:
+            canonical["record_kind"] = canonical["record_kind"].fillna("interaction").astype(str)
+
+        sort_columns = ["interaction_id"]
+        if "timestamp" in canonical.columns:
+            canonical["timestamp"] = pd.to_datetime(canonical["timestamp"], errors="coerce", utc=True)
+            sort_columns.append("timestamp")
+        sort_columns.append("_row_order")
+        canonical = canonical.sort_values(sort_columns, kind="stable")
+
+        merged_groups: List[pd.Series] = []
+        for _, group in canonical.groupby("interaction_id", dropna=False, sort=False):
+            merged_groups.append(group.ffill().iloc[-1])
+
+        merged = pd.DataFrame(merged_groups).reset_index(drop=True) if merged_groups else canonical.iloc[0:0].copy()
+
+        if "record_kind" in merged.columns:
+            merged["record_kind"] = "interaction"
+        if "_row_order" in merged.columns:
+            merged = merged.drop(columns=["_row_order"])
+        return merged
 
     def load_dataframe(self) -> pd.DataFrame:
         return self._primary_sink.load_dataframe()
@@ -927,6 +982,9 @@ class EvidentlyMonitor:
             try:
                 scan = pl.scan_ndjson(str(native_path), ignore_errors=True)
                 schema_names = set(scan.collect_schema().names())
+
+                if {"interaction_id", "record_kind"} & schema_names:
+                    raise ValueError("interaction merge requires pandas fallback")
 
                 if not schema_names:
                     result = {"error": "Monitoring data is empty"}
@@ -1016,6 +1074,7 @@ class EvidentlyMonitor:
             if dataset.empty:
                 result = {"error": "Monitoring data is empty"}
             else:
+                dataset = self._canonicalize_dataset(dataset)
                 if "latency_ms" not in dataset.columns:
                     dataset["latency_ms"] = None
                 if "is_error" not in dataset.columns:

@@ -31,6 +31,7 @@ class ChatWorkflowInput:
     client_ip: str
     trace_span_id: Optional[str] = None
     session_id: Optional[str] = None
+    interaction_id: Optional[str] = None
 
 
 @dataclass

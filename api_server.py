@@ -1019,6 +1019,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="NASA Mission Intelligence API", version="1.0.0", lifespan=lifespan)
 tracer = init_telemetry(app, service_name="nasa-mission-intelligence-api")
 monitor = EvidentlyMonitor()
+
+
+def _record_async_evaluation_completion(
+    workflow_input: ChatWorkflowInput,
+    answer: str,
+    contexts: List[str],
+    payload: Dict[str, Any],
+) -> None:
+    if not isinstance(payload, dict):
+        return
+    if str(payload.get("status", "")).strip().lower() != "completed":
+        return
+
+    interaction_id = (workflow_input.interaction_id or "").strip()
+    if not interaction_id:
+        return
+
+    monitor.log_interaction(
+        question=workflow_input.question,
+        answer=answer,
+        model=workflow_input.model,
+        backend=f"{workflow_input.chroma_dir}:{workflow_input.collection_name}",
+        context_count=len(contexts),
+        mission=workflow_input.mission_filter,
+        evaluation=payload,
+        error=False,
+        interaction_id=interaction_id,
+        record_kind="evaluation_update",
+        synchronous=True,
+    )
+
 rate_limiter = RedisSlidingWindowRateLimiter(
     requests_per_period=_get_rate_limit_requests_per_period(),
     period_seconds=_get_rate_limit_period_seconds(),
@@ -1151,6 +1182,7 @@ chat_workflow = MultiAgentChatWorkflow(
     judge_broker_stream=_JUDGE_BROKER_STREAM,
     judge_broker_group=_JUDGE_BROKER_GROUP,
     redis_l2_cache_enabled=_get_bool_env("REDIS_L2_CACHE_ENABLED", default=True),
+    evaluation_completion_callback=_record_async_evaluation_completion,
     stage_event_store=StageLatencyEventStore(
         log_file=_get_stage_sli_log_path(),
         retention_hours=_get_stage_sli_retention_hours(),
@@ -1317,6 +1349,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     error_msg = None
     client_ip = http_request.client.host if http_request.client else "unknown"
     session_id = (request.session_id or "").strip() or str(uuid.uuid4())
+    interaction_id = uuid.uuid4().hex
 
     with tracer.start_as_current_span("nasa.rag.chat") as span:
         span.set_attribute("model", request.model)
@@ -1342,6 +1375,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             client_ip=client_ip,
             trace_span_id=trace_span_id,
             session_id=session_id,
+            interaction_id=interaction_id,
         )
 
         try:
@@ -1380,6 +1414,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                 evaluation=workflow_result.evaluation if isinstance(workflow_result.evaluation, dict) else None,
                 error=False,
                 latency_ms=latency_ms,
+                interaction_id=interaction_id,
             )
 
             return ChatResponse(
@@ -1428,6 +1463,7 @@ def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                 evaluation={"error": error_msg[:200]},
                 error=True,
                 latency_ms=latency_ms,
+                interaction_id=interaction_id,
             )
             security_dashboard.log_event(
                 event_type="api_error",
