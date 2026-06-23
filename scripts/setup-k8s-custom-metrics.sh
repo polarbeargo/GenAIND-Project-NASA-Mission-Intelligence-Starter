@@ -23,6 +23,11 @@ WORKER_RELIABILITY_RULES_PATH="${WORKER_RELIABILITY_RULES_PATH:-${ROOT_DIR}/depl
 ENABLE_WORKER_RELIABILITY_ALERTS="${ENABLE_WORKER_RELIABILITY_ALERTS:-true}"
 ENABLE_SECURITY_GRAFANA_PROVISIONING="${ENABLE_SECURITY_GRAFANA_PROVISIONING:-true}"
 GRAFANA_SECURITY_PROVISION_SCRIPT_PATH="${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH:-${ROOT_DIR}/scripts/provision-grafana-security-assets.sh}"
+ENABLE_GRAFANA_INFINITY_SETUP="${ENABLE_GRAFANA_INFINITY_SETUP:-true}"
+GRAFANA_DEPLOYMENT_NAME="${GRAFANA_DEPLOYMENT_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
+GRAFANA_SERVICE_NAME="${GRAFANA_SERVICE_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
+GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
+GRAFANA_PORT_FORWARD_LOCAL_PORT="${GRAFANA_PORT_FORWARD_LOCAL_PORT:-33300}"
 
 SMOKE_SCRIPT_PATH="${ROOT_DIR}/scripts/smoke-k8s-custom-metrics.sh"
 
@@ -46,6 +51,133 @@ ensure_file() {
 wait_for_rollout() {
   log "Waiting for deployment rollout: ${DEPLOYMENT_NAME} (namespace: ${APP_NAMESPACE})"
   kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+}
+
+append_csv_unique() {
+  local existing="$1"
+  local item="$2"
+
+  if [[ -z "${existing}" ]]; then
+    printf '%s' "${item}"
+    return 0
+  fi
+
+  local found="false"
+  local token
+  IFS=',' read -r -a tokens <<<"${existing}"
+  for token in "${tokens[@]}"; do
+    token="${token//[[:space:]]/}"
+    if [[ "${token}" == "${item}" ]]; then
+      found="true"
+      break
+    fi
+  done
+
+  if [[ "${found}" == "true" ]]; then
+    printf '%s' "${existing}"
+  else
+    printf '%s,%s' "${existing}" "${item}"
+  fi
+}
+
+ensure_infinity_plugin_and_datasource() {
+  local grafana_deploy="${GRAFANA_DEPLOYMENT_NAME}"
+  local grafana_svc="${GRAFANA_SERVICE_NAME}"
+  local grafana_secret="${GRAFANA_SECRET_NAME}"
+  local local_port="${GRAFANA_PORT_FORWARD_LOCAL_PORT}"
+  local infinity_plugin="yesoreyeram-infinity-datasource"
+
+  if ! kubectl get deployment "${grafana_deploy}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
+    log "Warn: Grafana deployment ${MONITORING_NAMESPACE}/${grafana_deploy} not found; skipping Infinity provisioning"
+    return 0
+  fi
+
+  if ! kubectl get service "${grafana_svc}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
+    log "Warn: Grafana service ${MONITORING_NAMESPACE}/${grafana_svc} not found; skipping Infinity provisioning"
+    return 0
+  fi
+
+  if ! kubectl get secret "${grafana_secret}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
+    log "Warn: Grafana secret ${MONITORING_NAMESPACE}/${grafana_secret} not found; skipping Infinity provisioning"
+    return 0
+  fi
+
+  local current_plugins
+  current_plugins="$(kubectl get deployment "${grafana_deploy}" -n "${MONITORING_NAMESPACE}" -o json \
+    | jq -r '.spec.template.spec.containers[] | select(.name=="grafana") | (.env // [])[] | select(.name=="GF_INSTALL_PLUGINS") | .value' \
+    | head -n 1)"
+  current_plugins="${current_plugins:-}"
+
+  local merged_plugins
+  merged_plugins="$(append_csv_unique "${current_plugins}" "${infinity_plugin}")"
+
+  if [[ "${merged_plugins}" != "${current_plugins}" ]]; then
+    log "Enabling Grafana Infinity plugin on ${grafana_deploy}"
+    kubectl set env deployment/"${grafana_deploy}" -n "${MONITORING_NAMESPACE}" GF_INSTALL_PLUGINS="${merged_plugins}" >/dev/null
+    log "Waiting for Grafana rollout after plugin update"
+    kubectl rollout status deployment/"${grafana_deploy}" -n "${MONITORING_NAMESPACE}" --timeout=300s >/dev/null
+  else
+    log "Grafana Infinity plugin already configured"
+  fi
+
+  local grafana_user
+  local grafana_password
+  grafana_user="$(kubectl get secret -n "${MONITORING_NAMESPACE}" "${grafana_secret}" -o jsonpath='{.data.admin-user}' | base64 --decode 2>/dev/null || true)"
+  grafana_password="$(kubectl get secret -n "${MONITORING_NAMESPACE}" "${grafana_secret}" -o jsonpath='{.data.admin-password}' | base64 --decode 2>/dev/null || true)"
+
+  if [[ -z "${grafana_user}" || -z "${grafana_password}" ]]; then
+    log "Warn: Grafana admin credentials are empty in secret ${MONITORING_NAMESPACE}/${grafana_secret}; skipping datasource provisioning"
+    return 0
+  fi
+
+  log "Checking Grafana Infinity datasource via API"
+  local pf_log_file
+  local pf_pid=""
+  pf_log_file="$(mktemp)"
+
+  cleanup_pf() {
+    if [[ -n "${pf_pid}" ]]; then
+      kill "${pf_pid}" >/dev/null 2>&1 || true
+    fi
+    rm -f "${pf_log_file}" >/dev/null 2>&1 || true
+  }
+  trap cleanup_pf RETURN
+
+  kubectl -n "${MONITORING_NAMESPACE}" port-forward svc/"${grafana_svc}" "${local_port}:80" >"${pf_log_file}" 2>&1 &
+  pf_pid="$!"
+
+  local ok="false"
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS -u "${grafana_user}:${grafana_password}" "http://127.0.0.1:${local_port}/api/health" >/dev/null 2>&1; then
+      ok="true"
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ "${ok}" != "true" ]]; then
+    log "Warn: Grafana API did not become reachable on localhost:${local_port}; skipping datasource provisioning"
+    return 0
+  fi
+
+  local infinity_uid
+  infinity_uid="$(curl -fsS -u "${grafana_user}:${grafana_password}" "http://127.0.0.1:${local_port}/api/datasources" \
+    | jq -r 'map(select(.type=="yesoreyeram-infinity-datasource")) | .[0].uid // empty')"
+
+  if [[ -n "${infinity_uid}" ]]; then
+    log "Infinity datasource already present (uid=${infinity_uid})"
+    return 0
+  fi
+
+  local create_resp
+  create_resp="$(curl -fsS -u "${grafana_user}:${grafana_password}" -H 'Content-Type: application/json' \
+    -X POST "http://127.0.0.1:${local_port}/api/datasources" \
+    -d '{"name":"Infinity","type":"yesoreyeram-infinity-datasource","access":"proxy","isDefault":false}')"
+
+  local created_message
+  created_message="$(jq -r '.message // .status // "created"' <<<"${create_resp}")"
+  log "Infinity datasource provisioning: ${created_message}"
 }
 
 main() {
@@ -81,6 +213,12 @@ main() {
   log "Installing/upgrading kube-prometheus-stack"
   helm upgrade --install "${KUBE_PROM_STACK_RELEASE}" prometheus-community/kube-prometheus-stack \
     --namespace "${MONITORING_NAMESPACE}" --create-namespace >/dev/null
+
+  if [[ "${ENABLE_GRAFANA_INFINITY_SETUP}" == "true" ]]; then
+    ensure_infinity_plugin_and_datasource
+  else
+    log "Skipping Grafana Infinity plugin/datasource setup (ENABLE_GRAFANA_INFINITY_SETUP=${ENABLE_GRAFANA_INFINITY_SETUP})"
+  fi
 
   log "Applying API deployment/service manifest: ${API_MANIFEST_PATH}"
   kubectl apply -f "${API_MANIFEST_PATH}" >/dev/null
