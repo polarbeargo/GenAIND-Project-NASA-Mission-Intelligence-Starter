@@ -140,12 +140,12 @@
       },
       "targets": [
         {
-          "expr": "rate(nasa_monitoring_requests_total[5m])",
+          "expr": "sum without (instance,pod,container,endpoint) (rate(nasa_monitoring_requests_total[5m]))",
           "legendFormat": "Requests/sec",
           "refId": "A"
         },
         {
-          "expr": "rate(nasa_monitoring_errors_total[5m])",
+          "expr": "sum without (instance,pod,container,endpoint) (rate(nasa_monitoring_errors_total[5m]))",
           "legendFormat": "Errors/sec",
           "refId": "B"
         }
@@ -205,7 +205,7 @@
       "pluginVersion": "10.4.0",
       "targets": [
         {
-          "expr": "nasa_monitoring_error_rate_percent",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_error_rate_percent)",
           "refId": "A"
         }
       ],
@@ -294,22 +294,22 @@
       },
       "targets": [
         {
-          "expr": "nasa_monitoring_rag_retrieval_quality_avg",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_rag_retrieval_quality_avg)",
           "legendFormat": "RAG Retrieval Quality",
           "refId": "A"
         },
         {
-          "expr": "nasa_monitoring_rag_faithfulness_avg",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_rag_faithfulness_avg)",
           "legendFormat": "Faithfulness",
           "refId": "B"
         },
         {
-          "expr": "nasa_monitoring_rag_response_relevancy_avg",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_rag_response_relevancy_avg)",
           "legendFormat": "Response Relevancy",
           "refId": "C"
         },
         {
-          "expr": "nasa_monitoring_rag_context_precision_avg",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_rag_context_precision_avg)",
           "legendFormat": "Context Precision",
           "refId": "D"
         }
@@ -389,12 +389,12 @@
       },
       "targets": [
         {
-          "expr": "nasa_monitoring_latency_avg_ms",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_latency_avg_ms)",
           "legendFormat": "Average Latency",
           "refId": "A"
         },
         {
-          "expr": "nasa_monitoring_latency_p95_ms",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_latency_p95_ms)",
           "legendFormat": "P95 Latency",
           "refId": "B"
         }
@@ -454,7 +454,7 @@
       "pluginVersion": "10.4.0",
       "targets": [
         {
-          "expr": "(nasa_monitoring_sink_queue_depth / nasa_monitoring_sink_queue_capacity) * 100",
+          "expr": "(avg without (instance,pod,container,endpoint) (nasa_monitoring_sink_queue_depth) / avg without (instance,pod,container,endpoint) (nasa_monitoring_sink_queue_capacity)) * 100",
           "refId": "A"
         }
       ],
@@ -511,7 +511,7 @@
       "pluginVersion": "10.4.0",
       "targets": [
         {
-          "expr": "nasa_monitoring_sink_dropped_total",
+          "expr": "sum without (instance,pod,container,endpoint) (nasa_monitoring_sink_dropped_total)",
           "refId": "A"
         }
       ],
@@ -568,7 +568,7 @@
       "pluginVersion": "10.4.0",
       "targets": [
         {
-          "expr": "nasa_monitoring_sink_write_failures_total",
+          "expr": "sum without (instance,pod,container,endpoint) (nasa_monitoring_sink_write_failures_total)",
           "refId": "A"
         }
       ],
@@ -625,7 +625,7 @@
       "pluginVersion": "10.4.0",
       "targets": [
         {
-          "expr": "nasa_monitoring_mirror_write_failures_total",
+          "expr": "sum without (instance,pod,container,endpoint) (nasa_monitoring_mirror_write_failures_total)",
           "refId": "A"
         }
       ],
@@ -704,13 +704,66 @@
       },
       "targets": [
         {
-          "expr": "nasa_monitoring_sink_queue_depth",
+          "expr": "avg without (instance,pod,container,endpoint) (nasa_monitoring_sink_queue_depth)",
           "legendFormat": "Queue Depth",
           "refId": "A"
         }
       ],
       "title": "Sink Queue Depth (Real-time)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 10,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "fields": "",
+          "calcs": ["lastNotNull"]
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "expr": "sum without (instance,pod,container,endpoint) (nasa_monitoring_rag_scored_requests_total)",
+          "refId": "A"
+        }
+      ],
+      "title": "RAG Scored Requests (Total)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
