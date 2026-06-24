@@ -224,11 +224,107 @@ class PostgresInteractionSink:
 
         self.dsn = dsn
         self.table_name = table_name
+        self._latest_table_name = f"{table_name}_latest"
+        self._agg_overall_table_name = f"{table_name}_agg_overall"
+        self._agg_backend_table_name = f"{table_name}_agg_backend"
+        self._agg_model_table_name = f"{table_name}_agg_model"
+        self._incremental_aggregates_enabled = (os.getenv("MONITORING_POSTGRES_INCREMENTAL_AGGREGATES") or "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._setup_lock = threading.Lock()
         self._setup_complete = False
 
     def _connect(self):
-        return psycopg.connect(self.dsn, autocommit=True)
+        return psycopg.connect(self.dsn)
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+            if math.isnan(parsed):
+                return default
+            return parsed
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_optional_float(value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+            if math.isnan(parsed):
+                return None
+            return parsed
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _row_retrieval_quality(
+        faithfulness: Optional[float],
+        response_relevancy: Optional[float],
+        context_precision: Optional[float],
+    ) -> Optional[float]:
+        values = [value for value in [faithfulness, response_relevancy, context_precision] if value is not None]
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    @staticmethod
+    def _row_contributions(row: Optional[Dict[str, Any]]) -> Dict[str, float]:
+        if row is None:
+            return {
+                "total_requests": 0.0,
+                "total_errors": 0.0,
+                "latency_sum": 0.0,
+                "latency_count": 0.0,
+                "rag_scored_requests": 0.0,
+                "rag_faithfulness_sum": 0.0,
+                "rag_faithfulness_count": 0.0,
+                "rag_response_relevancy_sum": 0.0,
+                "rag_response_relevancy_count": 0.0,
+                "rag_context_precision_sum": 0.0,
+                "rag_context_precision_count": 0.0,
+                "rag_retrieval_quality_sum": 0.0,
+                "rag_retrieval_quality_count": 0.0,
+            }
+
+        faithfulness = PostgresInteractionSink._as_optional_float(row.get("metric_faithfulness"))
+        response_relevancy = PostgresInteractionSink._as_optional_float(row.get("metric_response_relevancy"))
+        context_precision = PostgresInteractionSink._as_optional_float(row.get("metric_context_precision"))
+        retrieval_quality = PostgresInteractionSink._as_optional_float(row.get("retrieval_quality"))
+        if retrieval_quality is None:
+            retrieval_quality = PostgresInteractionSink._row_retrieval_quality(
+                faithfulness,
+                response_relevancy,
+                context_precision,
+            )
+
+        latency_ms = PostgresInteractionSink._as_optional_float(row.get("latency_ms"))
+        rag_scored = any(value is not None for value in [faithfulness, response_relevancy, context_precision])
+
+        return {
+            "total_requests": 1.0,
+            "total_errors": PostgresInteractionSink._as_float(row.get("is_error"), 0.0),
+            "latency_sum": float(latency_ms or 0.0),
+            "latency_count": 1.0 if latency_ms is not None else 0.0,
+            "rag_scored_requests": 1.0 if rag_scored else 0.0,
+            "rag_faithfulness_sum": float(faithfulness or 0.0),
+            "rag_faithfulness_count": 1.0 if faithfulness is not None else 0.0,
+            "rag_response_relevancy_sum": float(response_relevancy or 0.0),
+            "rag_response_relevancy_count": 1.0 if response_relevancy is not None else 0.0,
+            "rag_context_precision_sum": float(context_precision or 0.0),
+            "rag_context_precision_count": 1.0 if context_precision is not None else 0.0,
+            "rag_retrieval_quality_sum": float(retrieval_quality or 0.0),
+            "rag_retrieval_quality_count": 1.0 if retrieval_quality is not None else 0.0,
+        }
+
+    @staticmethod
+    def _contribution_delta(new_row: Optional[Dict[str, Any]], old_row: Optional[Dict[str, Any]]) -> Dict[str, float]:
+        new_values = PostgresInteractionSink._row_contributions(new_row)
+        old_values = PostgresInteractionSink._row_contributions(old_row)
+        return {key: float(new_values.get(key, 0.0) - old_values.get(key, 0.0)) for key in new_values.keys()}
 
     def _ensure_table(self) -> None:
         if self._setup_complete:
@@ -239,6 +335,10 @@ class PostgresInteractionSink:
                 return
 
             table_identifier = sql.Identifier(self.table_name)
+            latest_table_identifier = sql.Identifier(self._latest_table_name)
+            agg_overall_table_identifier = sql.Identifier(self._agg_overall_table_name)
+            agg_backend_table_identifier = sql.Identifier(self._agg_backend_table_name)
+            agg_model_table_identifier = sql.Identifier(self._agg_model_table_name)
             safe_prefix = "".join(character if character.isalnum() else "_" for character in self.table_name)
             with self._connect() as conn:
                 with conn.cursor() as cursor:
@@ -280,7 +380,546 @@ class PostgresInteractionSink:
                                 sql.Identifier(column_name),
                             )
                         )
+
+                    if self._incremental_aggregates_enabled:
+                        cursor.execute(
+                            sql.SQL(
+                                """
+                                CREATE TABLE IF NOT EXISTS {} (
+                                    interaction_id TEXT PRIMARY KEY,
+                                    recorded_at TIMESTAMPTZ,
+                                    question TEXT,
+                                    answer TEXT,
+                                    model TEXT NOT NULL,
+                                    backend TEXT NOT NULL,
+                                    mission TEXT,
+                                    context_count INTEGER NOT NULL,
+                                    answer_length INTEGER NOT NULL,
+                                    question_length INTEGER NOT NULL,
+                                    is_error DOUBLE PRECISION NOT NULL,
+                                    latency_ms DOUBLE PRECISION,
+                                    metric_faithfulness DOUBLE PRECISION,
+                                    metric_response_relevancy DOUBLE PRECISION,
+                                    metric_context_precision DOUBLE PRECISION,
+                                    retrieval_quality DOUBLE PRECISION,
+                                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                )
+                                """
+                            ).format(latest_table_identifier)
+                        )
+                        cursor.execute(
+                            sql.SQL(
+                                """
+                                CREATE TABLE IF NOT EXISTS {} (
+                                    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE,
+                                    total_requests DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    total_errors DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_scored_requests DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_faithfulness_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_faithfulness_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_response_relevancy_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_response_relevancy_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_context_precision_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_context_precision_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_retrieval_quality_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    rag_retrieval_quality_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                )
+                                """
+                            ).format(agg_overall_table_identifier)
+                        )
+                        cursor.execute(
+                            sql.SQL(
+                                """
+                                INSERT INTO {} (singleton)
+                                VALUES (TRUE)
+                                ON CONFLICT (singleton) DO NOTHING
+                                """
+                            ).format(agg_overall_table_identifier)
+                        )
+                        cursor.execute(
+                            sql.SQL(
+                                """
+                                CREATE TABLE IF NOT EXISTS {} (
+                                    backend TEXT PRIMARY KEY,
+                                    total_requests DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    total_errors DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                )
+                                """
+                            ).format(agg_backend_table_identifier)
+                        )
+                        cursor.execute(
+                            sql.SQL(
+                                """
+                                CREATE TABLE IF NOT EXISTS {} (
+                                    model TEXT PRIMARY KEY,
+                                    total_requests DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    total_errors DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    latency_count DOUBLE PRECISION NOT NULL DEFAULT 0,
+                                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                )
+                                """
+                            ).format(agg_model_table_identifier)
+                        )
             self._setup_complete = True
+
+    def _record_to_latest_projection(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        interaction_id = str(record.get("interaction_id") or "").strip() or f"legacy-{uuid4().hex}"
+        metric_faithfulness = self._as_optional_float(record.get("metric_faithfulness"))
+        metric_response_relevancy = self._as_optional_float(record.get("metric_response_relevancy"))
+        metric_context_precision = self._as_optional_float(record.get("metric_context_precision"))
+        retrieval_quality = self._as_optional_float(record.get("retrieval_quality"))
+        if retrieval_quality is None:
+            retrieval_quality = self._row_retrieval_quality(
+                metric_faithfulness,
+                metric_response_relevancy,
+                metric_context_precision,
+            )
+
+        return {
+            "interaction_id": interaction_id,
+            "recorded_at": str(record.get("timestamp") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+            "question": str(record.get("question") or ""),
+            "answer": str(record.get("answer") or ""),
+            "model": str(record.get("model") or "unknown"),
+            "backend": str(record.get("backend") or "unknown"),
+            "mission": str(record.get("mission") or "all"),
+            "context_count": int(record.get("context_count") or 0),
+            "answer_length": int(record.get("answer_length") or len(str(record.get("answer") or ""))),
+            "question_length": int(record.get("question_length") or len(str(record.get("question") or ""))),
+            "is_error": self._as_float(record.get("is_error"), 0.0),
+            "latency_ms": self._as_optional_float(record.get("latency_ms")),
+            "metric_faithfulness": metric_faithfulness,
+            "metric_response_relevancy": metric_response_relevancy,
+            "metric_context_precision": metric_context_precision,
+            "retrieval_quality": retrieval_quality,
+        }
+
+    def _merge_latest_projection(self, previous: Optional[Dict[str, Any]], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        if previous is None:
+            return dict(incoming)
+
+        merged = dict(previous)
+        for key, value in incoming.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and value == "":
+                continue
+            merged[key] = value
+
+        merged["retrieval_quality"] = self._row_retrieval_quality(
+            self._as_optional_float(merged.get("metric_faithfulness")),
+            self._as_optional_float(merged.get("metric_response_relevancy")),
+            self._as_optional_float(merged.get("metric_context_precision")),
+        )
+        return merged
+
+    def _fetch_latest_row(self, cursor: Any, interaction_id: str) -> Optional[Dict[str, Any]]:
+        latest_table_identifier = sql.Identifier(self._latest_table_name)
+        query = sql.SQL(
+            """
+            SELECT
+                interaction_id,
+                recorded_at,
+                question,
+                answer,
+                model,
+                backend,
+                mission,
+                context_count,
+                answer_length,
+                question_length,
+                is_error,
+                latency_ms,
+                metric_faithfulness,
+                metric_response_relevancy,
+                metric_context_precision,
+                retrieval_quality
+            FROM {}
+            WHERE interaction_id = %s
+            FOR UPDATE
+            """
+        ).format(latest_table_identifier)
+        cursor.execute(query, (interaction_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        keys = [
+            "interaction_id",
+            "recorded_at",
+            "question",
+            "answer",
+            "model",
+            "backend",
+            "mission",
+            "context_count",
+            "answer_length",
+            "question_length",
+            "is_error",
+            "latency_ms",
+            "metric_faithfulness",
+            "metric_response_relevancy",
+            "metric_context_precision",
+            "retrieval_quality",
+        ]
+        return {key: row[idx] for idx, key in enumerate(keys)}
+
+    def _upsert_latest_row(self, cursor: Any, merged: Dict[str, Any]) -> None:
+        latest_table_identifier = sql.Identifier(self._latest_table_name)
+        cursor.execute(
+            sql.SQL(
+                """
+                INSERT INTO {} (
+                    interaction_id,
+                    recorded_at,
+                    question,
+                    answer,
+                    model,
+                    backend,
+                    mission,
+                    context_count,
+                    answer_length,
+                    question_length,
+                    is_error,
+                    latency_ms,
+                    metric_faithfulness,
+                    metric_response_relevancy,
+                    metric_context_precision,
+                    retrieval_quality,
+                    updated_at
+                ) VALUES (
+                    %s,
+                    %s::timestamptz,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    now()
+                )
+                ON CONFLICT (interaction_id) DO UPDATE SET
+                    recorded_at = EXCLUDED.recorded_at,
+                    question = EXCLUDED.question,
+                    answer = EXCLUDED.answer,
+                    model = EXCLUDED.model,
+                    backend = EXCLUDED.backend,
+                    mission = EXCLUDED.mission,
+                    context_count = EXCLUDED.context_count,
+                    answer_length = EXCLUDED.answer_length,
+                    question_length = EXCLUDED.question_length,
+                    is_error = EXCLUDED.is_error,
+                    latency_ms = EXCLUDED.latency_ms,
+                    metric_faithfulness = EXCLUDED.metric_faithfulness,
+                    metric_response_relevancy = EXCLUDED.metric_response_relevancy,
+                    metric_context_precision = EXCLUDED.metric_context_precision,
+                    retrieval_quality = EXCLUDED.retrieval_quality,
+                    updated_at = now()
+                """
+            ).format(latest_table_identifier),
+            (
+                merged.get("interaction_id"),
+                merged.get("recorded_at"),
+                merged.get("question"),
+                merged.get("answer"),
+                merged.get("model"),
+                merged.get("backend"),
+                merged.get("mission"),
+                int(merged.get("context_count") or 0),
+                int(merged.get("answer_length") or 0),
+                int(merged.get("question_length") or 0),
+                self._as_float(merged.get("is_error"), 0.0),
+                self._as_optional_float(merged.get("latency_ms")),
+                self._as_optional_float(merged.get("metric_faithfulness")),
+                self._as_optional_float(merged.get("metric_response_relevancy")),
+                self._as_optional_float(merged.get("metric_context_precision")),
+                self._as_optional_float(merged.get("retrieval_quality")),
+            ),
+        )
+
+    def _apply_overall_delta(self, cursor: Any, delta: Dict[str, float]) -> None:
+        agg_overall_table_identifier = sql.Identifier(self._agg_overall_table_name)
+        cursor.execute(
+            sql.SQL(
+                """
+                UPDATE {}
+                SET
+                    total_requests = total_requests + %s,
+                    total_errors = total_errors + %s,
+                    latency_sum = latency_sum + %s,
+                    latency_count = latency_count + %s,
+                    rag_scored_requests = rag_scored_requests + %s,
+                    rag_faithfulness_sum = rag_faithfulness_sum + %s,
+                    rag_faithfulness_count = rag_faithfulness_count + %s,
+                    rag_response_relevancy_sum = rag_response_relevancy_sum + %s,
+                    rag_response_relevancy_count = rag_response_relevancy_count + %s,
+                    rag_context_precision_sum = rag_context_precision_sum + %s,
+                    rag_context_precision_count = rag_context_precision_count + %s,
+                    rag_retrieval_quality_sum = rag_retrieval_quality_sum + %s,
+                    rag_retrieval_quality_count = rag_retrieval_quality_count + %s,
+                    updated_at = now()
+                WHERE singleton = TRUE
+                """
+            ).format(agg_overall_table_identifier),
+            (
+                delta["total_requests"],
+                delta["total_errors"],
+                delta["latency_sum"],
+                delta["latency_count"],
+                delta["rag_scored_requests"],
+                delta["rag_faithfulness_sum"],
+                delta["rag_faithfulness_count"],
+                delta["rag_response_relevancy_sum"],
+                delta["rag_response_relevancy_count"],
+                delta["rag_context_precision_sum"],
+                delta["rag_context_precision_count"],
+                delta["rag_retrieval_quality_sum"],
+                delta["rag_retrieval_quality_count"],
+            ),
+        )
+
+    def _apply_dimensional_delta(self, cursor: Any, table_name: str, dim_name: str, dim_value: str, delta: Dict[str, float]) -> None:
+        table_identifier = sql.Identifier(table_name)
+        dim_identifier = sql.Identifier(dim_name)
+        value = str(dim_value or "unknown")
+        cursor.execute(
+            sql.SQL(
+                """
+                INSERT INTO {} ({}, total_requests, total_errors, latency_sum, latency_count, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT ({}) DO UPDATE SET
+                    total_requests = {}.total_requests + EXCLUDED.total_requests,
+                    total_errors = {}.total_errors + EXCLUDED.total_errors,
+                    latency_sum = {}.latency_sum + EXCLUDED.latency_sum,
+                    latency_count = {}.latency_count + EXCLUDED.latency_count,
+                    updated_at = now()
+                """
+            ).format(
+                table_identifier,
+                dim_identifier,
+                dim_identifier,
+                table_identifier,
+                table_identifier,
+                table_identifier,
+                table_identifier,
+            ),
+            (
+                value,
+                delta["total_requests"],
+                delta["total_errors"],
+                delta["latency_sum"],
+                delta["latency_count"],
+            ),
+        )
+
+    def _apply_incremental_aggregates_for_record(self, cursor: Any, record: Dict[str, Any]) -> None:
+        incoming = self._record_to_latest_projection(record)
+        interaction_id = str(incoming.get("interaction_id") or "")
+        previous = self._fetch_latest_row(cursor, interaction_id)
+        merged = self._merge_latest_projection(previous, incoming)
+        self._upsert_latest_row(cursor, merged)
+
+        delta = self._contribution_delta(merged, previous)
+        self._apply_overall_delta(cursor, delta)
+
+        merged_backend = str(merged.get("backend") or "unknown")
+        previous_backend = str((previous or {}).get("backend") or "unknown")
+        merged_model = str(merged.get("model") or "unknown")
+        previous_model = str((previous or {}).get("model") or "unknown")
+
+        if previous is None:
+            self._apply_dimensional_delta(cursor, self._agg_backend_table_name, "backend", merged_backend, delta)
+            self._apply_dimensional_delta(cursor, self._agg_model_table_name, "model", merged_model, delta)
+            return
+
+        if previous_backend == merged_backend:
+            self._apply_dimensional_delta(cursor, self._agg_backend_table_name, "backend", merged_backend, delta)
+        else:
+            old_backend_contrib = self._row_contributions(previous)
+            new_backend_contrib = self._row_contributions(merged)
+            self._apply_dimensional_delta(
+                cursor,
+                self._agg_backend_table_name,
+                "backend",
+                previous_backend,
+                {key: -value for key, value in old_backend_contrib.items()},
+            )
+            self._apply_dimensional_delta(cursor, self._agg_backend_table_name, "backend", merged_backend, new_backend_contrib)
+
+        if previous_model == merged_model:
+            self._apply_dimensional_delta(cursor, self._agg_model_table_name, "model", merged_model, delta)
+        else:
+            old_model_contrib = self._row_contributions(previous)
+            new_model_contrib = self._row_contributions(merged)
+            self._apply_dimensional_delta(
+                cursor,
+                self._agg_model_table_name,
+                "model",
+                previous_model,
+                {key: -value for key, value in old_model_contrib.items()},
+            )
+            self._apply_dimensional_delta(cursor, self._agg_model_table_name, "model", merged_model, new_model_contrib)
+
+    def supports_incremental_rollups(self) -> bool:
+        return bool(self._incremental_aggregates_enabled)
+
+    def load_incremental_rollups(self) -> Optional[Dict[str, Any]]:
+        if not self._incremental_aggregates_enabled:
+            return None
+
+        self._ensure_table()
+        agg_overall_table_identifier = sql.Identifier(self._agg_overall_table_name)
+        agg_backend_table_identifier = sql.Identifier(self._agg_backend_table_name)
+        agg_model_table_identifier = sql.Identifier(self._agg_model_table_name)
+        latest_table_identifier = sql.Identifier(self._latest_table_name)
+
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT
+                            total_requests,
+                            total_errors,
+                            latency_sum,
+                            latency_count,
+                            rag_scored_requests,
+                            rag_faithfulness_sum,
+                            rag_faithfulness_count,
+                            rag_response_relevancy_sum,
+                            rag_response_relevancy_count,
+                            rag_context_precision_sum,
+                            rag_context_precision_count,
+                            rag_retrieval_quality_sum,
+                            rag_retrieval_quality_count
+                        FROM {}
+                        WHERE singleton = TRUE
+                        """
+                    ).format(agg_overall_table_identifier)
+                )
+                overall = cursor.fetchone()
+                if overall is None:
+                    return None
+
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT
+                            COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)
+                        FROM {}
+                        WHERE latency_ms IS NOT NULL
+                        """
+                    ).format(latest_table_identifier)
+                )
+                p95_row = cursor.fetchone()
+                p95_latency_ms = self._as_float(p95_row[0] if p95_row else 0.0, 0.0)
+
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT backend, total_requests, total_errors, latency_sum, latency_count
+                        FROM {}
+                        ORDER BY total_requests DESC
+                        """
+                    ).format(agg_backend_table_identifier)
+                )
+                backend_rows = cursor.fetchall()
+
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT model, total_requests, total_errors, latency_sum, latency_count
+                        FROM {}
+                        ORDER BY total_requests DESC
+                        """
+                    ).format(agg_model_table_identifier)
+                )
+                model_rows = cursor.fetchall()
+
+        total_requests = self._as_float(overall[0], 0.0)
+        total_errors = self._as_float(overall[1], 0.0)
+        latency_sum = self._as_float(overall[2], 0.0)
+        latency_count = self._as_float(overall[3], 0.0)
+        rag_scored_requests = self._as_float(overall[4], 0.0)
+        rag_faithfulness_sum = self._as_float(overall[5], 0.0)
+        rag_faithfulness_count = self._as_float(overall[6], 0.0)
+        rag_response_relevancy_sum = self._as_float(overall[7], 0.0)
+        rag_response_relevancy_count = self._as_float(overall[8], 0.0)
+        rag_context_precision_sum = self._as_float(overall[9], 0.0)
+        rag_context_precision_count = self._as_float(overall[10], 0.0)
+        rag_retrieval_quality_sum = self._as_float(overall[11], 0.0)
+        rag_retrieval_quality_count = self._as_float(overall[12], 0.0)
+
+        backend_rollups = []
+        for backend, requests, errors, latency_total, latency_samples in backend_rows:
+            request_count = self._as_float(requests, 0.0)
+            backend_rollups.append(
+                {
+                    "backend": str(backend or "unknown"),
+                    "requests": int(request_count),
+                    "error_rate_percent": (self._as_float(errors, 0.0) / request_count * 100.0) if request_count > 0 else 0.0,
+                    "avg_latency_ms": (self._as_float(latency_total, 0.0) / self._as_float(latency_samples, 0.0))
+                    if self._as_float(latency_samples, 0.0) > 0
+                    else None,
+                }
+            )
+
+        model_rollups = []
+        for model, requests, errors, latency_total, latency_samples in model_rows:
+            request_count = self._as_float(requests, 0.0)
+            model_rollups.append(
+                {
+                    "model": str(model or "unknown"),
+                    "requests": int(request_count),
+                    "error_rate_percent": (self._as_float(errors, 0.0) / request_count * 100.0) if request_count > 0 else 0.0,
+                    "avg_latency_ms": (self._as_float(latency_total, 0.0) / self._as_float(latency_samples, 0.0))
+                    if self._as_float(latency_samples, 0.0) > 0
+                    else None,
+                }
+            )
+
+        return {
+            "status": "ok",
+            "engine": "postgres-incremental-rollups",
+            "overall": {
+                "total_requests": int(total_requests),
+                "total_errors": int(total_errors),
+                "error_rate_percent": (total_errors / total_requests * 100.0) if total_requests > 0 else 0.0,
+                "avg_latency_ms": (latency_sum / latency_count) if latency_count > 0 else None,
+                "p95_latency_ms": p95_latency_ms,
+            },
+            "backend_rollups": backend_rollups,
+            "model_rollups": model_rollups,
+            "rag_overall": {
+                "scored_requests": int(rag_scored_requests),
+                "avg_faithfulness": (rag_faithfulness_sum / rag_faithfulness_count)
+                if rag_faithfulness_count > 0
+                else None,
+                "avg_response_relevancy": (rag_response_relevancy_sum / rag_response_relevancy_count)
+                if rag_response_relevancy_count > 0
+                else None,
+                "avg_context_precision": (rag_context_precision_sum / rag_context_precision_count)
+                if rag_context_precision_count > 0
+                else None,
+                "avg_retrieval_quality": (rag_retrieval_quality_sum / rag_retrieval_quality_count)
+                if rag_retrieval_quality_count > 0
+                else None,
+            },
+        }
 
     def persist_batch(self, records: Sequence[Dict[str, Any]]) -> None:
         if not records:
@@ -349,6 +988,11 @@ class PostgresInteractionSink:
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.executemany(insert_stmt, params)
+                if self._incremental_aggregates_enabled:
+                    for record in records:
+                        if isinstance(record, dict):
+                            self._apply_incremental_aggregates_for_record(cursor, record)
+            conn.commit()
 
     def load_dataframe(self) -> pd.DataFrame:
         self._ensure_table()
@@ -553,12 +1197,30 @@ class EvidentlyMonitor:
         self._writer_thread.start()
         atexit.register(self.shutdown)
 
+        # Keyed, incremental materialization state used by analytics/RAG endpoints.
+        # This replaces full read-time canonicalization on every query.
+        self._state_lock = threading.RLock()
+        self._materialized_by_interaction: Dict[str, Dict[str, Any]] = {}
+        self._materialized_order: Dict[str, int] = {}
+        self._materialized_bootstrapped = False
+        self._materialized_next_order = 0
+        self._materialized_next_legacy_id = 0
+        self._materialized_version = 0
+        self._materialized_refresh_seconds = self._parse_float_env(
+            "MONITORING_MATERIALIZED_REFRESH_SECONDS",
+            30.0,
+            minimum=1.0,
+        )
+        self._materialized_last_refresh_monotonic = 0.0
+        self._materialized_last_signature: Optional[Tuple[Any, ...]] = None
+
         self._analytics_cache: Dict[str, Any] = {
-            "signature": None,
+            "version": None,
             "result": None,
         }
         self._rag_cache: Dict[str, Any] = {
-            "signature": None,
+            "version": None,
+            "recent_failures_limit": None,
             "result": None,
         }
 
@@ -675,10 +1337,113 @@ class EvidentlyMonitor:
         return mirrors
 
     def _invalidate_caches(self) -> None:
-        self._analytics_cache["signature"] = None
+        self._analytics_cache["version"] = None
         self._analytics_cache["result"] = None
-        self._rag_cache["signature"] = None
+        self._rag_cache["version"] = None
+        self._rag_cache["recent_failures_limit"] = None
         self._rag_cache["result"] = None
+
+    @staticmethod
+    def _value_is_present(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str) and value == "":
+            return False
+        if isinstance(value, float) and math.isnan(value):
+            return False
+        return True
+
+    def _next_legacy_interaction_key_locked(self) -> str:
+        key = f"legacy-{self._materialized_next_legacy_id}"
+        self._materialized_next_legacy_id += 1
+        return key
+
+    def _resolve_interaction_key_locked(self, record: Dict[str, Any]) -> str:
+        interaction_id = record.get("interaction_id")
+        if isinstance(interaction_id, str) and interaction_id.strip():
+            return interaction_id.strip()
+        if interaction_id is not None:
+            interaction_id_text = str(interaction_id).strip()
+            if interaction_id_text:
+                return interaction_id_text
+        return self._next_legacy_interaction_key_locked()
+
+    def _apply_record_to_materialized_state_locked(self, record: Dict[str, Any]) -> None:
+        interaction_key = self._resolve_interaction_key_locked(record)
+        existing = self._materialized_by_interaction.get(interaction_key)
+        if existing is None:
+            merged = {
+                "interaction_id": interaction_key,
+                "record_kind": "interaction",
+            }
+            self._materialized_order[interaction_key] = self._materialized_next_order
+            self._materialized_next_order += 1
+        else:
+            merged = dict(existing)
+
+        # Forward-fill semantics by key: only present values overwrite existing values.
+        for key, value in record.items():
+            if self._value_is_present(value):
+                merged[key] = value
+
+        merged["interaction_id"] = interaction_key
+        merged["record_kind"] = "interaction"
+        self._materialized_by_interaction[interaction_key] = merged
+
+    def _rebuild_materialized_state_from_sink_locked(self) -> None:
+        dataset = self.load_dataframe()
+        self._materialized_by_interaction = {}
+        self._materialized_order = {}
+        self._materialized_next_order = 0
+        self._materialized_next_legacy_id = 0
+
+        if not dataset.empty:
+            for record in dataset.to_dict(orient="records"):
+                if isinstance(record, dict):
+                    self._apply_record_to_materialized_state_locked(record)
+
+        self._materialized_bootstrapped = True
+        self._materialized_last_signature = self._log_signature()
+        self._materialized_last_refresh_monotonic = time.monotonic()
+        self._materialized_version += 1
+        self._invalidate_caches()
+
+    def _ensure_materialized_state_loaded(self) -> bool:
+        should_check_signature = False
+        with self._state_lock:
+            if self._materialized_bootstrapped:
+                elapsed = time.monotonic() - self._materialized_last_refresh_monotonic
+                if elapsed < self._materialized_refresh_seconds:
+                    return False
+                self._materialized_last_refresh_monotonic = time.monotonic()
+                should_check_signature = True
+            else:
+                self._rebuild_materialized_state_from_sink_locked()
+                return True
+
+        if should_check_signature:
+            latest_signature = self._log_signature()
+            with self._state_lock:
+                if self._materialized_last_signature is None:
+                    self._materialized_last_signature = latest_signature
+                    return False
+                if latest_signature == self._materialized_last_signature:
+                    return False
+                self._rebuild_materialized_state_from_sink_locked()
+                return True
+
+        return False
+
+    def _materialized_records_snapshot(self) -> Tuple[List[Dict[str, Any]], int]:
+        self._ensure_materialized_state_loaded()
+        with self._state_lock:
+            ordered_keys = sorted(
+                self._materialized_order.keys(),
+                key=lambda key: self._materialized_order[key],
+            )
+            records = [dict(self._materialized_by_interaction[key]) for key in ordered_keys]
+            version = int(self._materialized_version)
+        return records, version
 
     def _persist_batch(self, records: Sequence[Dict[str, Any]]) -> None:
         if not records:
@@ -687,7 +1452,18 @@ class EvidentlyMonitor:
         try:
             with self._write_lock:
                 self._primary_sink.persist_batch(records)
-            self._invalidate_caches()
+            just_bootstrapped = self._ensure_materialized_state_loaded()
+            if not just_bootstrapped:
+                with self._state_lock:
+                    for record in records:
+                        if isinstance(record, dict):
+                            self._apply_record_to_materialized_state_locked(record)
+                    # Local writes are already reflected in state; defer expensive
+                    # sink signature refresh to periodic checks.
+                    self._materialized_last_signature = None
+                    self._materialized_last_refresh_monotonic = time.monotonic()
+                    self._materialized_version += 1
+                    self._invalidate_caches()
         except Exception:
             self._write_failures += len(records)
             self._logger.exception("Failed to persist monitoring interaction records to primary sink")
@@ -824,7 +1600,8 @@ class EvidentlyMonitor:
         return "high"
 
     def _prepare_rag_dataframe(self) -> pd.DataFrame:
-        dataset = self._canonicalize_dataset(self.load_dataframe())
+        records, _ = self._materialized_records_snapshot()
+        dataset = pd.DataFrame(records)
         if dataset.empty:
             return dataset
 
@@ -965,180 +1742,98 @@ class EvidentlyMonitor:
         ]
 
     def get_analytics_summary(self) -> Dict[str, Any]:
-        """Return cached analytics rollups with a Polars-first implementation."""
-        signature = self._log_signature()
-        if signature is None:
+        """Return cached analytics rollups using keyed incremental materialization."""
+        if hasattr(self._primary_sink, "supports_incremental_rollups") and hasattr(self._primary_sink, "load_incremental_rollups"):
+            try:
+                if bool(getattr(self._primary_sink, "supports_incremental_rollups")()):
+                    rollups = getattr(self._primary_sink, "load_incremental_rollups")()
+                    if isinstance(rollups, dict) and rollups.get("status") == "ok":
+                        return {
+                            "status": "ok",
+                            "engine": rollups.get("engine", "postgres-incremental-rollups"),
+                            "overall": rollups.get("overall", {}),
+                            "backend_rollups": self._round_records(list(rollups.get("backend_rollups", []))),
+                            "model_rollups": self._round_records(list(rollups.get("model_rollups", []))),
+                        }
+            except Exception:
+                self._logger.exception("Incremental Postgres rollup read failed; falling back to local materialized state")
+
+        records, version = self._materialized_records_snapshot()
+        if not records:
             return {"error": "No monitoring data found"}
 
-        if self._analytics_cache["signature"] == signature:
+        if self._analytics_cache["version"] == version:
             cached_result = self._analytics_cache["result"]
             if cached_result is not None:
                 return cached_result
 
-        result: Dict[str, Any]
-        native_path = self._primary_sink.native_ndjson_path()
+        dataset = pd.DataFrame(records)
+        if "latency_ms" not in dataset.columns:
+            dataset["latency_ms"] = None
+        if "is_error" not in dataset.columns:
+            dataset["is_error"] = 0.0
+        if "backend" not in dataset.columns:
+            dataset["backend"] = "unknown"
+        if "model" not in dataset.columns:
+            dataset["model"] = "unknown"
 
-        if native_path is not None and POLARS_AVAILABLE and pl is not None:
-            try:
-                scan = pl.scan_ndjson(str(native_path), ignore_errors=True)
-                schema_names = set(scan.collect_schema().names())
+        dataset["is_error"] = dataset["is_error"].fillna(0).astype(float)
 
-                if {"interaction_id", "record_kind"} & schema_names:
-                    raise ValueError("interaction merge requires pandas fallback")
+        total_requests = len(dataset)
+        total_errors = int(dataset["is_error"].sum())
+        latency_numeric = pd.to_numeric(dataset["latency_ms"], errors="coerce")
+        backend_rollups = (
+            dataset.groupby("backend", dropna=False)
+            .agg(
+                requests=("backend", "count"),
+                error_rate_percent=("is_error", lambda series: float(series.mean() * 100)),
+                avg_latency_ms=("latency_ms", "mean"),
+                p95_latency_ms=("latency_ms", lambda series: pd.to_numeric(series, errors="coerce").quantile(0.95)),
+            )
+            .reset_index()
+            .sort_values("requests", ascending=False)
+            .to_dict(orient="records")
+        )
+        model_rollups = (
+            dataset.groupby("model", dropna=False)
+            .agg(
+                requests=("model", "count"),
+                error_rate_percent=("is_error", lambda series: float(series.mean() * 100)),
+                avg_latency_ms=("latency_ms", "mean"),
+            )
+            .reset_index()
+            .sort_values("requests", ascending=False)
+            .to_dict(orient="records")
+        )
 
-                if not schema_names:
-                    result = {"error": "Monitoring data is empty"}
-                else:
-                    columns = []
-                    if "latency_ms" in schema_names:
-                        columns.append(pl.col("latency_ms").cast(pl.Float64, strict=False).alias("latency_ms"))
-                    else:
-                        columns.append(pl.lit(None, dtype=pl.Float64).alias("latency_ms"))
+        result = {
+            "status": "ok",
+            "engine": "keyed-materialized",
+            "overall": {
+                "total_requests": total_requests,
+                "total_errors": total_errors,
+                "error_rate_percent": round((total_errors / total_requests) * 100, 2) if total_requests else 0.0,
+                "avg_latency_ms": self._round_float(latency_numeric.mean()),
+                "p95_latency_ms": self._round_float(latency_numeric.quantile(0.95)),
+            },
+            "backend_rollups": self._round_records(backend_rollups),
+            "model_rollups": self._round_records(model_rollups),
+        }
 
-                    if "is_error" in schema_names:
-                        columns.append(pl.col("is_error").cast(pl.Float64, strict=False).fill_null(0.0).alias("is_error"))
-                    else:
-                        columns.append(pl.lit(0.0).alias("is_error"))
-
-                    if "backend" in schema_names:
-                        columns.append(pl.col("backend").cast(pl.Utf8, strict=False).fill_null("unknown").alias("backend"))
-                    else:
-                        columns.append(pl.lit("unknown").alias("backend"))
-
-                    if "model" in schema_names:
-                        columns.append(pl.col("model").cast(pl.Utf8, strict=False).fill_null("unknown").alias("model"))
-                    else:
-                        columns.append(pl.lit("unknown").alias("model"))
-
-                    dataset = scan.select(columns)
-
-                    overall_row = dataset.select([
-                        pl.len().alias("total_requests"),
-                        pl.col("is_error").sum().alias("total_errors"),
-                        pl.col("latency_ms").mean().alias("avg_latency_ms"),
-                        pl.col("latency_ms").quantile(0.95).alias("p95_latency_ms"),
-                    ]).collect().to_dicts()[0]
-
-                    total_requests = int(overall_row.get("total_requests") or 0)
-                    if total_requests == 0:
-                        result = {"error": "Monitoring data is empty"}
-                    else:
-                        total_errors = int(overall_row.get("total_errors") or 0)
-                        avg_latency_ms = overall_row.get("avg_latency_ms")
-                        p95_latency_ms = overall_row.get("p95_latency_ms")
-                        backend_rollups = (
-                            dataset.group_by("backend")
-                            .agg([
-                                pl.len().alias("requests"),
-                                (pl.col("is_error").mean() * 100).alias("error_rate_percent"),
-                                pl.col("latency_ms").mean().alias("avg_latency_ms"),
-                                pl.col("latency_ms").quantile(0.95).alias("p95_latency_ms"),
-                            ])
-                            .sort("requests", descending=True)
-                            .collect()
-                            .to_dicts()
-                        )
-
-                        model_rollups = (
-                            dataset.group_by("model")
-                            .agg([
-                                pl.len().alias("requests"),
-                                (pl.col("is_error").mean() * 100).alias("error_rate_percent"),
-                                pl.col("latency_ms").mean().alias("avg_latency_ms"),
-                            ])
-                            .sort("requests", descending=True)
-                            .collect()
-                            .to_dicts()
-                        )
-
-                        result = {
-                            "status": "ok",
-                            "engine": "polars",
-                            "overall": {
-                                "total_requests": total_requests,
-                                "total_errors": total_errors,
-                                "error_rate_percent": round((total_errors / total_requests) * 100, 2),
-                                "avg_latency_ms": self._round_float(avg_latency_ms),
-                                "p95_latency_ms": self._round_float(p95_latency_ms),
-                            },
-                            "backend_rollups": self._round_records(backend_rollups),
-                            "model_rollups": self._round_records(model_rollups),
-                        }
-            except Exception:
-                result = {"error": "polars_fallback"}
-        else:
-            result = {"error": "polars_fallback"}
-
-        if result.get("error") == "polars_fallback":
-            dataset = self.load_dataframe()
-            if dataset.empty:
-                result = {"error": "Monitoring data is empty"}
-            else:
-                dataset = self._canonicalize_dataset(dataset)
-                if "latency_ms" not in dataset.columns:
-                    dataset["latency_ms"] = None
-                if "is_error" not in dataset.columns:
-                    dataset["is_error"] = 0.0
-                if "backend" not in dataset.columns:
-                    dataset["backend"] = "unknown"
-                if "model" not in dataset.columns:
-                    dataset["model"] = "unknown"
-
-                dataset["is_error"] = dataset["is_error"].fillna(0).astype(float)
-
-                total_requests = len(dataset)
-                total_errors = int(dataset["is_error"].sum())
-                latency_numeric = pd.to_numeric(dataset["latency_ms"], errors="coerce")
-                backend_rollups = (
-                    dataset.groupby("backend", dropna=False)
-                    .agg(
-                        requests=("backend", "count"),
-                        error_rate_percent=("is_error", lambda series: float(series.mean() * 100)),
-                        avg_latency_ms=("latency_ms", "mean"),
-                    )
-                    .reset_index()
-                    .sort_values("requests", ascending=False)
-                    .to_dict(orient="records")
-                )
-                model_rollups = (
-                    dataset.groupby("model", dropna=False)
-                    .agg(
-                        requests=("model", "count"),
-                        error_rate_percent=("is_error", lambda series: float(series.mean() * 100)),
-                        avg_latency_ms=("latency_ms", "mean"),
-                    )
-                    .reset_index()
-                    .sort_values("requests", ascending=False)
-                    .to_dict(orient="records")
-                )
-
-                result = {
-                    "status": "ok",
-                    "engine": "pandas",
-                    "overall": {
-                        "total_requests": total_requests,
-                        "total_errors": total_errors,
-                        "error_rate_percent": round((total_errors / total_requests) * 100, 2) if total_requests else 0.0,
-                        "avg_latency_ms": self._round_float(latency_numeric.mean()),
-                        "p95_latency_ms": self._round_float(latency_numeric.quantile(0.95)),
-                    },
-                    "backend_rollups": self._round_records(backend_rollups),
-                    "model_rollups": self._round_records(model_rollups),
-                }
-
-        self._analytics_cache["signature"] = signature
+        self._analytics_cache["version"] = version
         self._analytics_cache["result"] = result
         return result
 
     def get_rag_dashboard_summary(self, recent_failures_limit: int = 20) -> Dict[str, Any]:
         """Return RAG-specific rollups built from logged RAGAS scores."""
-        signature = self._log_signature()
-        if signature is None:
+        records, version = self._materialized_records_snapshot()
+        if not records:
             return {"error": "No monitoring data found"}
 
-        cached_signature = self._rag_cache["signature"]
+        cached_signature = self._rag_cache["version"]
         cached_result = self._rag_cache["result"]
-        if cached_signature == (signature, recent_failures_limit) and cached_result is not None:
+        cached_limit = self._rag_cache["recent_failures_limit"]
+        if cached_signature == version and cached_limit == recent_failures_limit and cached_result is not None:
             return cached_result
 
         dataset = self._prepare_rag_dataframe()
@@ -1255,7 +1950,8 @@ class EvidentlyMonitor:
             "ranking_inc_rag": self._round_records(ranking_view),
         }
 
-        self._rag_cache["signature"] = (signature, recent_failures_limit)
+        self._rag_cache["version"] = version
+        self._rag_cache["recent_failures_limit"] = recent_failures_limit
         self._rag_cache["result"] = result
         return result
 
@@ -1264,8 +1960,20 @@ class EvidentlyMonitor:
         analytics = self.get_analytics_summary()
         rag = self.get_rag_dashboard_summary(recent_failures_limit=20)
 
+        rollup_payload: Optional[Dict[str, Any]] = None
+        if hasattr(self._primary_sink, "supports_incremental_rollups") and hasattr(self._primary_sink, "load_incremental_rollups"):
+            try:
+                if bool(getattr(self._primary_sink, "supports_incremental_rollups")()):
+                    candidate = getattr(self._primary_sink, "load_incremental_rollups")()
+                    if isinstance(candidate, dict) and candidate.get("status") == "ok":
+                        rollup_payload = candidate
+            except Exception:
+                self._logger.exception("Incremental Postgres rollup read failed while building curated snapshot")
+
         analytics_overall = analytics.get("overall", {}) if isinstance(analytics, dict) else {}
         rag_overall = rag.get("overall", {}) if isinstance(rag, dict) else {}
+        if isinstance(rollup_payload, dict):
+            rag_overall = rollup_payload.get("rag_overall", {}) or rag_overall
         sink_info = self._primary_sink.describe()
         mirror_sink_types = ",".join(mirror.describe().get("type", mirror.sink_type) for mirror in self._mirror_sinks)
 
