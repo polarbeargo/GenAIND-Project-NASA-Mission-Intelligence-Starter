@@ -97,6 +97,27 @@ class TestEvaluationModes(unittest.TestCase):
         self.assertEqual(stored.get("status"), "completed")
         self.assertAlmostEqual(stored.get("faithfulness"), 0.93)
 
+    def test_async_evaluation_completion_callback_receives_completed_payload(self):
+        callback = MagicMock()
+        workflow = build_workflow(evaluation_mode="async", evaluation_completion_callback=callback)
+        self._seed_common_mocks(workflow)
+        workflow.analysis_worker.evaluate = MagicMock(return_value={"faithfulness": 0.93})
+
+        workflow._evaluation_broker.enqueue = MagicMock(return_value=False)
+        workflow._redis_job_store.is_completed = MagicMock(return_value=False)
+        workflow._redis_job_store.acquire_processing = MagicMock(return_value=True)
+        workflow._redis_job_store.release_processing = MagicMock(return_value=True)
+        workflow._eval_job_executor.submit = lambda fn, *args: fn(*args)
+        workflow._eval_executor.submit = lambda fn, *args: fn(*args)
+
+        result = workflow.run(make_input(evaluate=True), openai_key="fake-key")
+
+        self.assertEqual(result.evaluation.get("status"), "pending")
+        callback.assert_called_once()
+        _, _, _, payload = callback.call_args.args
+        self.assertEqual(payload.get("status"), "completed")
+        self.assertAlmostEqual(payload.get("faithfulness"), 0.93)
+
     def test_sync_evaluation_runs_inline_for_debug(self):
         workflow = build_workflow(evaluation_mode="sync")
         self._seed_common_mocks(workflow)

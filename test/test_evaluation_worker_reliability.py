@@ -77,6 +77,7 @@ def _call(
     processing_ttl: int = 300,
     consumer_name: str = "test-consumer",
     message_id: str = "1-0",
+    monitor=None,
 ):
     _process_one_message(
         message_id=message_id,
@@ -89,6 +90,7 @@ def _call(
         backoff_base=backoff_base,
         backoff_max=backoff_max,
         processing_ttl=processing_ttl,
+        monitor=monitor,
     )
 
 
@@ -146,6 +148,22 @@ class TestEvaluationWorkerSuccessPath(unittest.TestCase):
         # Should be retrying, not completed.
         self.assertEqual(stored["status"], "retrying")
         broker.enqueue.assert_called_once()
+
+    def test_successful_evaluation_with_interaction_id_writes_monitoring_update(self):
+        broker, job_store, analysis_worker = _make_deps(
+            evaluate_result={"faithfulness": 0.92, "answer_relevancy": 0.89}
+        )
+        monitor = MagicMock()
+        payload = _good_payload()
+        payload["interaction_id"] = "req-123"
+
+        _call(broker, job_store, analysis_worker, payload, monitor=monitor)
+
+        monitor.log_interaction.assert_called_once()
+        kwargs = monitor.log_interaction.call_args.kwargs
+        self.assertEqual(kwargs["interaction_id"], "req-123")
+        self.assertEqual(kwargs["record_kind"], "evaluation_update")
+        self.assertTrue(kwargs["synchronous"])
 
 
 class TestEvaluationWorkerPoisonMessages(unittest.TestCase):
@@ -395,6 +413,21 @@ class TestEvaluationWorkerAckOrdering(unittest.TestCase):
 
         _call(broker, job_store, analysis_worker, _good_payload())
 
+        self.assertLess(call_order.index("set_result"), call_order.index("ack"))
+
+    def test_ack_occurs_after_monitoring_update_when_present(self):
+        call_order: list[str] = []
+        broker, job_store, analysis_worker = _make_deps()
+        monitor = MagicMock()
+        monitor.log_interaction.side_effect = lambda *a, **kw: call_order.append("monitor")
+        job_store.set_result.side_effect = lambda *a, **kw: call_order.append("set_result") or True
+        broker.ack.side_effect = lambda *a, **kw: call_order.append("ack")
+        payload = _good_payload()
+        payload["interaction_id"] = "req-123"
+
+        _call(broker, job_store, analysis_worker, payload, monitor=monitor)
+
+        self.assertLess(call_order.index("monitor"), call_order.index("set_result"))
         self.assertLess(call_order.index("set_result"), call_order.index("ack"))
 
     def test_ack_occurs_after_dead_letter_on_poisoned_message(self):
