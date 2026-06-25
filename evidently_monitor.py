@@ -234,6 +234,15 @@ class PostgresInteractionSink:
             "yes",
             "on",
         }
+        self._p95_refresh_seconds = self._as_float(
+            os.getenv("MONITORING_POSTGRES_P95_REFRESH_SECONDS"),
+            5.0,
+        )
+        if self._p95_refresh_seconds < 0.5:
+            self._p95_refresh_seconds = 0.5
+        self._p95_cache_lock = threading.Lock()
+        self._p95_latency_cached_ms = 0.0
+        self._p95_cache_refreshed_at_monotonic = 0.0
         self._setup_lock = threading.Lock()
         self._setup_complete = False
 
@@ -777,6 +786,30 @@ class PostgresInteractionSink:
     def supports_incremental_rollups(self) -> bool:
         return bool(self._incremental_aggregates_enabled)
 
+    def _get_cached_or_refreshed_p95_latency_ms(self, cursor: Any, latest_table_identifier: Any) -> float:
+        now = time.monotonic()
+        with self._p95_cache_lock:
+            if (now - self._p95_cache_refreshed_at_monotonic) < self._p95_refresh_seconds:
+                return float(self._p95_latency_cached_ms)
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT
+                    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)
+                FROM {}
+                WHERE latency_ms IS NOT NULL
+                """
+            ).format(latest_table_identifier)
+        )
+        p95_row = cursor.fetchone()
+        refreshed_value = self._as_float(p95_row[0] if p95_row else 0.0, 0.0)
+
+        with self._p95_cache_lock:
+            self._p95_latency_cached_ms = refreshed_value
+            self._p95_cache_refreshed_at_monotonic = now
+            return float(self._p95_latency_cached_ms)
+
     def load_incremental_rollups(self) -> Optional[Dict[str, Any]]:
         if not self._incremental_aggregates_enabled:
             return None
@@ -815,18 +848,10 @@ class PostgresInteractionSink:
                 if overall is None:
                     return None
 
-                cursor.execute(
-                    sql.SQL(
-                        """
-                        SELECT
-                            COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)
-                        FROM {}
-                        WHERE latency_ms IS NOT NULL
-                        """
-                    ).format(latest_table_identifier)
+                p95_latency_ms = self._get_cached_or_refreshed_p95_latency_ms(
+                    cursor,
+                    latest_table_identifier,
                 )
-                p95_row = cursor.fetchone()
-                p95_latency_ms = self._as_float(p95_row[0] if p95_row else 0.0, 0.0)
 
                 cursor.execute(
                     sql.SQL(
@@ -1223,6 +1248,16 @@ class EvidentlyMonitor:
             "recent_failures_limit": None,
             "result": None,
         }
+        self._postgres_rollup_cache_ttl_seconds = self._parse_float_env(
+            "MONITORING_POSTGRES_ROLLUP_CACHE_TTL_SECONDS",
+            1.0,
+            minimum=0.1,
+        )
+        self._postgres_rollup_cache_lock = threading.Lock()
+        self._postgres_rollup_cache: Dict[str, Any] = {
+            "expires_at_monotonic": 0.0,
+            "payload": None,
+        }
 
     @staticmethod
     def _parse_int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -1342,6 +1377,43 @@ class EvidentlyMonitor:
         self._rag_cache["version"] = None
         self._rag_cache["recent_failures_limit"] = None
         self._rag_cache["result"] = None
+
+    def _invalidate_postgres_rollup_cache(self) -> None:
+        with self._postgres_rollup_cache_lock:
+            self._postgres_rollup_cache["expires_at_monotonic"] = 0.0
+            self._postgres_rollup_cache["payload"] = None
+
+    def _get_postgres_rollup_payload_cached(self) -> Optional[Dict[str, Any]]:
+        if not (hasattr(self._primary_sink, "supports_incremental_rollups") and hasattr(self._primary_sink, "load_incremental_rollups")):
+            return None
+
+        try:
+            if not bool(getattr(self._primary_sink, "supports_incremental_rollups")()):
+                return None
+        except Exception:
+            self._logger.exception("Failed checking incremental rollup capability")
+            return None
+
+        now = time.monotonic()
+        with self._postgres_rollup_cache_lock:
+            expires_at = float(self._postgres_rollup_cache.get("expires_at_monotonic") or 0.0)
+            cached_payload = self._postgres_rollup_cache.get("payload")
+            if isinstance(cached_payload, dict) and expires_at > now:
+                return cached_payload
+
+        try:
+            payload = getattr(self._primary_sink, "load_incremental_rollups")()
+        except Exception:
+            self._logger.exception("Incremental Postgres rollup read failed")
+            return None
+
+        if not (isinstance(payload, dict) and payload.get("status") == "ok"):
+            return None
+
+        with self._postgres_rollup_cache_lock:
+            self._postgres_rollup_cache["payload"] = payload
+            self._postgres_rollup_cache["expires_at_monotonic"] = now + self._postgres_rollup_cache_ttl_seconds
+        return payload
 
     @staticmethod
     def _value_is_present(value: Any) -> bool:
@@ -1464,6 +1536,7 @@ class EvidentlyMonitor:
                     self._materialized_last_refresh_monotonic = time.monotonic()
                     self._materialized_version += 1
                     self._invalidate_caches()
+                    self._invalidate_postgres_rollup_cache()
         except Exception:
             self._write_failures += len(records)
             self._logger.exception("Failed to persist monitoring interaction records to primary sink")
@@ -1743,20 +1816,15 @@ class EvidentlyMonitor:
 
     def get_analytics_summary(self) -> Dict[str, Any]:
         """Return cached analytics rollups using keyed incremental materialization."""
-        if hasattr(self._primary_sink, "supports_incremental_rollups") and hasattr(self._primary_sink, "load_incremental_rollups"):
-            try:
-                if bool(getattr(self._primary_sink, "supports_incremental_rollups")()):
-                    rollups = getattr(self._primary_sink, "load_incremental_rollups")()
-                    if isinstance(rollups, dict) and rollups.get("status") == "ok":
-                        return {
-                            "status": "ok",
-                            "engine": rollups.get("engine", "postgres-incremental-rollups"),
-                            "overall": rollups.get("overall", {}),
-                            "backend_rollups": self._round_records(list(rollups.get("backend_rollups", []))),
-                            "model_rollups": self._round_records(list(rollups.get("model_rollups", []))),
-                        }
-            except Exception:
-                self._logger.exception("Incremental Postgres rollup read failed; falling back to local materialized state")
+        rollups = self._get_postgres_rollup_payload_cached()
+        if isinstance(rollups, dict) and rollups.get("status") == "ok":
+            return {
+                "status": "ok",
+                "engine": rollups.get("engine", "postgres-incremental-rollups"),
+                "overall": rollups.get("overall", {}),
+                "backend_rollups": self._round_records(list(rollups.get("backend_rollups", []))),
+                "model_rollups": self._round_records(list(rollups.get("model_rollups", []))),
+            }
 
         records, version = self._materialized_records_snapshot()
         if not records:
@@ -1960,15 +2028,7 @@ class EvidentlyMonitor:
         analytics = self.get_analytics_summary()
         rag = self.get_rag_dashboard_summary(recent_failures_limit=20)
 
-        rollup_payload: Optional[Dict[str, Any]] = None
-        if hasattr(self._primary_sink, "supports_incremental_rollups") and hasattr(self._primary_sink, "load_incremental_rollups"):
-            try:
-                if bool(getattr(self._primary_sink, "supports_incremental_rollups")()):
-                    candidate = getattr(self._primary_sink, "load_incremental_rollups")()
-                    if isinstance(candidate, dict) and candidate.get("status") == "ok":
-                        rollup_payload = candidate
-            except Exception:
-                self._logger.exception("Incremental Postgres rollup read failed while building curated snapshot")
+        rollup_payload = self._get_postgres_rollup_payload_cached()
 
         analytics_overall = analytics.get("overall", {}) if isinstance(analytics, dict) else {}
         rag_overall = rag.get("overall", {}) if isinstance(rag, dict) else {}

@@ -47,9 +47,18 @@ def _new_materialized_read_latency_ms(monitor: EvidentlyMonitor) -> float:
     return (time.perf_counter() - started) * 1000.0
 
 
-def _writer_loop(monitor: EvidentlyMonitor, stop_event: threading.Event, write_counter: Dict[str, int]) -> None:
+def _writer_loop(
+    monitor: EvidentlyMonitor,
+    stop_event: threading.Event,
+    write_counter: Dict[str, int],
+    target_rows: int,
+    writer_rate_rps: float,
+) -> None:
     idx = 0
-    while not stop_event.is_set():
+    tick_interval = (1.0 / writer_rate_rps) if writer_rate_rps > 0 else 0.0
+    next_tick = time.perf_counter()
+
+    while not stop_event.is_set() and idx < target_rows:
         interaction_id = f"bench-{idx}"
         monitor.log_interaction(
             question=f"Q{idx}: Why did Apollo 13 abort the landing?",
@@ -89,9 +98,11 @@ def _writer_loop(monitor: EvidentlyMonitor, stop_event: threading.Event, write_c
         idx += 1
         write_counter["count"] = idx
 
-        # Tiny jitter prevents CPU pegging while maintaining high pressure.
-        if idx % 250 == 0:
-            time.sleep(0.001)
+        if tick_interval > 0:
+            next_tick += tick_interval
+            sleep_for = next_tick - time.perf_counter()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def _summarize(samples: List[float]) -> Dict[str, float]:
@@ -109,8 +120,10 @@ def _summarize(samples: List[float]) -> Dict[str, float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark monitoring read latency under high write load")
-    parser.add_argument("--duration-seconds", type=int, default=6, help="Duration for the benchmark window")
+    parser.add_argument("--duration-seconds", type=int, default=6, help="Upper bound duration for the benchmark window")
     parser.add_argument("--read-iterations", type=int, default=120, help="Number of reads per path")
+    parser.add_argument("--target-rows", type=int, default=5000, help="Fixed target number of interaction rows to write")
+    parser.add_argument("--writer-rate-rps", type=float, default=600.0, help="Fixed writer rate in rows per second")
     parser.add_argument(
         "--sink",
         choices=["file", "postgres", "auto"],
@@ -135,7 +148,11 @@ def main() -> int:
 
         stop_event = threading.Event()
         write_counter = {"count": 0}
-        writer = threading.Thread(target=_writer_loop, args=(monitor, stop_event, write_counter), daemon=True)
+        writer = threading.Thread(
+            target=_writer_loop,
+            args=(monitor, stop_event, write_counter, max(1, int(args.target_rows)), float(args.writer_rate_rps)),
+            daemon=True,
+        )
         writer.start()
 
         # Warmup to build initial state and caches.
@@ -146,10 +163,13 @@ def main() -> int:
         new_samples: List[float] = []
 
         started = time.monotonic()
-        while time.monotonic() - started < max(1, args.duration_seconds):
+        deadline = started + max(1, args.duration_seconds)
+        while time.monotonic() < deadline:
             old_samples.append(_old_canonicalized_read_latency_ms(monitor))
             new_samples.append(_new_materialized_read_latency_ms(monitor))
-            if len(old_samples) >= args.read_iterations and len(new_samples) >= args.read_iterations:
+            if len(old_samples) >= args.read_iterations and len(new_samples) >= args.read_iterations and not writer.is_alive():
+                break
+            if not writer.is_alive() and len(old_samples) >= args.read_iterations:
                 break
 
         stop_event.set()
@@ -162,6 +182,8 @@ def main() -> int:
         speedup = (old_summary["avg_ms"] / new_summary["avg_ms"]) if new_summary["avg_ms"] > 0 else 0.0
 
         print("benchmark_sink=", sink)
+        print("target_rows=", int(args.target_rows))
+        print("writer_rate_rps=", float(args.writer_rate_rps))
         print("writes_observed=", write_counter["count"])
         print("old_read_avg_ms=", round(old_summary["avg_ms"], 4))
         print("old_read_p95_ms=", round(old_summary["p95_ms"], 4))
