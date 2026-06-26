@@ -259,7 +259,7 @@ def run() -> int:
                     )
 
                 broker.ack(message_id)
-                    job_store.release_processing(job_id, processing_token)
+                job_store.release_processing(job_id, processing_token)
             except Exception as error:
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 retry_error = str(error)[:200]
