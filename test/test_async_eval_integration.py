@@ -325,7 +325,7 @@ class TestRedisEvalIntegration(unittest.TestCase):
 
         def _try_acquire():
             barrier.wait()  # release both threads simultaneously
-            results.append(job_store.acquire_processing(job_id, processing_ttl_seconds=30))
+            results.append(bool(job_store.acquire_processing(job_id, processing_ttl_seconds=30)))
 
         t1 = threading.Thread(target=_try_acquire, daemon=True)
         t2 = threading.Thread(target=_try_acquire, daemon=True)
@@ -338,6 +338,19 @@ class TestRedisEvalIntegration(unittest.TestCase):
         # Exactly one thread must win the lock.
         self.assertEqual(results.count(True), 1)
         self.assertEqual(results.count(False), 1)
+
+    def test_processing_lock_release_requires_matching_token(self):
+        job_store = RedisAsyncJobStore(self.redis, retention_ttl_seconds=120)
+        job_id = f"job-{uuid.uuid4()}"
+
+        token = job_store.acquire_processing(job_id, processing_ttl_seconds=120)
+        self.assertIsInstance(token, str)
+        self.assertFalse(job_store.release_processing(job_id, "wrong-token"))
+        self.assertFalse(job_store.is_completed(job_id))
+        self.assertFalse(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
+        self.assertTrue(job_store.release_processing(job_id, token))
+        reacquired = job_store.acquire_processing(job_id, processing_ttl_seconds=120)
+        self.assertIsInstance(reacquired, str)
 
     # ------------------------------------------------------------------
     # Dead-letter queue

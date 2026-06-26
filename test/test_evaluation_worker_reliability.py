@@ -36,7 +36,7 @@ from evaluation_worker import _process_one_message
 def _make_deps(
     *,
     is_completed: bool = False,
-    acquire_processing: bool = True,
+    acquire_processing: object = "lock-token",
     evaluate_result=None,
     evaluate_side_effect=None,
     enqueue_result: bool = True,
@@ -134,6 +134,7 @@ class TestEvaluationWorkerSuccessPath(unittest.TestCase):
         # Message must be acked exactly once.
         broker.ack.assert_called_once_with("1-0")
         broker.dead_letter.assert_not_called()
+        job_store.release_processing.assert_called_once_with(payload["job_id"], job_store.acquire_processing.return_value)
 
     def test_evaluate_result_error_flag_triggers_retry_not_success(self):
         """A result dict with 'error' key must be treated as a failure."""
@@ -148,6 +149,7 @@ class TestEvaluationWorkerSuccessPath(unittest.TestCase):
         # Should be retrying, not completed.
         self.assertEqual(stored["status"], "retrying")
         broker.enqueue.assert_called_once()
+        job_store.release_processing.assert_called_once_with(payload["job_id"], job_store.acquire_processing.return_value)
 
     def test_successful_evaluation_with_interaction_id_writes_monitoring_update(self):
         broker, job_store, analysis_worker = _make_deps(
@@ -172,7 +174,6 @@ class TestEvaluationWorkerPoisonMessages(unittest.TestCase):
         broker, job_store, analysis_worker = _make_deps()
         payload = {
             "_decode_error": "Expecting value: line 1 column 1",
-            "_raw_payload": "{broken",
             "job_id": "",
         }
 
@@ -309,7 +310,7 @@ class TestEvaluationWorkerRetryLogic(unittest.TestCase):
 
         broker.ack.assert_called_once_with("1-0")
         broker.enqueue.assert_not_called()
-        job_store.release_processing.assert_not_called()
+        job_store.release_processing.assert_called_once_with(payload["job_id"], job_store.acquire_processing.return_value)
 
     def test_retry_enqueue_failure_dead_letters_instead_of_scheduling(self):
         broker, job_store, analysis_worker = _make_deps(

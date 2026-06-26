@@ -291,7 +291,8 @@ class TestRedisJudgeIntegration(unittest.TestCase):
         job_store = RedisAsyncJobStore(self.redis, retention_ttl_seconds=120)
         job_id = f"job-{uuid.uuid4()}"
 
-        self.assertTrue(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
+        token = job_store.acquire_processing(job_id, processing_ttl_seconds=120)
+        self.assertIsInstance(token, str)
         self.assertFalse(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
 
         self.assertTrue(
@@ -305,6 +306,18 @@ class TestRedisJudgeIntegration(unittest.TestCase):
             )
         )
         self.assertTrue(job_store.is_completed(job_id))
+
+    def test_processing_lock_release_requires_matching_token(self):
+        job_store = RedisAsyncJobStore(self.redis, retention_ttl_seconds=120)
+        job_id = f"job-{uuid.uuid4()}"
+
+        token = job_store.acquire_processing(job_id, processing_ttl_seconds=120)
+        self.assertIsInstance(token, str)
+        self.assertFalse(job_store.release_processing(job_id, "wrong-token"))
+        self.assertFalse(job_store.acquire_processing(job_id, processing_ttl_seconds=120))
+        self.assertTrue(job_store.release_processing(job_id, token))
+        reacquired = job_store.acquire_processing(job_id, processing_ttl_seconds=120)
+        self.assertIsInstance(reacquired, str)
 
     def test_broker_dead_letter_writes_dlq_entry(self):
         stream_name = f"test:judge:jobs:{uuid.uuid4()}"
