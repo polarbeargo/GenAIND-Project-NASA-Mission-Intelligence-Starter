@@ -164,11 +164,12 @@ def _process_one_message(
         return
 
     # --- Idempotency: duplicate in-flight ---
-    if not job_store.acquire_processing(
+    processing_token = job_store.acquire_processing(
         job_id,
         processing_ttl_seconds=processing_ttl,
         worker_type="evaluation",
-    ):
+    )
+    if not processing_token:
         # Lock contention and acquire failures are recorded in job_store.
         logger.info("Skipping duplicate in-flight evaluation job_id=%s", job_id)
         broker.ack(message_id)
@@ -216,6 +217,7 @@ def _process_one_message(
                 synchronous=True,
             )
         job_store.set_result(job_id, final_payload)
+        job_store.release_processing(job_id, processing_token)
         broker.ack(message_id)
     except Exception as error:
         latency_ms = (time.perf_counter() - started) * 1000.0
@@ -249,7 +251,7 @@ def _process_one_message(
             if broker.enqueue(job_id, retry_payload):
                 get_async_reliability_metrics().record_retry(worker="evaluation", reason="processing_error")
                 broker.ack(message_id)
-                job_store.release_processing(job_id)
+                job_store.release_processing(job_id, processing_token)
                 logger.warning(
                     "Evaluation job retry scheduled job_id=%s attempt=%s/%s",
                     job_id,
@@ -269,6 +271,7 @@ def _process_one_message(
                     "max_retries": max_retries,
                 }
                 job_store.set_result(job_id, terminal)
+                job_store.release_processing(job_id, processing_token)
                 broker.dead_letter(
                     message_id=message_id,
                     payload=payload,
@@ -290,6 +293,7 @@ def _process_one_message(
                 "max_retries": max_retries,
             }
             job_store.set_result(job_id, terminal)
+            job_store.release_processing(job_id, processing_token)
             broker.dead_letter(
                 message_id=message_id,
                 payload=payload,

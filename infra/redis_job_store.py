@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from infra.async_reliability_metrics import get_async_reliability_metrics
@@ -50,18 +51,22 @@ class RedisAsyncJobStore:
         job_id: str,
         processing_ttl_seconds: int = 300,
         worker_type: str = "unknown",
-    ) -> bool:
-        """Acquire a best-effort distributed idempotency lock for one job."""
+    ) -> Optional[str]:
+        """Acquire a best-effort distributed idempotency lock for one job.
+
+        Returns a unique ownership token on success so release can use compare-and-delete.
+        """
         if not self.redis.is_available() or self.redis._client is None:
             get_async_reliability_metrics().record_lock_acquire_fail(worker=worker_type, reason="redis_unavailable")
-            return False
+            return None
 
         try:
             ttl = max(30, int(processing_ttl_seconds))
+            token = uuid.uuid4().hex
             # NX avoids duplicate concurrent processing across workers.
             locked = self.redis._client.set(
                 self._processing_key(job_id),
-                str(time.time()),
+                token,
                 nx=True,
                 ex=ttl,
             )
@@ -70,20 +75,31 @@ class RedisAsyncJobStore:
                     worker=worker_type,
                     reason="contended",
                 )
-            return bool(locked)
+                return None
+            return token
         except Exception as error:
             logger.warning("Failed to acquire processing lock for job %s: %s", job_id, error)
             get_async_reliability_metrics().record_lock_acquire_fail(worker=worker_type, reason="error")
-            return False
+            return None
 
-    def release_processing(self, job_id: str) -> bool:
-        """Release the in-flight idempotency lock for one job."""
+    def release_processing(self, job_id: str, token: str) -> bool:
+        """Release the in-flight idempotency lock for one job if the token matches."""
         if not self.redis.is_available():
             return False
 
+        if not token:
+            return False
+
         try:
-            self.redis.delete(self._processing_key(job_id))
-            return True
+            script = """
+            local current = redis.call('GET', KEYS[1])
+            if current == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+            """
+            result = self.redis.eval(script, 1, self._processing_key(job_id), token)
+            return int(result or 0) > 0
         except Exception as error:
             logger.warning("Failed to release processing lock for job %s: %s", job_id, error)
             return False
@@ -130,7 +146,7 @@ class RedisAsyncJobStore:
             return False
 
     def set_result(self, job_id: str, result: Dict[str, Any]) -> bool:
-        """Store job state/result and update terminal markers."""
+        """Store job state/result and update terminal markers atomically."""
         if not self.redis.is_available():
             return False
 
@@ -146,22 +162,34 @@ class RedisAsyncJobStore:
             job_data.setdefault("created_at", time.time())
             job_data["status"] = status
             job_data["completed_at"] = time.time() if self._is_terminal_status(status) else None
-            self.redis.set(job_key, job_data, ex=self.retention_ttl)
-
-            # Store result
+            result_payload = dict(result)
+            completed_payload = {"status": status}
             result_key = self._result_key(job_id)
-            self.redis.set(result_key, result, ex=self.retention_ttl)
-
-            # Terminal marker supports idempotent redelivery suppression.
             completed_key = self._completed_key(job_id)
-            if self._is_terminal_status(status):
-                self.redis.set(completed_key, {"status": status}, ex=self.retention_ttl)
-            else:
-                self.redis.delete(completed_key)
 
-            # Processing lock should not outlive terminal outcomes.
-            if self._is_terminal_status(status):
-                self.release_processing(job_id)
+            script = """
+            local ttl = tonumber(ARGV[4])
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', ttl)
+            redis.call('SET', KEYS[2], ARGV[2], 'EX', ttl)
+            if ARGV[3] == '1' then
+                redis.call('SET', KEYS[3], ARGV[5], 'EX', ttl)
+            else
+                redis.call('DEL', KEYS[3])
+            end
+            return 1
+            """
+            self.redis.eval(
+                script,
+                3,
+                job_key,
+                result_key,
+                completed_key,
+                json.dumps(job_data),
+                json.dumps(result_payload),
+                "1" if self._is_terminal_status(status) else "0",
+                str(self.retention_ttl),
+                json.dumps(completed_payload),
+            )
 
             logger.debug(f"Completed async job: {job_id}")
             return True

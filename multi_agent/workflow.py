@@ -1319,11 +1319,12 @@ class MultiAgentChatWorkflow:
         # Cross-pod idempotency: only one worker/pod should execute a job.
         if self._redis_job_store.is_completed(job_id):
             return
-        if not self._redis_job_store.acquire_processing(
+        processing_token = self._redis_job_store.acquire_processing(
             job_id,
             processing_ttl_seconds=300,
             worker_type="evaluation_local",
-        ):
+        )
+        if not processing_token:
             return
 
         if not self._evaluation_breaker.allow():
@@ -1336,7 +1337,7 @@ class MultiAgentChatWorkflow:
                 "error": "evaluation circuit breaker open",
             }
             self._record_evaluation_job(job_id, payload)
-            self._redis_job_store.release_processing(job_id)
+            self._redis_job_store.release_processing(job_id, processing_token)
             return
 
         try:
@@ -1366,7 +1367,7 @@ class MultiAgentChatWorkflow:
                 "error": "evaluation queue saturated",
             }
             self._record_evaluation_job(job_id, payload)
-            self._redis_job_store.release_processing(job_id)
+            self._redis_job_store.release_processing(job_id, processing_token)
             return
 
         try:
@@ -1438,41 +1439,32 @@ class MultiAgentChatWorkflow:
             self._record_evaluation_job(job_id, payload)
             logging.getLogger(__name__).warning("Async evaluation failed: %s", str(error)[:120])
         finally:
-            self._redis_job_store.release_processing(job_id)
+            self._redis_job_store.release_processing(job_id, processing_token)
 
     def _record_evaluation_job(self, job_id: str, payload: Dict[str, Any]) -> None:
-        # Store in L1 (in-process)
-        with self._evaluation_lock:
-            self._evaluation_results[job_id] = payload
-            self._evaluation_results.move_to_end(job_id)
-            while len(self._evaluation_results) > self._evaluation_buffer_size:
-                self._evaluation_results.popitem(last=False)
-        
-        # Also store in L2 (Redis) for cross-pod access
-        self._redis_job_store.set_result(job_id, payload)
+        # Redis is the source of truth; L1 mirrors it as a local cache.
+        if self._redis_job_store.set_result(job_id, payload):
+            # Store in L1 (in-process)
+            with self._evaluation_lock:
+                self._evaluation_results[job_id] = payload
+                self._evaluation_results.move_to_end(job_id)
+                while len(self._evaluation_results) > self._evaluation_buffer_size:
+                    self._evaluation_results.popitem(last=False)
 
     def get_evaluation_job(self, job_id: str) -> Dict[str, Any] | None:
-        # Read current L1 snapshot first.
+        # Redis is authoritative; L1 is only a cache for fast local reads.
+        l2_payload = self._redis_job_store.get_result(job_id)
+        if isinstance(l2_payload, dict):
+            with self._evaluation_lock:
+                self._evaluation_results[job_id] = dict(l2_payload)
+                self._evaluation_results.move_to_end(job_id)
+                while len(self._evaluation_results) > self._evaluation_buffer_size:
+                    self._evaluation_results.popitem(last=False)
+            return dict(l2_payload)
+
+        # Fall back to the local cache only when Redis is unavailable or missing.
         with self._evaluation_lock:
             l1_payload = self._evaluation_results.get(job_id)
-
-        l1_status = str((l1_payload or {}).get("status", "")).strip().lower()
-        l1_terminal = l1_status in {"completed", "error", "dead_lettered", "poisoned", "skipped"}
-
-        # If L1 is missing or non-terminal (e.g., pending), consult shared L2 so
-        # broker-backed worker completions are visible across polling requests.
-        if (l1_payload is None) or (not l1_terminal):
-            l2_payload = self._redis_job_store.get_result(job_id)
-            if isinstance(l2_payload, dict):
-                l2_status = str(l2_payload.get("status", "")).strip().lower()
-                if l2_status and l2_status != l1_status:
-                    # Hydrate L1 with the freshest state for subsequent reads.
-                    with self._evaluation_lock:
-                        self._evaluation_results[job_id] = dict(l2_payload)
-                        self._evaluation_results.move_to_end(job_id)
-                        while len(self._evaluation_results) > self._evaluation_buffer_size:
-                            self._evaluation_results.popitem(last=False)
-                return dict(l2_payload)
 
         return dict(l1_payload) if isinstance(l1_payload, dict) else None
 
@@ -1513,12 +1505,11 @@ class MultiAgentChatWorkflow:
                 "latency_ms": round(latency_ms, 2),
             }
             
-            # Store in L1 (in-process)
-            with self._judge_lock:
-                self._judge_results.appendleft(payload)
-            
-            # Store in L2 (Redis)
-            self._redis_job_store.set_result(judge_job_id, payload)
+            # Redis is the source of truth; L1 mirrors the latest local cache.
+            if self._redis_job_store.set_result(judge_job_id, payload):
+                # Store in L1 (in-process)
+                with self._judge_lock:
+                    self._judge_results.appendleft(payload)
 
             # When async judge runs in-process fallback mode, post annotations to
             # the originating request span so Phoenix metrics include final scores.
@@ -1556,11 +1547,9 @@ class MultiAgentChatWorkflow:
             }
             
             # Store in L1 (in-process)
-            with self._judge_lock:
-                self._judge_results.appendleft(payload)
-            
-            # Store in L2 (Redis)
-            self._redis_job_store.set_result(judge_job_id, payload)
+            if self._redis_job_store.set_result(judge_job_id, payload):
+                with self._judge_lock:
+                    self._judge_results.appendleft(payload)
             
             logging.getLogger(__name__).warning("Async judge failed: %s", str(error)[:120])
 

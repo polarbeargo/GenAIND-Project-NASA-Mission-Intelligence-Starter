@@ -196,11 +196,12 @@ def run() -> int:
                 broker.ack(message_id)
                 continue
 
-            if not job_store.acquire_processing(
+            processing_token = job_store.acquire_processing(
                 job_id,
                 processing_ttl_seconds=processing_ttl,
                 worker_type="judge",
-            ):
+            )
+            if not processing_token:
                 logger.info("Skipping duplicate in-flight judge job_id=%s", job_id)
                 broker.ack(message_id)
                 continue
@@ -258,6 +259,7 @@ def run() -> int:
                     )
 
                 broker.ack(message_id)
+                    job_store.release_processing(job_id, processing_token)
             except Exception as error:
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 retry_error = str(error)[:200]
@@ -298,7 +300,7 @@ def run() -> int:
                     if broker.enqueue(job_id, retry_payload):
                         get_async_reliability_metrics().record_retry(worker="judge", reason="processing_error")
                         broker.ack(message_id)
-                        job_store.release_processing(job_id)
+                        job_store.release_processing(job_id, processing_token)
                         logger.warning(
                             "Judge job retry scheduled job_id=%s attempt=%s/%s",
                             job_id,
@@ -325,6 +327,7 @@ def run() -> int:
                             "max_retries": max_retries,
                         }
                         job_store.set_result(job_id, terminal)
+                        job_store.release_processing(job_id, processing_token)
                         broker.dead_letter(
                             message_id=message_id,
                             payload=payload,
@@ -353,6 +356,7 @@ def run() -> int:
                         "max_retries": max_retries,
                     }
                     job_store.set_result(job_id, terminal)
+                    job_store.release_processing(job_id, processing_token)
                     broker.dead_letter(
                         message_id=message_id,
                         payload=payload,
