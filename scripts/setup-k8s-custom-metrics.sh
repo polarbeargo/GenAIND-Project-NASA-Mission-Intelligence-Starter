@@ -136,10 +136,16 @@ ensure_infinity_plugin_and_datasource() {
   pf_log_file="$(mktemp)"
 
   cleanup_pf() {
-    if [[ -n "${pf_pid}" ]]; then
-      kill "${pf_pid}" >/dev/null 2>&1 || true
+    # Ensure this cleanup runs only once and is safe with `set -u`.
+    trap - RETURN
+    local _pf_pid="${pf_pid:-}"
+    local _pf_log_file="${pf_log_file:-}"
+    if [[ -n "${_pf_pid}" ]]; then
+      kill "${_pf_pid}" >/dev/null 2>&1 || true
     fi
-    rm -f "${pf_log_file}" >/dev/null 2>&1 || true
+    if [[ -n "${_pf_log_file}" ]]; then
+      rm -f "${_pf_log_file}" >/dev/null 2>&1 || true
+    fi
   }
   trap cleanup_pf RETURN
 

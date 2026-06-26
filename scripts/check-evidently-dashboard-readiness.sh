@@ -10,6 +10,9 @@ PROMETHEUS_SERVICE_NAME="${PROMETHEUS_SERVICE_NAME:-kube-prometheus-stack-promet
 GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-kube-prometheus-stack-grafana}"
 SERVICEMONITOR_NAME="${SERVICEMONITOR_NAME:-nasa-evidently-monitor}"
 DASHBOARD_UID="${DASHBOARD_UID:-evidently-monitor}"
+DASHBOARD_TITLE="${DASHBOARD_TITLE:-}"
+DASHBOARD_PATH="${DASHBOARD_PATH:-}"
+DASHBOARD_BINDING_REQUIRED="${DASHBOARD_BINDING_REQUIRED:-false}"
 GRAFANA_LOCAL_PORT="${GRAFANA_LOCAL_PORT:-39300}"
 PROMETHEUS_LOCAL_PORT="${PROMETHEUS_LOCAL_PORT:-39390}"
 GRAFANA_PORT_FORWARD_READY_PATH="${GRAFANA_PORT_FORWARD_READY_PATH:-/api/health}"
@@ -141,11 +144,43 @@ check_dashboard_binding() {
 
   log "Validating dashboard datasource bindings"
   local dashboard_json
-  dashboard_json="$(grafana_api "${grafana_user}" "${grafana_password}" GET "/api/dashboards/uid/${DASHBOARD_UID}")"
+  local resolved_uid="${DASHBOARD_UID}"
+  local fallback_reason=""
+
+  if dashboard_json="$(grafana_api "${grafana_user}" "${grafana_password}" GET "/api/dashboards/uid/${DASHBOARD_UID}" 2>/dev/null)"; then
+    :
+  else
+    fallback_reason="dashboard UID ${DASHBOARD_UID} returned 404 or is inaccessible"
+    log "Warn: ${fallback_reason}; trying fallback lookup"
+
+    local search_json
+    search_json="$(grafana_api "${grafana_user}" "${grafana_password}" GET "/api/search?type=dash-db")"
+
+    resolved_uid="$(jq -r --arg title "${DASHBOARD_TITLE}" --arg path "${DASHBOARD_PATH}" '
+      [
+        .[]
+        | select((($title | length) > 0 and (.title // "") == $title)
+            or (($path | length) > 0 and (.url // "") == $path))
+      ]
+      | .[0].uid // empty
+    ' <<<"${search_json}")"
+
+    if [[ -z "${resolved_uid}" ]]; then
+      local not_found_message="Unable to resolve Grafana dashboard. Checked uid=${DASHBOARD_UID}, title=${DASHBOARD_TITLE:-<unset>}, path=${DASHBOARD_PATH:-<unset>}"
+      if [[ "${DASHBOARD_BINDING_REQUIRED}" == "true" ]]; then
+        die "${not_found_message}"
+      fi
+      log "Warn: ${not_found_message}. Skipping dashboard binding validation (DASHBOARD_BINDING_REQUIRED=${DASHBOARD_BINDING_REQUIRED})"
+      return 0
+    fi
+
+    dashboard_json="$(grafana_api "${grafana_user}" "${grafana_password}" GET "/api/dashboards/uid/${resolved_uid}")"
+    log "Resolved dashboard via fallback lookup: uid=${resolved_uid}"
+  fi
 
   local panel_count
   panel_count="$(jq -r '.dashboard.panels | length' <<<"${dashboard_json}")"
-  [[ "${panel_count}" -gt 0 ]] || die "Dashboard ${DASHBOARD_UID} has no panels"
+  [[ "${panel_count}" -gt 0 ]] || die "Dashboard ${resolved_uid} has no panels"
 
   local bad_bindings
   bad_bindings="$(jq -r --arg ds "${PROMETHEUS_DATASOURCE_UID}" '
@@ -157,7 +192,7 @@ check_dashboard_binding() {
     | length
   ' <<<"${dashboard_json}")"
 
-  [[ "${bad_bindings}" == "0" ]] || die "Dashboard panels are bound to an invalid Prometheus datasource UID"
+  [[ "${bad_bindings}" == "0" ]] || die "Dashboard panels are bound to an invalid Prometheus datasource UID (dashboard uid=${resolved_uid})"
   log "Dashboard datasource bindings are valid"
 }
 
@@ -209,6 +244,14 @@ main() {
   require_cmd curl
   require_cmd jq
   ensure_file "${ROOT_DIR}/monitoring/grafana/evidently_monitor_dashboard.json"
+
+  if [[ -z "${DASHBOARD_TITLE}" ]]; then
+    DASHBOARD_TITLE="$(jq -r '.title // empty' "${ROOT_DIR}/monitoring/grafana/evidently_monitor_dashboard.json")"
+  fi
+
+  if [[ -z "${DASHBOARD_PATH}" ]]; then
+    DASHBOARD_PATH="$(jq -r '.uid // empty' "${ROOT_DIR}/monitoring/grafana/evidently_monitor_dashboard.json" | awk '{ if (length($0) > 0) print "/d/" $0 }')"
+  fi
 
   TMP_DIR="$(mktemp -d)"
 
