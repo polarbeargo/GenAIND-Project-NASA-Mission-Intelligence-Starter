@@ -10,6 +10,7 @@ GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-monitoring}"
 GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-kube-prometheus-stack-grafana}"
 DASHBOARD_FILE="${DASHBOARD_FILE:-${ROOT_DIR}/monitoring/latency_sli_dashboard.json}"
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8000}"
+VERIFY_API_BASE_URL="${VERIFY_API_BASE_URL:-${API_BASE_URL}}"
 INFINITY_DATASOURCE_UID="${INFINITY_DATASOURCE_UID:-}"
 VERIFY_DASHBOARD_FUNCTIONS="${VERIFY_DASHBOARD_FUNCTIONS:-true}"
 
@@ -165,14 +166,14 @@ verify_panel_queries() {
     return
   }
 
-  local url="${API_BASE_URL}/monitoring/latency-sli/timeseries?window_minutes=60&bucket_seconds=300"
+  local url="${VERIFY_API_BASE_URL}/monitoring/latency-sli/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300"
   local payload
   payload="$(curl -fsS "${url}")"
 
-  local points_count
-  points_count="$(jq -r '.points | length // 0' <<<"${payload}")"
-  [[ "${points_count}" =~ ^[0-9]+$ ]] || die "Latency timeseries response is malformed"
-  log "Latency timeseries endpoint OK: ${url} (points=${points_count})"
+  local series_count
+  series_count="$(jq -r '((.series // .points // []) | length)' <<<"${payload}")"
+  [[ "${series_count}" =~ ^[0-9]+$ ]] || die "Latency timeseries response is malformed"
+  log "Latency timeseries endpoint OK: ${url} (rows=${series_count})"
 }
 
 main() {

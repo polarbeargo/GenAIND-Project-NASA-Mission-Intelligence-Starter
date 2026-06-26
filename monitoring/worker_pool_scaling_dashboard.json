@@ -751,7 +751,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "nasa_worker_pool_utilization_ratio{stage=~\"${stage:regex}\"}",
+          "expr": "nasa_worker_pool_utilization_ratio{stage=~\"${stage}\"}",
           "legendFormat": "stage={{stage}}",
           "range": true,
           "refId": "A"

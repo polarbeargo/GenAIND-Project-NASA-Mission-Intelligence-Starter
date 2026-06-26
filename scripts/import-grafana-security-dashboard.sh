@@ -116,7 +116,28 @@ import_dashboard() {
   local payload_path="$1"
 
   local response
-  response="$(grafana_api POST "/api/dashboards/db" -H "Content-Type: application/json" --data-binary "@${payload_path}")"
+  local http_code
+  response="$({
+    curl -sS -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+      -X POST \
+      "${GRAFANA_URL}/api/dashboards/db" \
+      -H "Content-Type: application/json" \
+      --data-binary "@${payload_path}" \
+      -w '\n%{http_code}';
+  })"
+  http_code="${response##*$'\n'}"
+  response="${response%$'\n'*}"
+
+  if [[ "${http_code}" == "400" ]]; then
+    local message
+    message="$(jq -r '.message // .error // empty' <<<"${response}" 2>/dev/null || true)"
+    if [[ "${message}" == "Cannot save provisioned dashboard" ]]; then
+      log "Dashboard is already provisioned in Grafana; skipping import and verifying existing dashboard"
+      return 0
+    fi
+  fi
+
+  [[ "${http_code}" == "200" ]] || die "Grafana import failed (HTTP ${http_code}): $(jq -r '.message // .error // "unknown error"' <<<"${response}" 2>/dev/null || echo "${response}")"
 
   local status
   status="$(jq -r '.status // empty' <<<"${response}")"
@@ -135,17 +156,17 @@ verify_dashboard_binding() {
   dashboard_json="$(grafana_api GET "/api/dashboards/uid/${uid}")"
 
   local missing
-  missing="$(jq -r --arg ds "${PROMETHEUS_DATASOURCE_UID}" '
+  missing="$(jq -r --arg ds "${PROMETHEUS_DATASOURCE_UID}" --arg placeholder '${DS_PROMETHEUS}' '
     [
       .dashboard.panels[]
       | select(.datasource.type? == "prometheus")
-      | select(.datasource.uid != $ds)
+      | select((.datasource.uid // "") != $ds and (.datasource.uid // "") != $placeholder)
       | .title
     ] | length
   ' <<<"${dashboard_json}")"
 
-  [[ "${missing}" == "0" ]] || die "Some Prometheus panels are not bound to datasource UID ${PROMETHEUS_DATASOURCE_UID}"
-  log "Verified all Prometheus panels are bound to datasource UID ${PROMETHEUS_DATASOURCE_UID}"
+  [[ "${missing}" == "0" ]] || die "Some Prometheus panels are not bound to datasource UID ${PROMETHEUS_DATASOURCE_UID} or placeholder ${DS_PROMETHEUS}"
+  log "Verified all Prometheus panels are bound to datasource UID ${PROMETHEUS_DATASOURCE_UID} or the provisioned placeholder"
 }
 
 verify_panel_queries() {

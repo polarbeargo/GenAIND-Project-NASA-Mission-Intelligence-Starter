@@ -10,6 +10,7 @@ GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-monitoring}"
 GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-kube-prometheus-stack-grafana}"
 DASHBOARD_FILE="${DASHBOARD_FILE:-${ROOT_DIR}/monitoring/worker_pool_scaling_dashboard.json}"
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8000}"
+VERIFY_API_BASE_URL="${VERIFY_API_BASE_URL:-${API_BASE_URL}}"
 INFINITY_DATASOURCE_UID="${INFINITY_DATASOURCE_UID:-}"
 PROMETHEUS_DATASOURCE_UID="${PROMETHEUS_DATASOURCE_UID:-}"
 PROMETHEUS_ASYNC_DATASOURCE_UID="${PROMETHEUS_ASYNC_DATASOURCE_UID:-}"
@@ -115,18 +116,24 @@ build_import_payload() {
     --arg ds_prom_async "${PROMETHEUS_ASYNC_DATASOURCE_UID}" \
     --arg api_base_url "${API_BASE_URL}" \
     '
-      .panels |= map(
-        if (.datasource.type? == "yesoreyeram-infinity-datasource") then
-          .datasource.uid = $ds_inf
-        elif (.datasource.type? == "prometheus") then
-          if (.datasource.uid? == "${DS_PROMETHEUS_ASYNC}")
-          then .datasource.uid = $ds_prom_async
-          else .datasource.uid = $ds_prom
+      def bind_ds:
+        if (type == "object") and (.datasource? | type == "object") then
+          if .datasource.type == "yesoreyeram-infinity-datasource" then
+            .datasource.uid = $ds_inf
+          elif .datasource.type == "prometheus" then
+            if (.datasource.uid? == "${DS_PROMETHEUS_ASYNC}") then
+              .datasource.uid = $ds_prom_async
+            else
+              .datasource.uid = $ds_prom
+            end
+          else
+            .
           end
         else
           .
-        end
-      )
+        end;
+
+      walk(bind_ds)
       | .templating.list |= map(
           if .name == "api_base_url" then
             .current.text = $api_base_url
@@ -171,6 +178,10 @@ verify_dashboard_binding() {
   wrong_inf="$(jq -r --arg ds "${INFINITY_DATASOURCE_UID}" '[.dashboard.panels[] | select(.datasource.type? == "yesoreyeram-infinity-datasource") | select(.datasource.uid != $ds)] | length' <<<"${dashboard_json}")"
   [[ "${wrong_inf}" == "0" ]] || die "Some Infinity panels are bound to unexpected datasource UID"
 
+  local unresolved
+  unresolved="$(jq -r '[.. | objects | .datasource? | select(type == "object") | .uid? | strings | select(test("^\\$\\{DS_"))] | length' <<<"${dashboard_json}")"
+  [[ "${unresolved}" == "0" ]] || die "Some datasource UID placeholders are unresolved in imported dashboard"
+
   log "Verified datasource bindings and api_base_url variable"
 }
 
@@ -182,15 +193,18 @@ verify_panel_queries() {
 
   local infinity_paths=(
     "/monitoring/worker-pools/series"
-    "/monitoring/worker-pools/timeseries?window_minutes=60&bucket_seconds=300"
-    "/monitoring/latency-sli/timeseries?window_minutes=60&bucket_seconds=300"
+    "/monitoring/worker-pools/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300"
+    "/monitoring/latency-sli/timeseries?stage=retrieval&window_minutes=60&bucket_seconds=300"
   )
 
   for path in "${infinity_paths[@]}"; do
-    local status
-    status="$(curl -fsS "${API_BASE_URL}${path}" | jq -r 'if has("series") or has("points") then "ok" else "ok" end')"
-    [[ "${status}" == "ok" ]] || die "Infinity source endpoint check failed: ${API_BASE_URL}${path}"
-    log "Endpoint OK: ${API_BASE_URL}${path}"
+    local payload
+    payload="$(curl -fsS "${VERIFY_API_BASE_URL}${path}")"
+
+    local count
+    count="$(jq -r '((.series // .points // []) | length)' <<<"${payload}")"
+    [[ "${count}" =~ ^[0-9]+$ ]] || die "Infinity source endpoint returned malformed JSON: ${VERIFY_API_BASE_URL}${path}"
+    log "Endpoint OK: ${VERIFY_API_BASE_URL}${path} (rows=${count})"
   done
 
   local prom_queries=(
