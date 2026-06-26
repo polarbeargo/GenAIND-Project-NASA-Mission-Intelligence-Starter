@@ -12,7 +12,8 @@ RUN apt-get update \
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --group monitoring-postgres
+RUN uv sync --frozen --no-dev \
+    && uv pip install --python .venv/bin/python "psycopg[binary]==3.3.4"
 
 COPY . .
 
