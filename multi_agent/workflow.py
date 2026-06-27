@@ -1641,6 +1641,10 @@ class MultiAgentChatWorkflow:
         self._safety_executor.shutdown(wait=False, cancel_futures=False)
         self._retrieval_executor.shutdown(wait=False, cancel_futures=False)
         self._generation_executor.shutdown(wait=False, cancel_futures=False)
+        try:
+            self._stage_event_store.shutdown()
+        except Exception:
+            pass
 
     def get_worker_pool_report(self) -> Dict[str, Any]:
         """Return bounded worker-pool saturation metrics for autoscaling decisions."""

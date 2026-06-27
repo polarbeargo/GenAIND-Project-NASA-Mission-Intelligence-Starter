@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict
 
 
@@ -22,15 +24,22 @@ class StageLatencyEventStore:
         max_file_bytes: int = 20 * 1024 * 1024,
         max_rotated_files: int = 10,
         maintenance_interval_seconds: float = 60.0,
+        max_in_memory_events: int = 50_000,
+        max_cached_queries: int = 64,
     ):
         self.log_file = log_file or Path(__file__).parent / "stage_latency_events.jsonl"
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        self._write_lock = threading.Lock()
+        self._state_lock = RLock()
         self._retention_hours = max(1.0, float(retention_hours))
         self._max_file_bytes = max(1024 * 1024, int(max_file_bytes))
         self._max_rotated_files = max(1, int(max_rotated_files))
         self._maintenance_interval_seconds = max(1.0, float(maintenance_interval_seconds))
+        self._max_in_memory_events = max(1000, int(max_in_memory_events))
+        self._max_cached_queries = max(8, int(max_cached_queries))
         self._last_maintenance_at = 0.0
+        self._events: deque[Dict[str, Any]] = deque()
+        self._query_cache: OrderedDict[tuple[Any, ...], Dict[str, Any]] = OrderedDict()
+        self._load_recent_events_from_disk()
 
     @staticmethod
     def _percentile(sorted_values: list[float], percentile: float) -> float:
@@ -72,13 +81,62 @@ class StageLatencyEventStore:
             "model": (model or "").strip().lower(),
         }
 
-        with self._write_lock:
+        with self._state_lock:
             with self.log_file.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, separators=(",", ":")) + "\n")
-            self._maintenance_if_due()
+            self._events.append(event)
+            self._prune_in_memory_locked()
+            self._query_cache.clear()
+            self._maintenance_if_due_locked()
         return event
 
-    def _maintenance_if_due(self) -> None:
+    def _load_recent_events_from_disk(self) -> None:
+        if not self.log_file.exists():
+            return
+        cutoff_ms = round(time.time() * 1000) - int(self._retention_hours * 3600 * 1000)
+        with self._state_lock:
+            try:
+                with self.log_file.open("r", encoding="utf-8") as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        timestamp_ms = int(payload.get("timestamp_ms", 0))
+                        stage = str(payload.get("stage", "")).strip().lower()
+                        if timestamp_ms < cutoff_ms or stage not in self.VALID_STAGES:
+                            continue
+
+                        self._events.append(
+                            {
+                                "timestamp_ms": timestamp_ms,
+                                "stage": stage,
+                                "latency_ms": max(0.0, float(payload.get("latency_ms", 0.0))),
+                                "timed_out": bool(payload.get("timed_out", False)),
+                                "status": str(payload.get("status", "ok")).strip().lower() or "ok",
+                                "budget_ms": max(0.0, float(payload.get("budget_ms", 0.0))),
+                                "within_budget": bool(payload.get("within_budget", False)),
+                                "mission": str(payload.get("mission", "")).strip().lower(),
+                                "backend": str(payload.get("backend", "")).strip().lower(),
+                                "model": str(payload.get("model", "")).strip().lower(),
+                            }
+                        )
+            except OSError:
+                return
+            self._prune_in_memory_locked()
+
+    def _prune_in_memory_locked(self) -> None:
+        cutoff_ms = round(time.time() * 1000) - int(self._retention_hours * 3600 * 1000)
+        while self._events and int(self._events[0].get("timestamp_ms", 0)) < cutoff_ms:
+            self._events.popleft()
+        while len(self._events) > self._max_in_memory_events:
+            self._events.popleft()
+
+    def _maintenance_if_due_locked(self) -> None:
         now = time.time()
         if (now - self._last_maintenance_at) < self._maintenance_interval_seconds:
             return
@@ -86,6 +144,7 @@ class StageLatencyEventStore:
         self._prune_expired_events()
         self._rotate_if_needed()
         self._cleanup_rotated_files()
+        self._prune_in_memory_locked()
 
     def _prune_expired_events(self) -> None:
         if not self.log_file.exists():
@@ -227,11 +286,23 @@ class StageLatencyEventStore:
     ) -> Dict[str, Any]:
         safe_window_minutes = max(1, min(int(window_minutes), 7 * 24 * 60))
         safe_bucket_seconds = max(10, min(int(bucket_seconds), 3600))
-        events = self._read_recent_events(safe_window_minutes)
-
         mission_filter = (mission or "").strip().lower()
         backend_filter = (backend or "").strip().lower()
         model_filter = (model or "").strip().lower()
+        query_key = (stage, safe_window_minutes, safe_bucket_seconds, mission_filter, backend_filter, model_filter)
+
+        with self._state_lock:
+            cached = self._query_cache.get(query_key)
+            if cached is not None:
+                self._query_cache.move_to_end(query_key)
+                return cached
+
+            cutoff_ms = round(time.time() * 1000) - (safe_window_minutes * 60 * 1000)
+            events = [
+                dict(event)
+                for event in self._events
+                if int(event.get("timestamp_ms", 0)) >= cutoff_ms
+            ]
 
         def _matches(event: Dict[str, Any]) -> bool:
             if mission_filter and str(event.get("mission", "")).strip().lower() != mission_filter:
@@ -255,7 +326,7 @@ class StageLatencyEventStore:
             if safe_stage not in self.VALID_STAGES:
                 raise ValueError(f"Unsupported stage: {stage}")
             stage_events = [item for item in filtered_events if item["stage"] == safe_stage]
-            return {
+            result = {
                 "generated_at_ms": round(time.time() * 1000),
                 "window_minutes": safe_window_minutes,
                 "bucket_seconds": safe_bucket_seconds,
@@ -263,15 +334,27 @@ class StageLatencyEventStore:
                 "filters": filters,
                 "series": self._build_series(stage_events, safe_bucket_seconds),
             }
+        else:
+            workers = {
+                worker: self._build_series([item for item in filtered_events if item["stage"] == worker], safe_bucket_seconds)
+                for worker in self.VALID_STAGES
+            }
+            result = {
+                "generated_at_ms": round(time.time() * 1000),
+                "window_minutes": safe_window_minutes,
+                "bucket_seconds": safe_bucket_seconds,
+                "filters": filters,
+                "workers": workers,
+            }
 
-        workers = {
-            worker: self._build_series([item for item in filtered_events if item["stage"] == worker], safe_bucket_seconds)
-            for worker in self.VALID_STAGES
-        }
-        return {
-            "generated_at_ms": round(time.time() * 1000),
-            "window_minutes": safe_window_minutes,
-            "bucket_seconds": safe_bucket_seconds,
-            "filters": filters,
-            "workers": workers,
-        }
+        with self._state_lock:
+            self._query_cache[query_key] = result
+            self._query_cache.move_to_end(query_key)
+            while len(self._query_cache) > self._max_cached_queries:
+                self._query_cache.popitem(last=False)
+        return result
+
+    def shutdown(self) -> None:
+        with self._state_lock:
+            self._events.clear()
+            self._query_cache.clear()

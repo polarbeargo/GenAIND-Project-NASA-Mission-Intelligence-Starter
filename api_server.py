@@ -1009,6 +1009,11 @@ async def lifespan(app: FastAPI):
     except Exception as error:
         logger.warning("Workflow shutdown encountered an error: %s", str(error)[:120])
     try:
+        worker_pool_event_store.shutdown()
+        logger.info("Worker-pool monitoring store cleared")
+    except Exception as error:
+        logger.warning("Worker-pool store shutdown encountered an error: %s", str(error)[:120])
+    try:
         monitor.shutdown()
         logger.info("Monitoring sink writer shut down")
     except Exception as error:

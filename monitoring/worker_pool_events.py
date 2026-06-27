@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict
 
 
@@ -22,15 +24,22 @@ class WorkerPoolEventStore:
         max_file_bytes: int = 20 * 1024 * 1024,
         max_rotated_files: int = 10,
         maintenance_interval_seconds: float = 60.0,
+        max_in_memory_events: int = 20_000,
+        max_cached_queries: int = 64,
     ):
         self.log_file = log_file or Path(__file__).parent / "worker_pool_events.jsonl"
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        self._write_lock = threading.Lock()
+        self._state_lock = RLock()
         self._retention_hours = max(1.0, float(retention_hours))
         self._max_file_bytes = max(1024 * 1024, int(max_file_bytes))
         self._max_rotated_files = max(1, int(max_rotated_files))
         self._maintenance_interval_seconds = max(1.0, float(maintenance_interval_seconds))
+        self._max_in_memory_events = max(1000, int(max_in_memory_events))
+        self._max_cached_queries = max(8, int(max_cached_queries))
         self._last_maintenance_at = 0.0
+        self._events: deque[Dict[str, Any]] = deque()
+        self._query_cache: OrderedDict[tuple[Any, ...], Dict[str, Any]] = OrderedDict()
+        self._load_recent_events_from_disk()
 
     @staticmethod
     def _avg(values: list[float]) -> float:
@@ -98,18 +107,74 @@ class WorkerPoolEventStore:
                 "sample_count": 0,
             }
 
-        with self._write_lock:
+        with self._state_lock:
             with self.log_file.open("a", encoding="utf-8") as handle:
                 for event in events:
                     handle.write(json.dumps(event, separators=(",", ":")) + "\n")
-            self._maintenance_if_due()
+            for event in events:
+                self._events.append(event)
+            self._prune_in_memory_locked()
+            self._query_cache.clear()
+            self._maintenance_if_due_locked()
 
         return {
             "generated_at_ms": timestamp_ms,
             "sample_count": len(events),
         }
 
-    def _maintenance_if_due(self) -> None:
+    def _load_recent_events_from_disk(self) -> None:
+        if not self.log_file.exists():
+            return
+        cutoff_ms = round(time.time() * 1000) - int(self._retention_hours * 3600 * 1000)
+        with self._state_lock:
+            try:
+                with self.log_file.open("r", encoding="utf-8") as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        timestamp_ms = int(payload.get("timestamp_ms", 0))
+                        stage = str(payload.get("stage", "")).strip().lower()
+                        if timestamp_ms < cutoff_ms or stage not in self.VALID_STAGES:
+                            continue
+
+                        self._events.append(
+                            {
+                                "timestamp_ms": timestamp_ms,
+                                "stage": stage,
+                                "max_workers": max(0.0, float(payload.get("max_workers", 0.0))),
+                                "queue_limit": max(0.0, float(payload.get("queue_limit", 0.0))),
+                                "capacity": max(0.0, float(payload.get("capacity", 0.0))),
+                                "inflight": max(0.0, float(payload.get("inflight", 0.0))),
+                                "queued_estimate": max(0.0, float(payload.get("queued_estimate", 0.0))),
+                                "submitted": max(0.0, float(payload.get("submitted", 0.0))),
+                                "completed": max(0.0, float(payload.get("completed", 0.0))),
+                                "rejected": max(0.0, float(payload.get("rejected", 0.0))),
+                                "failed": max(0.0, float(payload.get("failed", 0.0))),
+                                "oldest_queue_age_seconds": max(0.0, float(payload.get("oldest_queue_age_seconds", 0.0))),
+                                "rejected_rate": max(0.0, float(payload.get("rejected_rate", 0.0))),
+                                "error_rate": max(0.0, float(payload.get("error_rate", 0.0))),
+                                "queue_depth_ratio": max(0.0, float(payload.get("queue_depth_ratio", 0.0))),
+                                "utilization_ratio": max(0.0, float(payload.get("utilization_ratio", 0.0))),
+                            }
+                        )
+            except OSError:
+                return
+            self._prune_in_memory_locked()
+
+    def _prune_in_memory_locked(self) -> None:
+        cutoff_ms = round(time.time() * 1000) - int(self._retention_hours * 3600 * 1000)
+        while self._events and int(self._events[0].get("timestamp_ms", 0)) < cutoff_ms:
+            self._events.popleft()
+        while len(self._events) > self._max_in_memory_events:
+            self._events.popleft()
+
+    def _maintenance_if_due_locked(self) -> None:
         now = time.time()
         if (now - self._last_maintenance_at) < self._maintenance_interval_seconds:
             return
@@ -117,6 +182,7 @@ class WorkerPoolEventStore:
         self._prune_expired_events()
         self._rotate_if_needed()
         self._cleanup_rotated_files()
+        self._prune_in_memory_locked()
 
     def _prune_expired_events(self) -> None:
         if not self.log_file.exists():
@@ -175,50 +241,12 @@ class WorkerPoolEventStore:
     def _read_recent_events(self, window_minutes: int) -> list[Dict[str, Any]]:
         safe_window_minutes = max(1, min(int(window_minutes), 7 * 24 * 60))
         cutoff_ms = round(time.time() * 1000) - (safe_window_minutes * 60 * 1000)
-        if not self.log_file.exists():
-            return []
-
-        events: list[Dict[str, Any]] = []
-        try:
-            with self.log_file.open("r", encoding="utf-8") as handle:
-                for raw_line in handle:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    timestamp_ms = int(payload.get("timestamp_ms", 0))
-                    stage = str(payload.get("stage", "")).strip().lower()
-                    if timestamp_ms < cutoff_ms or stage not in self.VALID_STAGES:
-                        continue
-
-                    events.append(
-                        {
-                            "timestamp_ms": timestamp_ms,
-                            "stage": stage,
-                            "max_workers": max(0.0, float(payload.get("max_workers", 0.0))),
-                            "queue_limit": max(0.0, float(payload.get("queue_limit", 0.0))),
-                            "capacity": max(0.0, float(payload.get("capacity", 0.0))),
-                            "inflight": max(0.0, float(payload.get("inflight", 0.0))),
-                            "queued_estimate": max(0.0, float(payload.get("queued_estimate", 0.0))),
-                            "submitted": max(0.0, float(payload.get("submitted", 0.0))),
-                            "completed": max(0.0, float(payload.get("completed", 0.0))),
-                            "rejected": max(0.0, float(payload.get("rejected", 0.0))),
-                            "failed": max(0.0, float(payload.get("failed", 0.0))),
-                            "oldest_queue_age_seconds": max(0.0, float(payload.get("oldest_queue_age_seconds", 0.0))),
-                            "rejected_rate": max(0.0, float(payload.get("rejected_rate", 0.0))),
-                            "error_rate": max(0.0, float(payload.get("error_rate", 0.0))),
-                            "queue_depth_ratio": max(0.0, float(payload.get("queue_depth_ratio", 0.0))),
-                            "utilization_ratio": max(0.0, float(payload.get("utilization_ratio", 0.0))),
-                        }
-                    )
-        except OSError:
-            # Rotation/replacement can race with reads; return best effort instead of failing monitoring.
-            return []
-        return events
+        with self._state_lock:
+            return [
+                dict(event)
+                for event in self._events
+                if int(event.get("timestamp_ms", 0)) >= cutoff_ms
+            ]
 
     def _build_series(self, events: list[Dict[str, Any]], bucket_seconds: int) -> list[Dict[str, Any]]:
         safe_bucket_seconds = max(10, min(int(bucket_seconds), 3600))
@@ -272,28 +300,53 @@ class WorkerPoolEventStore:
     ) -> Dict[str, Any]:
         safe_window_minutes = max(1, min(int(window_minutes), 7 * 24 * 60))
         safe_bucket_seconds = max(10, min(int(bucket_seconds), 3600))
-        events = self._read_recent_events(safe_window_minutes)
+        query_key = (stage, safe_window_minutes, safe_bucket_seconds)
+
+        with self._state_lock:
+            cached = self._query_cache.get(query_key)
+            if cached is not None:
+                self._query_cache.move_to_end(query_key)
+                return cached
+
+            cutoff_ms = round(time.time() * 1000) - (safe_window_minutes * 60 * 1000)
+            events = [
+                dict(event)
+                for event in self._events
+                if int(event.get("timestamp_ms", 0)) >= cutoff_ms
+            ]
 
         if stage is not None:
             safe_stage = stage.strip().lower()
             if safe_stage not in self.VALID_STAGES:
                 raise ValueError(f"Unsupported stage: {stage}")
             stage_events = [item for item in events if item["stage"] == safe_stage]
-            return {
+            result = {
                 "generated_at_ms": round(time.time() * 1000),
                 "window_minutes": safe_window_minutes,
                 "bucket_seconds": safe_bucket_seconds,
                 "stage": safe_stage,
                 "series": self._build_series(stage_events, safe_bucket_seconds),
             }
+        else:
+            workers = {
+                worker: self._build_series([item for item in events if item["stage"] == worker], safe_bucket_seconds)
+                for worker in self.VALID_STAGES
+            }
+            result = {
+                "generated_at_ms": round(time.time() * 1000),
+                "window_minutes": safe_window_minutes,
+                "bucket_seconds": safe_bucket_seconds,
+                "workers": workers,
+            }
 
-        workers = {
-            worker: self._build_series([item for item in events if item["stage"] == worker], safe_bucket_seconds)
-            for worker in self.VALID_STAGES
-        }
-        return {
-            "generated_at_ms": round(time.time() * 1000),
-            "window_minutes": safe_window_minutes,
-            "bucket_seconds": safe_bucket_seconds,
-            "workers": workers,
-        }
+        with self._state_lock:
+            self._query_cache[query_key] = result
+            self._query_cache.move_to_end(query_key)
+            while len(self._query_cache) > self._max_cached_queries:
+                self._query_cache.popitem(last=False)
+        return result
+
+    def shutdown(self) -> None:
+        with self._state_lock:
+            self._events.clear()
+            self._query_cache.clear()
