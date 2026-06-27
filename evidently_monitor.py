@@ -1497,8 +1497,10 @@ class EvidentlyMonitor:
             latest_signature = self._log_signature()
             with self._state_lock:
                 if self._materialized_last_signature is None:
-                    self._materialized_last_signature = latest_signature
-                    return False
+                    # When baseline signature is unknown (e.g. after local writes),
+                    # rebuild from sink so externally written worker updates are not missed.
+                    self._rebuild_materialized_state_from_sink_locked()
+                    return True
                 if latest_signature == self._materialized_last_signature:
                     return False
                 self._rebuild_materialized_state_from_sink_locked()

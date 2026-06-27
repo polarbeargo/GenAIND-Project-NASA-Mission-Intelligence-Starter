@@ -1,5 +1,7 @@
 import asyncio
 import inspect
+import math
+import re
 from threading import Lock
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
@@ -16,7 +18,14 @@ from openai_config import (
 
 try:
     from ragas import SingleTurnSample
-    from ragas.metrics import BleuScore, NonLLMContextPrecisionWithReference, ResponseRelevancy, Faithfulness, RougeScore
+    from ragas.metrics import (
+        BleuScore,
+        LLMContextPrecisionWithoutReference,
+        NonLLMContextPrecisionWithReference,
+        ResponseRelevancy,
+        Faithfulness,
+        RougeScore,
+    )
     from ragas import evaluate
     RAGAS_AVAILABLE = True
 except ImportError:
@@ -27,6 +36,14 @@ _EVALUATOR_CACHE: Dict[tuple[str, str, str, str], tuple[Any, Any]] = {}
 _EVALUATOR_CACHE_LOCK = Lock()
 _EVALUATOR_CACHE_HITS = 0
 _EVALUATOR_CACHE_MISSES = 0
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+_MIN_CONTEXT_OVERLAP = 0.08
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "had", "has", "have",
+    "he", "her", "his", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their",
+    "there", "they", "this", "to", "was", "were", "with", "what", "when", "where", "which", "who",
+    "why", "how", "during", "into", "about", "after", "before", "can", "could", "should", "would",
+}
 
 
 def _resolve_result(value):
@@ -48,6 +65,47 @@ def _score_single_metric(metric, sample) -> float:
     if hasattr(metric, "single_turn_ascore"):
         return float(_resolve_result(metric.single_turn_ascore(sample)))
     raise AttributeError("Metric does not expose single-turn scoring methods")
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    if not isinstance(text, str) or not text.strip():
+        return set()
+    return {
+        token
+        for token in _TOKEN_PATTERN.findall(text.lower())
+        if len(token) > 1 and token not in _STOPWORDS
+    }
+
+
+def _calculate_context_precision_fallback(question: str, answer: str, contexts: List[str]) -> float:
+    """Estimate context precision as relevant-context ratio using lexical overlap.
+
+    This fallback is deterministic and lightweight so we can still surface a
+    stable context precision signal when the RAGAS metric is unavailable.
+    """
+    cleaned_contexts = [context for context in contexts if isinstance(context, str) and context.strip()]
+    if not cleaned_contexts:
+        return 0.0
+
+    anchor_tokens = _tokenize_for_overlap(question)
+    anchor_tokens.update(_tokenize_for_overlap(answer))
+    if not anchor_tokens:
+        return 0.0
+
+    relevant_contexts = 0
+    for context in cleaned_contexts:
+        context_tokens = _tokenize_for_overlap(context)
+        if not context_tokens:
+            continue
+        overlap = len(context_tokens & anchor_tokens) / float(len(context_tokens))
+        if overlap >= _MIN_CONTEXT_OVERLAP:
+            relevant_contexts += 1
+
+    return relevant_contexts / float(len(cleaned_contexts))
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not math.isnan(float(value)) and math.isfinite(float(value))
 
 
 def _create_single_turn_sample(question: str, answer: str, contexts: List[str]):
@@ -153,10 +211,23 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
             "rouge_score": RougeScore(),
         }
 
+        context_precision_metric = None
         try:
-            metrics["context_precision"] = NonLLMContextPrecisionWithReference()
+            # When no ground-truth reference answer is available, this aligns
+            # with RAGAS context precision guidance by evaluating retrieved
+            # contexts against the generated response.
+            context_precision_metric = LLMContextPrecisionWithoutReference(llm=evaluator_llm)
         except Exception:
-            pass
+            try:
+                # Backward-compatible non-LLM path: this approximation uses the
+                # top retrieved context as a lightweight reference when only
+                # retrieved contexts are available.
+                context_precision_metric = NonLLMContextPrecisionWithReference()
+            except Exception:
+                context_precision_metric = None
+
+        if context_precision_metric is not None:
+            metrics["context_precision"] = context_precision_metric
 
         sample = _create_single_turn_sample(question, answer, cleaned_contexts)
 
@@ -168,6 +239,13 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
                 scores[metric_name] = _score_single_metric(metric, sample)
             except Exception as metric_error:
                 metric_errors[f"{metric_name}_error"] = str(metric_error)
+
+        # Context precision can fail with upstream metric/library incompatibilities.
+        # Ensure the monitoring pipeline still receives a bounded numeric signal.
+        if not _is_finite_number(scores.get("context_precision")):
+            fallback_precision = _calculate_context_precision_fallback(question, answer, cleaned_contexts)
+            scores["context_precision"] = max(0.0, min(1.0, float(fallback_precision)))
+            scores["context_precision_fallback"] = 1.0
 
         if scores:
             return {**scores, **metric_errors}
