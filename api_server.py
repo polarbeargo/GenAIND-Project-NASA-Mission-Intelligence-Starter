@@ -8,6 +8,7 @@ import math
 import os
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -162,6 +163,43 @@ def _get_rate_limit_paths() -> List[str]:
     configured = os.getenv("RATE_LIMIT_PATHS", default_paths).strip()
     paths = [path.strip() for path in configured.split(",") if path.strip()]
     return paths or ["/chat"]
+
+
+def _get_startup_warm_targets() -> List[Tuple[str, str]]:
+    """Return deterministic, bounded warmup targets for lifespan startup.
+
+    Format: STARTUP_WARM_TARGETS="./chroma_db:collection_a,./chroma_db_openai:collection_b"
+    """
+    default_targets: List[Tuple[str, str]] = [
+        ("./chroma_db", "nasa_space_missions_test"),
+        ("./chroma_db_openai", "nasa_space_missions_text"),
+    ]
+    raw = os.getenv("STARTUP_WARM_TARGETS", "").strip()
+    if not raw:
+        return default_targets
+
+    parsed: List[Tuple[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        chroma_dir, sep, collection_name = token.partition(":")
+        if not sep:
+            continue
+        safe_chroma_dir = chroma_dir.strip()
+        safe_collection_name = collection_name.strip()
+        if not safe_chroma_dir or not safe_collection_name:
+            continue
+        key = (safe_chroma_dir, safe_collection_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append(key)
+        if len(parsed) >= 8:
+            break
+
+    return parsed or default_targets
 
 
 def _get_evaluation_broker_stream() -> str:
@@ -887,35 +925,44 @@ class CacheStats:
     """Track cache performance metrics for monitoring."""
 
     def __init__(self):
+        self._lock = Lock()
         self.hits = 0
         self.misses = 0
-        self.init_times: List[float] = []
+        self.init_times = deque(maxlen=100)
 
     def record_hit(self):
-        self.hits += 1
+        with self._lock:
+            self.hits += 1
 
     def record_miss(self, duration_ms: float):
-        self.misses += 1
-        self.init_times.append(duration_ms)
-        if len(self.init_times) > 100:
-            self.init_times = self.init_times[-100:]
+        with self._lock:
+            self.misses += 1
+            self.init_times.append(duration_ms)
 
     @property
     def hit_rate(self) -> float:
-        total = self.hits + self.misses
-        return (self.hits / total * 100) if total > 0 else 0.0
+        with self._lock:
+            total = self.hits + self.misses
+            return (self.hits / total * 100) if total > 0 else 0.0
 
     @property
     def avg_init_ms(self) -> float:
-        return sum(self.init_times) / len(self.init_times) if self.init_times else 0.0
+        with self._lock:
+            return sum(self.init_times) / len(self.init_times) if self.init_times else 0.0
 
     def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            hits = self.hits
+            misses = self.misses
+            total = hits + misses
+            hit_rate = (hits / total * 100) if total > 0 else 0.0
+            avg_init_ms = sum(self.init_times) / len(self.init_times) if self.init_times else 0.0
         return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate_percent": round(self.hit_rate, 2),
-            "avg_init_ms": round(self.avg_init_ms, 2),
-            "total_requests": self.hits + self.misses,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate_percent": round(hit_rate, 2),
+            "avg_init_ms": round(avg_init_ms, 2),
+            "total_requests": total,
         }
 
 
@@ -944,62 +991,33 @@ def _get_cached_rag_init(chroma_dir: str, collection_name: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle: startup (mission-scoped warmup) and shutdown.
+    """Application lifecycle with deterministic, bounded startup warmups only."""
 
-    Warmup phases (executed in order):
-    1. Security rule compilation — confirm all regex patterns are pre-compiled
-       at module-import time so the first request incurs zero JIT cost.
-    2. Collection cache — open each target ChromaDB collection and prime the
-       LRU cache so every request hits immediately.
-    3. Index metadata — call count()+peek() on each collection to load the
-       HNSW index and SQLite metadata tables into the process cache before any
-       real traffic arrives.
-    """
-
-    if PromptInjectionDetector is not None:
-        n_injection = len(PromptInjectionDetector.INJECTION_PATTERNS)
-        n_doc = len(PromptInjectionDetector.RETRIEVED_DOC_PATTERNS)
-        n_sanitize = len(PromptInjectionDetector._SANITIZE_PATTERNS)
-        n_sensitive = len(SensitiveInfoFilter.SENSITIVE_PATTERNS)
-        n_strict = len(SensitiveInfoFilter.STRICT_SENSITIVE_PATTERNS)
-        n_harmful = len(OutputValidator._HARMFUL_PATTERNS)
-        total = n_injection + n_doc + n_sanitize + n_sensitive + n_strict + n_harmful
-        logger.info(
-            "Security patterns pre-compiled: %d total "
-            "(injection=%d, doc=%d, sanitize=%d, sensitive=%d, strict=%d, harmful=%d)",
-            total, n_injection, n_doc, n_sanitize, n_sensitive, n_strict, n_harmful,
-        )
-    else:
-        logger.warning("Security module unavailable — pattern precompilation skipped")
-
-    logger.info("Pre-warming RAG collection cache and index metadata...")
-    backends_to_warm = [
-        ("./chroma_db", "nasa_space_missions_test"),
-        ("./chroma_db_openai", "nasa_space_missions_text"),
-    ]
-    for chroma_dir, collection_name in backends_to_warm:
+    warm_targets = _get_startup_warm_targets()
+    logger.info("Startup deterministic warmup begin: targets=%d", len(warm_targets))
+    for chroma_dir, collection_name in warm_targets:
         try:
             collection, success, error = _cached_rag_init(chroma_dir, collection_name)
             if success and collection is not None:
                 index_info = rag_client.warm_collection_index(collection)
                 if "error" in index_info:
                     logger.warning(
-                        "  ~ Partial warm %s/%s: index metadata unavailable — %s",
+                        "Startup warm partial %s/%s: index metadata unavailable: %s",
                         chroma_dir, collection_name, index_info["error"],
                     )
                 else:
                     logger.info(
-                        "  ✓ Ready: %s/%s  docs=%d  index_primed=%s",
+                        "Startup warm ready %s/%s docs=%d index_primed=%s",
                         chroma_dir, collection_name,
                         index_info["count"], index_info["index_primed"],
                     )
             else:
                 logger.warning(
-                    "  - Skip (optional): %s/%s — %s",
+                    "Startup warm skipped %s/%s: %s",
                     chroma_dir, collection_name, error or "no collection",
                 )
         except Exception as exc:
-            logger.warning("  - Skip (optional): %s — %s", chroma_dir, str(exc)[:60])
+            logger.warning("Startup warm skipped %s: %s", chroma_dir, str(exc)[:60])
 
     logger.info("Startup warmup complete. Cache stats: %s", cache_stats.to_dict())
     yield
