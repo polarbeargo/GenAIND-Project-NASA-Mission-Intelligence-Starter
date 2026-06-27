@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from monitoring.stage_sli_events import StageLatencyEventStore
+from monitoring.worker_pool_events import WorkerPoolEventStore
 from multi_agent.models import ChatWorkflowInput, RetrievalResult, SafetyPreflightResult
 from multi_agent.workflow import MultiAgentChatWorkflow
 
@@ -197,6 +198,66 @@ class TestLatencySLITimeseries(unittest.TestCase):
             report = store.get_timeseries(stage="retrieval", window_minutes=180, bucket_seconds=300)
             latest_bucket = report["series"][-1]
             self.assertEqual(latest_bucket["total_requests"], 1)
+
+    def test_shutdown_clears_in_memory_buffers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "stage_latency_events.jsonl"
+            store = StageLatencyEventStore(log_file=log_path)
+
+            store.record(
+                stage="retrieval",
+                latency_ms=120.0,
+                timed_out=False,
+                budget_ms=700.0,
+                status="ok",
+                mission="apollo13",
+                backend="backend-a",
+                model="model-a",
+            )
+
+            self.assertGreaterEqual(len(store.get_timeseries(stage="retrieval")["series"]), 1)
+
+            store.shutdown()
+
+            cleared = store.get_timeseries(stage="retrieval", window_minutes=60, bucket_seconds=300)
+            self.assertEqual(cleared["series"], [])
+
+
+class TestWorkerPoolEventStore(unittest.TestCase):
+    def test_timeseries_and_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "worker_pool_events.jsonl"
+            store = WorkerPoolEventStore(log_file=log_path)
+
+            report = {
+                "generated_at_ms": round(time.time() * 1000),
+                "workers": {
+                    "retrieval": {
+                        "max_workers": 4,
+                        "queue_limit": 8,
+                        "capacity": 4,
+                        "inflight": 2,
+                        "queued_estimate": 1,
+                        "submitted": 10,
+                        "completed": 8,
+                        "rejected": 0,
+                        "failed": 0,
+                        "oldest_queue_age_seconds": 0.5,
+                        "rejected_rate": 0.0,
+                        "error_rate": 0.0,
+                    }
+                },
+            }
+
+            store.record_snapshot(report)
+            timeseries = store.get_timeseries(stage="retrieval", window_minutes=60, bucket_seconds=300)
+
+            self.assertEqual(timeseries["stage"], "retrieval")
+            self.assertGreaterEqual(len(timeseries["series"]), 1)
+
+            store.shutdown()
+            cleared = store.get_timeseries(stage="retrieval", window_minutes=60, bucket_seconds=300)
+            self.assertEqual(cleared["series"], [])
 
 
 if __name__ == "__main__":
