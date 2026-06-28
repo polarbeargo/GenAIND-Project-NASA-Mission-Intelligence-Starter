@@ -917,7 +917,32 @@ class MultiAgentChatWorkflow:
                 },
                 blocked=False,
             )
-        
+
+        # For non mission-filtered requests, retrieval can still degrade to an
+        # empty context set due to sparse matches. Return a clear bounded
+        # response instead of generating from priors.
+        if answer is None and not retrieval_result.contexts:
+            return ChatWorkflowResult(
+                answer=(
+                    "I don't have enough grounded context to answer this safely right now. "
+                    "Please rephrase with mission-specific details or broaden the data scope and retry."
+                ),
+                contexts=[],
+                evaluation={},
+                judge={
+                    "groundedness_score": 0.0,
+                    "safety_score": 1.0,
+                    "task_success_score": 0.0,
+                    "overall_score": 0.3,
+                    "confidence": 1.0,
+                    "passed": True,
+                    "low_confidence": True,
+                    "rationale": "No retrieval contexts available for grounded generation.",
+                    "source": "policy",
+                },
+                blocked=False,
+            )
+
         if answer is None:
             if not self._generation_breaker.allow():
                 answer = (
