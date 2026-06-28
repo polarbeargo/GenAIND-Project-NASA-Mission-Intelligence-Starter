@@ -1,0 +1,57 @@
+name: Batch Eval Dry Run
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - scripts/run_batch_evaluation.py
+      - test_questions.json
+      - .github/workflows/batch-eval-dry-run.yml
+      - README.md
+
+permissions:
+  contents: read
+
+jobs:
+  batch-eval-dry-run:
+    name: Batch Evaluation Dry Run
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run batch evaluator in dry-run mode
+        run: |
+          python scripts/run_batch_evaluation.py \
+            --dataset test_questions.json \
+            --dry-run \
+            --min-questions 10 \
+            --output-json monitoring/batch_eval_ci_dry_run.json
+
+      - name: Verify dry-run report status
+        run: |
+          python - << 'PYTHON_SCRIPT'
+          import json
+          from pathlib import Path
+
+          report_path = Path('monitoring/batch_eval_ci_dry_run.json')
+          if not report_path.exists():
+              raise SystemExit('Dry-run report was not generated')
+
+          payload = json.loads(report_path.read_text(encoding='utf-8'))
+          results = payload.get('results', [])
+          if len(results) < 10:
+              raise SystemExit(f'Expected >= 10 results, got {len(results)}')
+
+          invalid = [r for r in results if r.get('status') != 'dry_run']
+          if invalid:
+              raise SystemExit(f'Unexpected non-dry-run statuses: {invalid[:2]}')
+
+          print(f'Dry-run validation passed for {len(results)} tagged queries')
+          PYTHON_SCRIPT

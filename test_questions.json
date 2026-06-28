@@ -1,0 +1,62 @@
+[
+  {
+    "id": "overview_ap11",
+    "category": "overview",
+    "mission": "apollo11",
+    "question": "Give a concise overview of the Apollo 11 mission objectives and outcome."
+  },
+  {
+    "id": "emergency_ap13",
+    "category": "emergency",
+    "mission": "apollo13",
+    "question": "What immediate emergency actions were taken after the Apollo 13 oxygen tank incident?"
+  },
+  {
+    "id": "disaster_challenger",
+    "category": "disaster_analysis",
+    "mission": "challenger",
+    "question": "What technical and decision factors contributed to the Challenger STS-51L disaster?"
+  },
+  {
+    "id": "crew_ap13",
+    "category": "crew",
+    "mission": "apollo13",
+    "question": "Who were the Apollo 13 crew members and what were their primary roles?"
+  },
+  {
+    "id": "technical_ap13",
+    "category": "technical",
+    "mission": "apollo13",
+    "question": "Explain the technical root cause of the Apollo 13 oxygen tank explosion."
+  },
+  {
+    "id": "timeline_ap11",
+    "category": "timeline",
+    "mission": "apollo11",
+    "question": "Provide a short timeline from Apollo 11 launch to lunar landing."
+  },
+  {
+    "id": "procedure_ap13_powerdown",
+    "category": "procedure_detail",
+    "mission": "apollo13",
+    "question": "Describe the key command module power-down steps used to conserve energy on Apollo 13."
+  },
+  {
+    "id": "cross_mission_life_support",
+    "category": "cross_mission",
+    "mission": "all",
+    "question": "Compare how Apollo 13 and Challenger documentation describe life-support risk handling."
+  },
+  {
+    "id": "vague_mission_query",
+    "category": "vague",
+    "mission": "all",
+    "question": "What happened during the mission when communications became critical?"
+  },
+  {
+    "id": "out_of_scope_non_nasa",
+    "category": "out_of_scope",
+    "mission": "all",
+    "question": "Who won the 2018 FIFA World Cup and what was the final score?"
+  }
+]

@@ -1,0 +1,225 @@
+{
+  "dataset": "test_questions.json",
+  "base_url": "http://127.0.0.1:8000",
+  "dataset_errors": [],
+  "results": [
+    {
+      "row_index": 1,
+      "id": "overview_ap11",
+      "category": "overview",
+      "mission": "apollo11",
+      "question": "Give a concise overview of the Apollo 11 mission objectives and outcome.",
+      "status": "completed",
+      "error": null,
+      "context_count": 4,
+      "metrics": {
+        "faithfulness": 0.2,
+        "response_relevancy": 0.7458650715332696,
+        "context_precision": 0.8055555555287036,
+        "bleu_score": 0.4200134021848839,
+        "rouge_score": 0.26229508196721313
+      }
+    },
+    {
+      "row_index": 2,
+      "id": "emergency_ap13",
+      "category": "emergency",
+      "mission": "apollo13",
+      "question": "What immediate emergency actions were taken after the Apollo 13 oxygen tank incident?",
+      "status": "completed",
+      "error": null,
+      "context_count": 2,
+      "metrics": {
+        "faithfulness": 0.75,
+        "response_relevancy": 0.9921510000947075,
+        "context_precision": 0.99999999995,
+        "bleu_score": 0.34112657643036315,
+        "rouge_score": 0.30985915492957744
+      }
+    },
+    {
+      "row_index": 3,
+      "id": "disaster_challenger",
+      "category": "disaster_analysis",
+      "mission": "challenger",
+      "question": "What technical and decision factors contributed to the Challenger STS-51L disaster?",
+      "status": "completed",
+      "error": null,
+      "context_count": 2,
+      "metrics": {
+        "faithfulness": 0.0,
+        "response_relevancy": 0.9902880702967719,
+        "context_precision": 0.99999999995,
+        "bleu_score": 0.008238973589671713,
+        "rouge_score": 0.13749999999999998
+      }
+    },
+    {
+      "row_index": 4,
+      "id": "crew_ap13",
+      "category": "crew",
+      "mission": "apollo13",
+      "question": "Who were the Apollo 13 crew members and what were their primary roles?",
+      "status": "completed",
+      "error": null,
+      "context_count": 2,
+      "metrics": {
+        "faithfulness": 0.0,
+        "response_relevancy": 0.9424044699936903,
+        "context_precision": 0.0,
+        "bleu_score": 0.04491575568657404,
+        "rouge_score": 0.09090909090909091
+      }
+    },
+    {
+      "row_index": 5,
+      "id": "technical_ap13",
+      "category": "technical",
+      "mission": "apollo13",
+      "question": "Explain the technical root cause of the Apollo 13 oxygen tank explosion.",
+      "status": "completed",
+      "error": null,
+      "context_count": 3,
+      "metrics": {
+        "faithfulness": 0.0,
+        "response_relevancy": 0.9745346098799949,
+        "context_precision": 0.49999999995,
+        "bleu_score": 0.024908369388021448,
+        "rouge_score": 0.1021897810218978
+      }
+    },
+    {
+      "row_index": 6,
+      "id": "timeline_ap11",
+      "category": "timeline",
+      "mission": "apollo11",
+      "question": "Provide a short timeline from Apollo 11 launch to lunar landing.",
+      "status": "completed",
+      "error": null,
+      "context_count": 4,
+      "metrics": {
+        "faithfulness": 0.8,
+        "response_relevancy": 0.5937446705028925,
+        "context_precision": 0.999999999975,
+        "bleu_score": 0.0,
+        "rouge_score": 0.12955465587044535
+      }
+    },
+    {
+      "row_index": 7,
+      "id": "procedure_ap13_powerdown",
+      "category": "procedure_detail",
+      "mission": "apollo13",
+      "question": "Describe the key command module power-down steps used to conserve energy on Apollo 13.",
+      "status": "completed",
+      "error": null,
+      "context_count": 3,
+      "metrics": {
+        "faithfulness": 0.25,
+        "response_relevancy": 0.9499379090183627,
+        "context_precision": 0.9999999999666667,
+        "bleu_score": 0.03712934101015684,
+        "rouge_score": 0.15189873417721517
+      }
+    },
+    {
+      "row_index": 8,
+      "id": "cross_mission_life_support",
+      "category": "cross_mission",
+      "mission": "all",
+      "question": "Compare how Apollo 13 and Challenger documentation describe life-support risk handling.",
+      "status": "completed",
+      "error": null,
+      "context_count": 4,
+      "metrics": {
+        "faithfulness": 0.5,
+        "response_relevancy": 0.7019160421842175,
+        "context_precision": 0.0,
+        "bleu_score": 0.0011843598674628338,
+        "rouge_score": 0.03738317757009346
+      }
+    },
+    {
+      "row_index": 9,
+      "id": "vague_mission_query",
+      "category": "vague",
+      "mission": "all",
+      "question": "What happened during the mission when communications became critical?",
+      "status": "completed",
+      "error": null,
+      "context_count": 2,
+      "metrics": {
+        "faithfulness": 1.0,
+        "response_relevancy": 0.7278142986927897,
+        "context_precision": 0.99999999995,
+        "bleu_score": 0.4535974992141894,
+        "rouge_score": 0.5401459854014597
+      }
+    },
+    {
+      "row_index": 10,
+      "id": "out_of_scope_non_nasa",
+      "category": "out_of_scope",
+      "mission": "all",
+      "question": "Who won the 2018 FIFA World Cup and what was the final score?",
+      "status": "completed",
+      "error": null,
+      "context_count": 2,
+      "metrics": {
+        "faithfulness": 0.0,
+        "response_relevancy": 0.0,
+        "context_precision": 0.0,
+        "bleu_score": 0.03708659055657029,
+        "rouge_score": 0.0
+      }
+    }
+  ],
+  "aggregate": {
+    "total_questions": 10,
+    "status_counts": {
+      "completed": 10
+    },
+    "metrics": {
+      "faithfulness": {
+        "mean": 0.35,
+        "min": 0.0,
+        "max": 1.0,
+        "count": 10,
+        "zero_count": 4,
+        "null_count": 0
+      },
+      "response_relevancy": {
+        "mean": 0.761866,
+        "min": 0.0,
+        "max": 0.992151,
+        "count": 10,
+        "zero_count": 1,
+        "null_count": 0
+      },
+      "context_precision": {
+        "mean": 0.630556,
+        "min": 0.0,
+        "max": 1.0,
+        "count": 10,
+        "zero_count": 3,
+        "null_count": 0
+      },
+      "bleu_score": {
+        "mean": 0.13682,
+        "min": 0.0,
+        "max": 0.453597,
+        "count": 10,
+        "zero_count": 1,
+        "null_count": 0
+      },
+      "rouge_score": {
+        "mean": 0.176174,
+        "min": 0.0,
+        "max": 0.540146,
+        "count": 10,
+        "zero_count": 1,
+        "null_count": 0
+      }
+    }
+  }
+}
