@@ -73,6 +73,28 @@ _MISSION_ALIASES = {
     "apollo 13": "apollo_13",
     "apollo-13": "apollo_13",
     "challenger": "challenger",
+    "sts-51l": "challenger",
+    "sts_51l": "challenger",
+    "sts 51l": "challenger",
+}
+
+_QUERY_ALIAS_EXPANSIONS = {
+    "sts-51l": ["challenger", "space shuttle challenger", "mission 51l"],
+    "sts 51l": ["challenger", "space shuttle challenger", "mission 51l"],
+    "sts_51l": ["challenger", "space shuttle challenger", "mission 51l"],
+    "apollo13": ["apollo 13", "apollo thirteen"],
+    "apollo-13": ["apollo 13", "apollo thirteen"],
+    "apollo11": ["apollo 11", "apollo eleven"],
+    "apollo-11": ["apollo 11", "apollo eleven"],
+    "cryo stir": ["cryogenic stir", "oxygen tank stir"],
+    "oxygen tank": ["cryogenic oxygen tank", "o2 tank"],
+    "o2 tank": ["oxygen tank", "cryogenic oxygen tank"],
+}
+
+_MISSION_CONTEXT_TERMS = {
+    "apollo_11": ["apollo 11", "saturn v", "lunar landing", "command module"],
+    "apollo_13": ["apollo 13", "oxygen tank", "command module", "lunar module"],
+    "challenger": ["challenger", "sts-51l", "solid rocket booster", "launch decision"],
 }
 
 
@@ -125,6 +147,18 @@ def _get_keyword_candidates_per_term() -> int:
     return max(1, min(value, 16))
 
 
+def _query_rewrite_enabled() -> bool:
+    return os.getenv("RETRIEVAL_QUERY_REWRITE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_query_rewrite_max_expansion_terms() -> int:
+    try:
+        value = int(os.getenv("RETRIEVAL_QUERY_REWRITE_MAX_EXPANSION_TERMS", "10"))
+    except ValueError:
+        value = 10
+    return max(2, min(value, 24))
+
+
 def _tokenize_for_rerank(text: str) -> set[str]:
     """Tokenize text into lowercase alphanumeric terms for overlap scoring."""
     return set(_TOKEN_PATTERN.findall((text or "").lower()))
@@ -141,6 +175,62 @@ def _extract_keyword_terms(query: str) -> List[str]:
         seen.add(token)
         terms.append(token)
     return terms
+
+
+def _infer_mission_from_query(query: str) -> str:
+    raw = (query or "").strip().lower()
+    if not raw:
+        return ""
+
+    for alias, normalized in _MISSION_ALIASES.items():
+        if alias and alias in raw:
+            return normalized
+
+    return ""
+
+
+def _rewrite_query_for_retrieval(query: str, mission_filter: Optional[str]) -> str:
+    """Rewrite query with bounded alias + mission-context expansion for recall.
+
+    This function is deterministic and side-effect free so it is safe under
+    concurrent request load.
+    """
+    base_query = (query or "").strip()
+    if not base_query or not _query_rewrite_enabled():
+        return base_query
+
+    lower_query = base_query.lower()
+    max_terms = _get_query_rewrite_max_expansion_terms()
+
+    expansions: List[str] = []
+    seen = set()
+
+    def _append_terms(terms: List[str]) -> None:
+        for term in terms:
+            candidate = (term or "").strip().lower()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            expansions.append(term.strip())
+            if len(expansions) >= max_terms:
+                return
+
+    for alias, alias_expansions in _QUERY_ALIAS_EXPANSIONS.items():
+        if alias in lower_query:
+            _append_terms(alias_expansions)
+            if len(expansions) >= max_terms:
+                break
+
+    normalized_filter = _normalize_mission_filter(mission_filter or "") if mission_filter else ""
+    inferred_mission = _infer_mission_from_query(lower_query)
+    effective_mission = normalized_filter or inferred_mission
+    if effective_mission in _MISSION_CONTEXT_TERMS and len(expansions) < max_terms:
+        _append_terms(_MISSION_CONTEXT_TERMS[effective_mission])
+
+    if not expansions:
+        return base_query
+
+    return f"{base_query} {' '.join(expansions[:max_terms])}".strip()
 
 
 def _flatten_results(results: Dict[str, Any]) -> tuple[list[str], list[Dict[str, Any]], list[Any], list[Any]]:
@@ -528,9 +618,14 @@ def retrieve_documents(
         min(requested_n * _get_first_pass_multiplier(), _get_first_pass_max_candidates()),
     )
 
+    retrieval_query = _rewrite_query_for_retrieval(
+        query=query,
+        mission_filter=mission_filter,
+    )
+
     results = _run_hybrid_first_pass(
         collection=collection,
-        query=query,
+        query=retrieval_query,
         first_pass_n=first_pass_n,
         where_filter=where_filter,
         chroma_dir=chroma_dir,
