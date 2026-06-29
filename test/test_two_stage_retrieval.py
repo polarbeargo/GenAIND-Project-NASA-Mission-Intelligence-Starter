@@ -70,6 +70,64 @@ class FakeHybridCollection:
 
 
 class TestTwoStageRetrieval(unittest.TestCase):
+    def test_query_rewrite_expands_aliases_for_first_pass(self):
+        fake = FakeCollection(
+            {
+                "documents": [["doc"]],
+                "metadatas": [[{}]],
+                "distances": [[0.1]],
+                "ids": [["x"]],
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "RETRIEVAL_QUERY_REWRITE_ENABLED": "true",
+                "RETRIEVAL_HYBRID_ENABLED": "false",
+            },
+            clear=False,
+        ), patch.object(rag_client, "VectorSecurityValidator", None):
+            rag_client.retrieve_documents(
+                fake,
+                query="What happened during STS-51L launch?",
+                n_results=1,
+            )
+
+        rewritten_query = fake.calls[0]["query_texts"][0].lower()
+        self.assertIn("sts-51l", rewritten_query)
+        self.assertIn("challenger", rewritten_query)
+
+    def test_query_rewrite_expands_mission_context_from_filter(self):
+        fake = FakeCollection(
+            {
+                "documents": [["doc"]],
+                "metadatas": [[{"mission": "apollo_13"}]],
+                "distances": [[0.1]],
+                "ids": [["x"]],
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "RETRIEVAL_QUERY_REWRITE_ENABLED": "true",
+                "RETRIEVAL_HYBRID_ENABLED": "false",
+            },
+            clear=False,
+        ), patch.object(rag_client, "VectorSecurityValidator", None):
+            rag_client.retrieve_documents(
+                fake,
+                query="power-down steps",
+                n_results=1,
+                mission_filter="apollo13",
+            )
+
+        rewritten_query = fake.calls[0]["query_texts"][0].lower()
+        self.assertIn("power-down steps", rewritten_query)
+        self.assertIn("apollo 13", rewritten_query)
+        self.assertIn("oxygen tank", rewritten_query)
+
     def test_first_pass_expands_candidate_set(self):
         fake = FakeCollection(
             {
