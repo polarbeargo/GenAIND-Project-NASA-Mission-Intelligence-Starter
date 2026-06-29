@@ -25,6 +25,7 @@ STREAMLIT_DEPLOYMENT_NAME="${STREAMLIT_DEPLOYMENT_NAME:-nasa-mission-intelligenc
 EVALUATION_WORKER_DEPLOYMENT_NAME="${EVALUATION_WORKER_DEPLOYMENT_NAME:-nasa-evaluation-worker}"
 JUDGE_WORKER_DEPLOYMENT_NAME="${JUDGE_WORKER_DEPLOYMENT_NAME:-nasa-judge-worker}"
 REDIS_DEPLOYMENT_NAME="${REDIS_DEPLOYMENT_NAME:-nasa-redis}"
+ROLLOUT_TIMEOUT_SECONDS="${ROLLOUT_TIMEOUT_SECONDS:-420}"
 ENABLE_STREAMLIT_CHECKS="${ENABLE_STREAMLIT_CHECKS:-true}"
 ENABLE_EVALUATION_WORKER="${ENABLE_EVALUATION_WORKER:-false}"
 ENABLE_JUDGE_WORKER="${ENABLE_JUDGE_WORKER:-false}"
@@ -95,7 +96,7 @@ install_postgres() {
   log "Provisioning in-cluster PostgreSQL for centralized monitoring: ${POSTGRES_MANIFEST_PATH}"
   kubectl apply -f "${POSTGRES_MANIFEST_PATH}" >/dev/null
   log "Waiting for PostgreSQL rollout: ${POSTGRES_DEPLOYMENT_NAME}"
-  kubectl rollout status deployment/"${POSTGRES_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null || \
+  kubectl rollout status deployment/"${POSTGRES_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null || \
     die "PostgreSQL deployment failed to become ready"
   log "PostgreSQL ready. Monitoring sink will use: postgresql://${MONITORING_POSTGRES_USER}@${MONITORING_POSTGRES_HOST}:${MONITORING_POSTGRES_PORT}/${MONITORING_POSTGRES_DB}"
 }
@@ -221,14 +222,14 @@ main() {
     log "Provisioning in-cluster Redis: ${REDIS_MANIFEST_PATH}"
     kubectl apply -f "${REDIS_MANIFEST_PATH}" >/dev/null
     log "Waiting for Redis rollout: ${REDIS_DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${REDIS_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+    kubectl rollout status deployment/"${REDIS_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
   fi
 
   log "Applying PVC-backed API manifest for full RAG parity: ${API_MANIFEST_PATH}"
   kubectl apply -f "${API_MANIFEST_PATH}" >/dev/null
 
   log "Waiting for API to become ready before wiring monitoring configuration"
-  kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+  kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
 
   if [[ "${ENABLE_MONITORING_POSTGRES}" == "true" || "${MONITORING_PRIMARY_SINK}" != "file" ]]; then
     log "Wiring Evidently monitoring sink configuration to API deployment"
@@ -241,7 +242,7 @@ main() {
       MONITORING_POSTGRES_USER="${MONITORING_POSTGRES_USER}" \
       MONITORING_POSTGRES_SSLMODE="${MONITORING_POSTGRES_SSLMODE}" >/dev/null
     log "Waiting for API rollout after monitoring sink env update: ${DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
   fi
 
   log "Recreating Chroma seed job for idempotent collection bootstrap"
@@ -284,7 +285,7 @@ main() {
     fi
 
     log "Waiting for API rollout after broker env update: ${DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+    kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
   fi
 
   if [[ "${ENABLE_EVALUATION_WORKER}" == "true" ]]; then
@@ -312,7 +313,7 @@ main() {
     fi
 
     log "Waiting for evaluation worker rollout: ${EVALUATION_WORKER_DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+    kubectl rollout status deployment/"${EVALUATION_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
 
     log "Applying KEDA ScaledObject for evaluation worker auto-scaling: ${KEDA_SCALER_PATH}"
     kubectl apply -f "${KEDA_SCALER_PATH}" >/dev/null
@@ -333,7 +334,7 @@ main() {
     fi
 
     log "Waiting for judge worker rollout: ${JUDGE_WORKER_DEPLOYMENT_NAME}"
-    kubectl rollout status deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+    kubectl rollout status deployment/"${JUDGE_WORKER_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
 
     log "Applying KEDA ScaledObject for judge worker auto-scaling: ${JUDGE_KEDA_SCALER_PATH}"
     kubectl apply -f "${JUDGE_KEDA_SCALER_PATH}" >/dev/null
@@ -343,7 +344,7 @@ main() {
   kubectl apply -f "${STREAMLIT_MANIFEST_PATH}" >/dev/null
 
   log "Waiting for Streamlit rollout: ${STREAMLIT_DEPLOYMENT_NAME}"
-  kubectl rollout status deployment/"${STREAMLIT_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout=180s >/dev/null
+  kubectl rollout status deployment/"${STREAMLIT_DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
 
   log "Applying Streamlit HPA: ${STREAMLIT_HPA_PATH}"
   kubectl apply -f "${STREAMLIT_HPA_PATH}" >/dev/null
