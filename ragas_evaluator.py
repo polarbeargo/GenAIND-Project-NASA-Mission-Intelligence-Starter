@@ -7,7 +7,7 @@ from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openai_config import (
     get_openai_api_key,
@@ -108,6 +108,40 @@ def _is_finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not math.isnan(float(value)) and math.isfinite(float(value))
 
 
+def _normalize_contexts_for_evaluation(contexts: Any) -> Tuple[List[str], Optional[str]]:
+    """Validate and normalize contexts into a compact list of non-empty strings."""
+    if contexts is None:
+        return [], "Malformed contexts: expected a list of strings, got NoneType"
+
+    # Guard string inputs explicitly so we do not accidentally iterate characters.
+    if isinstance(contexts, str):
+        return [], "Malformed contexts: expected a list of strings, got str"
+
+    if not isinstance(contexts, Sequence):
+        return [], f"Malformed contexts: expected a list of strings, got {type(contexts).__name__}"
+
+    cleaned_contexts = [context for context in contexts if isinstance(context, str) and context.strip()]
+    if not cleaned_contexts:
+        return [], "No contexts available for evaluation"
+
+    return cleaned_contexts, None
+
+
+def _normalize_text_field(value: Any, field_name: str) -> Tuple[str, Optional[str]]:
+    """Validate and normalize question/answer text fields."""
+    if value is None:
+        return "", f"Malformed {field_name}: expected non-empty string, got NoneType"
+
+    if not isinstance(value, str):
+        return "", f"Malformed {field_name}: expected non-empty string, got {type(value).__name__}"
+
+    normalized = value.strip()
+    if not normalized:
+        return "", f"Malformed {field_name}: expected non-empty string, got empty"
+
+    return normalized, None
+
+
 def _create_single_turn_sample(question: str, answer: str, contexts: List[str]):
     try:
         return SingleTurnSample(
@@ -183,12 +217,20 @@ def get_evaluator_cache_metrics() -> Dict[str, int]:
 
 def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -> Dict[str, float]:
     """Evaluate response quality using RAGAS metrics"""
+    normalized_question, question_error = _normalize_text_field(question, "question")
+    if question_error:
+        return {"error": question_error}
+
+    normalized_answer, answer_error = _normalize_text_field(answer, "answer")
+    if answer_error:
+        return {"error": answer_error}
+
+    cleaned_contexts, contexts_error = _normalize_contexts_for_evaluation(contexts)
+    if contexts_error:
+        return {"error": contexts_error}
+
     if not RAGAS_AVAILABLE:
         return {"error": "RAGAS not available"}
-
-    cleaned_contexts = [context for context in contexts if isinstance(context, str) and context.strip()]
-    if not cleaned_contexts:
-        return {"error": "No contexts available for evaluation"}
 
     openai_api_key = get_openai_api_key()
     if not openai_api_key:
@@ -243,7 +285,7 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
         # Context precision can fail with upstream metric/library incompatibilities.
         # Ensure the monitoring pipeline still receives a bounded numeric signal.
         if not _is_finite_number(scores.get("context_precision")):
-            fallback_precision = _calculate_context_precision_fallback(question, answer, cleaned_contexts)
+            fallback_precision = _calculate_context_precision_fallback(normalized_question, normalized_answer, cleaned_contexts)
             scores["context_precision"] = max(0.0, min(1.0, float(fallback_precision)))
             scores["context_precision_fallback"] = 1.0
 
