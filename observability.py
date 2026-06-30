@@ -98,6 +98,16 @@ def _fastapi_excluded_urls() -> str:
     only suppress Phoenix span creation; the endpoints stay fully functional.
     """
     default_patterns = [
+        # Chat route already emits an explicit OpenInference CHAIN span in
+        # api_server.py; excluding the framework span avoids duplicate
+        # SERVER/send/receive spans that Phoenix renders as UNKNOWN kind.
+        "/chat",
+        # Async evaluation polling is operational plumbing rather than a user
+        # semantic span, so exclude it to reduce UNKNOWN-kind noise.
+        "/evaluation/",
+        # All monitoring routes are scraped/polled frequently and create large
+        # volumes of ASGI send/receive spans with no OpenInference kind.
+        "/monitoring/",
         # All /monitoring/worker-pools sub-routes (snapshot, series, timeseries, prometheus)
         "/monitoring/worker-pools",
         # Latency SLI polling

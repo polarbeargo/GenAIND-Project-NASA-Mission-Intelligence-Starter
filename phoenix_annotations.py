@@ -12,6 +12,8 @@ from functools import lru_cache
 from numbers import Number
 from typing import Any, Dict, Iterable, Optional
 
+from opentelemetry.instrumentation.utils import suppress_instrumentation
+
 try:
     from phoenix.client import Client as PhoenixClient
 except Exception:  # pragma: no cover - optional runtime dependency
@@ -79,14 +81,18 @@ def post_span_annotations(
         client = _get_phoenix_client((base_url or phoenix_base_url()).rstrip("/"))
         if client is None:
             return
-        for name, score in scores.items():
-            client.spans.add_span_annotation(
-                span_id=span_id,
-                annotation_name=name,
-                annotator_kind="CODE",
-                score=float(score),
-                sync=False,
-            )
+        # Avoid tracing the Phoenix annotation transport itself; otherwise
+        # requests auto-instrumentation can create extra transport spans that
+        # show up in Phoenix as "unknown kind" alongside the real chat span.
+        with suppress_instrumentation():
+            for name, score in scores.items():
+                client.spans.add_span_annotation(
+                    span_id=span_id,
+                    annotation_name=name,
+                    annotator_kind="CODE",
+                    score=float(score),
+                    sync=False,
+                )
     except Exception as error:  # pragma: no cover - telemetry must never break serving
         if logger is not None:
             logger.warning("Failed to post Phoenix annotations for span %s: %s", span_id, error)
