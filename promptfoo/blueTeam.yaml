@@ -22,15 +22,15 @@ providers:
   - id: http
     label: nasa-chat-multi-agent
     config:
-      url: http://localhost:8001/chat
+      url: http://localhost:8000/chat
       method: POST
       headers:
         Content-Type: application/json
       body: |
         {
           "question": "{{ question }}",
-          "chroma_dir": "./chroma_db",
-          "collection_name": "nasa_space_missions_test",
+          "chroma_dir": "./chroma_db_openai",
+          "collection_name": "nasa_space_missions_text",
           "n_results": 3,
           "evaluate": true,
           "model": "gpt-3.5-turbo"
