@@ -22,3 +22,20 @@
 - Blocked preflight responses return a policy-derived judge object with `source=policy`.
 - HTTP-level schema stability for `/chat` (including `judge_mode=sync|async|off`) is regression-tested in `test/test_chat_contract_api.py`.
 
+How each mode fits production
+
+1. sync  
+Best for high-assurance routes where correctness matters more than latency.
+
+2. async  
+Best default for general production traffic. Fast response first, quality verdict shortly after.
+
+3. off  
+Useful for incident fallback, load-shedding, or internal non-critical workloads.
+
+Recommended production policy
+
+1. Default to async for most traffic.  
+2. Use sync for premium/high-risk endpoints.  
+3. Keep off only as controlled fallback with alerting.  
+4. Track judge pass rate and low_confidence rate as release gates.  
