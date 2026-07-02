@@ -22,7 +22,7 @@ providers:
   - id: http
     label: nasa-chat-multi-agent
     config:
-      url: http://localhost:8000/chat
+      url: http://localhost:8001/chat
       method: POST
       headers:
         Content-Type: application/json
