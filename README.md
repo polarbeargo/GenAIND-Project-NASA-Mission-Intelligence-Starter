@@ -212,13 +212,29 @@ See [Integration Testing Runbook](doc/integration-testing.md).
 |---|---|---|
 | LLM01 Prompt Injection | `PromptInjectionDetector` | Preflight + vector doc scan |
 | LLM02 Sensitive Information Disclosure | `SensitiveInfoFilter` | Postflight |
+| LLM03 Supply Chain | `pip-audit` + `Safety` | CI/CD dependency scanning |
+| LLM04 Data & Model Poisoning | `VectorSecurityValidator.detect_poisoned_results()` | Preflight |
 | LLM05 Improper Output Handling | `OutputValidator` | Postflight |
 | LLM07 System Prompt Leakage | Jailbreak deny-list + strict output filtering | Preflight + postflight |
-| LLM08 Vector and Embedding Weaknesses | `VectorSecurityValidator` | Preflight |
+| LLM08 Vector and Embedding Weaknesses | `VectorSecurityValidator.validate_embedding_source()` | Preflight |
 | LLM10 Unbounded Consumption | `ResourceLimitEnforcer` + Redis sliding-window API limiter | Preflight + middleware |
 | Cross-cutting audit telemetry (non-risk-specific) | `SecurityEventSink` (`DashboardSecurityEventSink`, `LoggerSecurityEventSink`) | Both stages |
 
 Jailbreak keyword detection (hardcoded deny-list) runs before any external library call, ensuring zero-cost early exit on obvious attacks.
+
+### Local Security Verification
+
+Use the reusable local gate to validate the Semgrep rules extracted from the workflow before pushing:
+
+```bash
+./scripts/verify-security-scan-local.sh
+```
+
+To mirror the scheduled workflow warning budget locally:
+
+```bash
+GITHUB_EVENT_NAME=schedule ./scripts/verify-security-scan-local.sh
+```
 
 ## Evaluation Strategy
 
@@ -1438,5 +1454,6 @@ See [doc/data-requirements.md](doc/data-requirements.md) for the expected direct
 - [Udacity Generative AI Nanodegree Program](https://www.udacity.com/course/generative-ai--nd608)
 - [Udacity Security Engineer Nanodegree Program](https://www.udacity.com/course/security-engineer-nanodegree--nd698)
 - [Udacity Cloud Native Application Architecture Nanodegree Program](https://www.udacity.com/blog/kick-off-your-cloud-native-application-architecture-career-with-the-launch-of-our-latest-nanodegree-program/)
+- [CS50 Cybersecurity](https://cs50.harvard.edu/cybersecurity/)
 - [Coursera Introduction to Machine Learning in Production](https://www.coursera.org/learn/introduction-to-machine-learning-in-production)
 - [MLOps Guide by Huyen Chip](https://huyenchip.com/mlops/)
