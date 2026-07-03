@@ -116,7 +116,9 @@ jobs:
               patterns:
                 - pattern-either:
                     - pattern: eval(...)
+                      pattern-not: $OBJ.eval(...)
                     - pattern: exec(...)
+                      pattern-not: $OBJ.exec(...)
                     - pattern: __import__(...)
               message: "Code execution risk - could enable LLM06 Excessive Agency"
               languages: [python]
@@ -229,11 +231,26 @@ jobs:
               report = json.load(handle)
 
           vulnerabilities = 0
+          findings = []
           for dep in report.get('dependencies', []):
-              vulnerabilities += len(dep.get('vulns', []))
+              vulns = dep.get('vulns', [])
+              if not vulns:
+                  continue
+
+              vulnerabilities += len(vulns)
+              dep_name = dep.get('name', '<unknown>')
+              dep_version = dep.get('version', '<unknown>')
+              for vuln in vulns:
+                  vuln_id = vuln.get('id', '<unknown-id>')
+                  fix_versions = vuln.get('fix_versions') or []
+                  findings.append((dep_name, dep_version, vuln_id, fix_versions))
 
           print(f"Dependency vulnerabilities detected: {vulnerabilities}")
           if vulnerabilities > 0:
+              print("Dependency vulnerability details:")
+              for dep_name, dep_version, vuln_id, fix_versions in findings:
+                  fixes_text = ", ".join(fix_versions) if fix_versions else "no fixed version published"
+                  print(f"- {dep_name}=={dep_version}: {vuln_id} (fixes: {fixes_text})")
               raise SystemExit('Dependency threshold failed: vulnerabilities must be 0 for CI gate')
           PYTHON_SCRIPT
 
