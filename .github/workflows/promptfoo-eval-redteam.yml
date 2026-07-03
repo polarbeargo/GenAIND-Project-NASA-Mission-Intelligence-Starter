@@ -60,12 +60,40 @@ jobs:
       - name: Install Python dependencies
         run: uv sync
 
+      - name: Validate key compatibility for eval provider
+        id: eval-key-check
+        shell: bash
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OPENAI_API_KEY is not set; skipping eval run."
+            exit 0
+          fi
+
+          # If a custom base URL is configured, allow non-sk keys for
+          # OpenAI-compatible providers (e.g., proxy/self-hosted gateways).
+          if [ -n "${OPENAI_BASE_URL}" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_BASE_URL detected; allowing non-sk key format."
+            exit 0
+          fi
+
+          if [[ "${OPENAI_API_KEY}" =~ ^sk- ]]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::OPENAI_API_KEY does not look OpenAI-compatible (expected sk- prefix when OPENAI_BASE_URL is empty); skipping eval run."
+
       - name: Start API server
+        if: steps.eval-key-check.outputs.eligible == 'true'
         run: |
           uv run uvicorn api_server:app --host 127.0.0.1 --port 8001 > api.log 2>&1 &
           echo $! > api.pid
 
       - name: Wait for API health
+        if: steps.eval-key-check.outputs.eligible == 'true'
         run: |
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8001/health > /dev/null; then
@@ -79,13 +107,20 @@ jobs:
           exit 1
 
       - name: Run Promptfoo eval
+        if: steps.eval-key-check.outputs.eligible == 'true'
         run: |
           npx promptfoo@latest eval \
             -c promptfoo/blueTeam.yaml \
             -o promptfoo-eval-results.json \
             -o promptfoo-eval-report.html
 
+      - name: Skip eval due incompatible key/provider config
+        if: steps.eval-key-check.outputs.eligible != 'true'
+        run: |
+          echo "Promptfoo eval skipped because OPENAI_API_KEY format is not compatible with default OpenAI endpoint and OPENAI_BASE_URL is empty."
+
       - name: Enforce eval quality gate
+        if: steps.eval-key-check.outputs.eligible == 'true'
         run: |
           SUCCESS=$(jq '.results.stats.successes // 0' promptfoo-eval-results.json)
           FAILURES=$(jq '.results.stats.failures // 0' promptfoo-eval-results.json)
@@ -165,12 +200,40 @@ jobs:
       - name: Install Python dependencies
         run: uv sync
 
+      - name: Validate OpenAI key compatibility for red-team generation
+        id: redteam-key-check
+        shell: bash
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OPENAI_API_KEY is not set; skipping red-team run."
+            exit 0
+          fi
+
+          # Allow non-sk keys when a custom OpenAI-compatible base URL is configured.
+          if [ -n "${OPENAI_BASE_URL}" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_BASE_URL detected; allowing non-sk key format."
+            exit 0
+          fi
+
+          # For default OpenAI endpoint, require OpenAI-style key format.
+          if [[ "${OPENAI_API_KEY}" =~ ^sk- ]]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::OPENAI_API_KEY does not look OpenAI-compatible (expected prefix sk-); skipping red-team run."
+
       - name: Start API server
+        if: steps.redteam-key-check.outputs.eligible == 'true'
         run: |
           uv run uvicorn api_server:app --host 127.0.0.1 --port 8001 > api.log 2>&1 &
           echo $! > api.pid
 
       - name: Wait for API health
+        if: steps.redteam-key-check.outputs.eligible == 'true'
         run: |
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8001/health > /dev/null; then
@@ -184,6 +247,7 @@ jobs:
           exit 1
 
       - name: Run Promptfoo red team
+        if: steps.redteam-key-check.outputs.eligible == 'true'
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             REDTEAM_CONFIG="promptfoo/redteam.yaml"
@@ -200,7 +264,13 @@ jobs:
             -o promptfoo-redteam-results.json \
             -o promptfoo-redteam-report.html
 
+      - name: Skip red-team due incompatible key
+        if: steps.redteam-key-check.outputs.eligible != 'true'
+        run: |
+          echo "Red-team execution skipped because OPENAI_API_KEY is missing or non-OpenAI format for this workflow."
+
       - name: Enforce red-team security gate
+        if: steps.redteam-key-check.outputs.eligible == 'true'
         run: |
           # Generic severity extraction that works across most JSON result shapes.
           CRITICAL=$(jq '[.. | objects | .severity? | strings | ascii_downcase | select(. == "critical")] | length' promptfoo-redteam-results.json)
