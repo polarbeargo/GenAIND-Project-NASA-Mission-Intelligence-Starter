@@ -1435,7 +1435,8 @@ See [doc/data-requirements.md](doc/data-requirements.md) for the expected direct
 - Norvig, P. (n.d.). *Inference in Text Understanding*. Computer Science Dept., Evans Hall, University of California, Berkeley, Berkeley, CA 94720. Academia.edu. Retrieved May 30, 2026, from https://www.academia.edu/121229122/Inference_in_text_understanding?email_work_card=view-paper
 - Norvig, P. (n.d.). *Remote Agent Experiment*. Computer Science Dept., Evans Hall, University of California, Berkeley, Berkeley, CA 94720. Academia.edu. Retrieved May 30, 2026, from https://www.academia.edu/120976021/Remote_Agent_Experiment?email_work_card=view-paper
 - Russell, S., and Norvig, P. (2020). Artificial Intelligence: A Modern Approach (4th US ed., p. 712). Pearson. Retrieved May 30, 2026, from https://aima.cs.berkeley.edu/
-- [Udacity Generative AI Nanodegree](https://www.udacity.com/course/generative-ai--nd608)
-- [Udacity Cloud Native Application Architecture Nanodegree](https://www.udacity.com/blog/kick-off-your-cloud-native-application-architecture-career-with-the-launch-of-our-latest-nanodegree-program/)
+- [Udacity Generative AI Nanodegree Program](https://www.udacity.com/course/generative-ai--nd608)
+- [Udacity Security Engineer Nanodegree Program](https://www.udacity.com/course/security-engineer-nanodegree--nd698)
+- [Udacity Cloud Native Application Architecture Nanodegree Program](https://www.udacity.com/blog/kick-off-your-cloud-native-application-architecture-career-with-the-launch-of-our-latest-nanodegree-program/)
 - [Coursera Introduction to Machine Learning in Production](https://www.coursera.org/learn/introduction-to-machine-learning-in-production)
 - [MLOps Guide by Huyen Chip](https://huyenchip.com/mlops/)
