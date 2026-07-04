@@ -112,14 +112,25 @@ jobs:
               languages: [python]
               severity: CRITICAL
             
-            - id: code-execution-risk
+            - id: code-execution-risk-eval
               patterns:
-                - pattern-either:
-                    - pattern: eval(...)
-                      pattern-not: $OBJ.eval(...)
-                    - pattern: exec(...)
-                      pattern-not: $OBJ.exec(...)
-                    - pattern: __import__(...)
+                - pattern: eval(...)
+                - pattern-not: $OBJ.eval(...)
+              message: "Code execution risk - could enable LLM06 Excessive Agency"
+              languages: [python]
+              severity: CRITICAL
+
+            - id: code-execution-risk-exec
+              patterns:
+                - pattern: exec(...)
+                - pattern-not: $OBJ.exec(...)
+              message: "Code execution risk - could enable LLM06 Excessive Agency"
+              languages: [python]
+              severity: CRITICAL
+
+            - id: code-execution-risk-import
+              patterns:
+                - pattern: __import__(...)
               message: "Code execution risk - could enable LLM06 Excessive Agency"
               languages: [python]
               severity: CRITICAL
