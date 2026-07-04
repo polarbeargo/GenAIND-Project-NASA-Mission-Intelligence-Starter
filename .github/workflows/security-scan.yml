@@ -218,6 +218,7 @@ jobs:
             "CVE-2026-45829"  # chromadb
             "CVE-2026-6587"   # ragas
             "CVE-2025-69872"  # diskcache (transitive)
+            "PYSEC-2026-597"  # nltk (remove when upstream publishes a fixed nltk release)
           )
           IGNORE_ARGS=()
           for vuln in "${KNOWN_UNFIXED_VULNS[@]}"; do
