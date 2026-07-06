@@ -74,7 +74,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "nasa_security_active_threats",
+          "expr": "sum(nasa_security_active_threats)",
           "legendFormat": "",
           "range": true,
           "refId": "A"
@@ -139,7 +139,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "nasa_security_rate_limit_events_last_hour",
+          "expr": "sum(nasa_security_rate_limit_events_last_hour)",
           "legendFormat": "",
           "range": true,
           "refId": "A"
@@ -200,7 +200,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "nasa_security_critical_events_last_hour",
+          "expr": "sum(nasa_security_critical_events_last_hour)",
           "legendFormat": "",
           "range": true,
           "refId": "A"
