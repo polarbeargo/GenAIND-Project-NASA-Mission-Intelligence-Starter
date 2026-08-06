@@ -143,6 +143,10 @@ minikube -p minikube start
 eval "$(minikube docker-env)"
 docker build -t nasa-mission-intelligence-api:latest .
 
+# or
+
+minikube -p minikube image build -t nasa-mission-intelligence-api:latest .
+
 # Full production parity with Postgres-backed monitoring analytics
 ROLLOUT_TIMEOUT_SECONDS=600 \
 DASHBOARD_BINDING_REQUIRED=true \

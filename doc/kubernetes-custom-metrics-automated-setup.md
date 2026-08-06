@@ -59,13 +59,19 @@ ENABLE_SECURITY_GRAFANA_PROVISIONING=false ./scripts/setup-k8s-custom-metrics.sh
 Default manifests keep tracing disabled (`OTEL_SDK_DISABLED=true`) to minimize baseline overhead.
 Enable tracing only when you intentionally deploy a collector endpoint.
 
-1. Create/update tracing secret with at least one endpoint key:
+1. Create/update the tracing secret. For a remote or in-cluster collector, use your real endpoint. For local Phoenix on macOS with Minikube, use `host.docker.internal` so the API pod can reach the host:
 
 ```bash
 kubectl create secret generic nasa-tracing \
   --from-literal=PHOENIX_ENDPOINT="https://<phoenix-host>/v1/traces" \
   --from-literal=OTEL_EXPORTER_OTLP_ENDPOINT="" \
   --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Example for local Phoenix on macOS with Minikube:
+
+```bash
+kubectl create secret generic nasa-tracing -n default --from-literal=PHOENIX_ENDPOINT='http://host.docker.internal:6006/v1/traces' --from-literal=OTEL_EXPORTER_OTLP_ENDPOINT='' --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 1. Run setup with tracing profile enabled:
