@@ -24,10 +24,19 @@ ENABLE_WORKER_RELIABILITY_ALERTS="${ENABLE_WORKER_RELIABILITY_ALERTS:-true}"
 ENABLE_SECURITY_GRAFANA_PROVISIONING="${ENABLE_SECURITY_GRAFANA_PROVISIONING:-true}"
 GRAFANA_SECURITY_PROVISION_SCRIPT_PATH="${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH:-${ROOT_DIR}/scripts/provision-grafana-security-assets.sh}"
 ENABLE_GRAFANA_INFINITY_SETUP="${ENABLE_GRAFANA_INFINITY_SETUP:-true}"
+ENABLE_GRAFANA_WORKER_SLI_IMPORTS="${ENABLE_GRAFANA_WORKER_SLI_IMPORTS:-true}"
+ENABLE_GRAFANA_AUTO_STAR_DASHBOARDS="${ENABLE_GRAFANA_AUTO_STAR_DASHBOARDS:-true}"
 GRAFANA_DEPLOYMENT_NAME="${GRAFANA_DEPLOYMENT_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
 GRAFANA_SERVICE_NAME="${GRAFANA_SERVICE_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
 GRAFANA_SECRET_NAME="${GRAFANA_SECRET_NAME:-${KUBE_PROM_STACK_RELEASE}-grafana}"
 GRAFANA_PORT_FORWARD_LOCAL_PORT="${GRAFANA_PORT_FORWARD_LOCAL_PORT:-33300}"
+GRAFANA_IMPORT_PORT_FORWARD_LOCAL_PORT="${GRAFANA_IMPORT_PORT_FORWARD_LOCAL_PORT:-33400}"
+API_IMPORT_PORT_FORWARD_LOCAL_PORT="${API_IMPORT_PORT_FORWARD_LOCAL_PORT:-18000}"
+API_SERVICE_NAME="${API_SERVICE_NAME:-nasa-mission-intelligence-api}"
+WORKER_POOL_DASHBOARD_IMPORT_SCRIPT_PATH="${WORKER_POOL_DASHBOARD_IMPORT_SCRIPT_PATH:-${ROOT_DIR}/scripts/import-grafana-worker-pool-dashboard.sh}"
+STAGE_LATENCY_DASHBOARD_IMPORT_SCRIPT_PATH="${STAGE_LATENCY_DASHBOARD_IMPORT_SCRIPT_PATH:-${ROOT_DIR}/scripts/import-grafana-stage-latency-dashboard.sh}"
+WORKER_POOL_DASHBOARD_UID="${WORKER_POOL_DASHBOARD_UID:-nasa-worker-pool-scaling}"
+STAGE_LATENCY_DASHBOARD_UID="${STAGE_LATENCY_DASHBOARD_UID:-nasa-stage-latency-sli}"
 
 SMOKE_SCRIPT_PATH="${ROOT_DIR}/scripts/smoke-k8s-custom-metrics.sh"
 
@@ -186,10 +195,111 @@ ensure_infinity_plugin_and_datasource() {
   log "Infinity datasource provisioning: ${created_message}"
 }
 
+run_grafana_worker_sli_imports() {
+  local grafana_svc="${GRAFANA_SERVICE_NAME}"
+  local grafana_secret="${GRAFANA_SECRET_NAME}"
+  local grafana_local_port="${GRAFANA_IMPORT_PORT_FORWARD_LOCAL_PORT}"
+  local api_local_port="${API_IMPORT_PORT_FORWARD_LOCAL_PORT}"
+  local api_base_url="http://${API_SERVICE_NAME}.${APP_NAMESPACE}.svc.cluster.local:8000"
+  local verify_api_base_url="http://127.0.0.1:${api_local_port}"
+
+  if ! kubectl get service "${grafana_svc}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
+    die "Grafana service ${MONITORING_NAMESPACE}/${grafana_svc} not found; cannot import worker/SLI dashboards"
+  fi
+  if ! kubectl get service "${API_SERVICE_NAME}" -n "${APP_NAMESPACE}" >/dev/null 2>&1; then
+    die "API service ${APP_NAMESPACE}/${API_SERVICE_NAME} not found; cannot import worker/SLI dashboards"
+  fi
+  if ! kubectl get secret "${grafana_secret}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
+    die "Grafana secret ${MONITORING_NAMESPACE}/${grafana_secret} not found; cannot import worker/SLI dashboards"
+  fi
+
+  local grafana_user
+  local grafana_password
+  grafana_user="$(kubectl get secret -n "${MONITORING_NAMESPACE}" "${grafana_secret}" -o jsonpath='{.data.admin-user}' | base64 --decode 2>/dev/null || true)"
+  grafana_password="$(kubectl get secret -n "${MONITORING_NAMESPACE}" "${grafana_secret}" -o jsonpath='{.data.admin-password}' | base64 --decode 2>/dev/null || true)"
+  [[ -n "${grafana_user}" && -n "${grafana_password}" ]] || die "Grafana credentials are empty in ${MONITORING_NAMESPACE}/${grafana_secret}"
+
+  local pf_grafana_pid=""
+  local pf_api_pid=""
+  local pf_grafana_log
+  local pf_api_log
+  pf_grafana_log="$(mktemp)"
+  pf_api_log="$(mktemp)"
+
+  cleanup_import_pf() {
+    trap - RETURN
+    local _pf_grafana_pid="${pf_grafana_pid:-}"
+    local _pf_api_pid="${pf_api_pid:-}"
+    local _pf_grafana_log="${pf_grafana_log:-}"
+    local _pf_api_log="${pf_api_log:-}"
+
+    if [[ -n "${_pf_grafana_pid}" ]]; then
+      kill "${_pf_grafana_pid}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${_pf_api_pid}" ]]; then
+      kill "${_pf_api_pid}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${_pf_grafana_log}" ]]; then
+      rm -f "${_pf_grafana_log}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${_pf_api_log}" ]]; then
+      rm -f "${_pf_api_log}" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup_import_pf RETURN
+
+  kubectl -n "${MONITORING_NAMESPACE}" port-forward svc/"${grafana_svc}" "${grafana_local_port}:80" >"${pf_grafana_log}" 2>&1 &
+  pf_grafana_pid="$!"
+  kubectl -n "${APP_NAMESPACE}" port-forward svc/"${API_SERVICE_NAME}" "${api_local_port}:8000" >"${pf_api_log}" 2>&1 &
+  pf_api_pid="$!"
+
+  local grafana_ready="false"
+  local api_ready="false"
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if [[ "${grafana_ready}" != "true" ]] && curl -fsS -u "${grafana_user}:${grafana_password}" "http://127.0.0.1:${grafana_local_port}/api/health" >/dev/null 2>&1; then
+      grafana_ready="true"
+    fi
+    if [[ "${api_ready}" != "true" ]] && curl -fsS "${verify_api_base_url}/monitoring/worker-pools/series" >/dev/null 2>&1; then
+      api_ready="true"
+    fi
+    if [[ "${grafana_ready}" == "true" && "${api_ready}" == "true" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  [[ "${grafana_ready}" == "true" ]] || die "Grafana port-forward did not become ready on localhost:${grafana_local_port}"
+  [[ "${api_ready}" == "true" ]] || die "API port-forward did not become ready on localhost:${api_local_port}"
+
+  log "Importing worker pool dashboard"
+  GRAFANA_URL="http://127.0.0.1:${grafana_local_port}" \
+  API_BASE_URL="${api_base_url}" \
+  VERIFY_API_BASE_URL="${verify_api_base_url}" \
+  "${WORKER_POOL_DASHBOARD_IMPORT_SCRIPT_PATH}"
+
+  log "Importing stage latency SLI dashboard"
+  GRAFANA_URL="http://127.0.0.1:${grafana_local_port}" \
+  API_BASE_URL="${api_base_url}" \
+  VERIFY_API_BASE_URL="${verify_api_base_url}" \
+  "${STAGE_LATENCY_DASHBOARD_IMPORT_SCRIPT_PATH}"
+
+  if [[ "${ENABLE_GRAFANA_AUTO_STAR_DASHBOARDS}" == "true" ]]; then
+    log "Starring worker pool and stage latency SLI dashboards in Grafana"
+    curl -fsS -u "${grafana_user}:${grafana_password}" -X POST "http://127.0.0.1:${grafana_local_port}/api/user/stars/dashboard/uid/${WORKER_POOL_DASHBOARD_UID}" >/dev/null || \
+      log "Warn: failed to star dashboard uid=${WORKER_POOL_DASHBOARD_UID}"
+    curl -fsS -u "${grafana_user}:${grafana_password}" -X POST "http://127.0.0.1:${grafana_local_port}/api/user/stars/dashboard/uid/${STAGE_LATENCY_DASHBOARD_UID}" >/dev/null || \
+      log "Warn: failed to star dashboard uid=${STAGE_LATENCY_DASHBOARD_UID}"
+  else
+    log "Skipping auto-star of dashboards (ENABLE_GRAFANA_AUTO_STAR_DASHBOARDS=${ENABLE_GRAFANA_AUTO_STAR_DASHBOARDS})"
+  fi
+}
+
 main() {
   require_cmd kubectl
   require_cmd helm
   require_cmd jq
+  require_cmd curl
 
   ensure_file "${SERVICEMONITOR_PATH}"
   ensure_file "${SECURITY_SERVICEMONITOR_PATH}"
@@ -197,6 +307,10 @@ main() {
   ensure_file "${HPA_PATH}"
   ensure_file "${API_MANIFEST_PATH}"
   ensure_file "${SMOKE_SCRIPT_PATH}"
+  if [[ "${ENABLE_GRAFANA_WORKER_SLI_IMPORTS}" == "true" ]]; then
+    ensure_file "${WORKER_POOL_DASHBOARD_IMPORT_SCRIPT_PATH}"
+    ensure_file "${STAGE_LATENCY_DASHBOARD_IMPORT_SCRIPT_PATH}"
+  fi
   if [[ "${ENABLE_SECURITY_GRAFANA_PROVISIONING}" == "true" ]]; then
     ensure_file "${GRAFANA_SECURITY_PROVISION_SCRIPT_PATH}"
   fi
@@ -240,6 +354,12 @@ main() {
     kubectl patch deployment "${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" \
       --type strategic --patch-file "${TRACING_PATCH_PATH}" >/dev/null
     wait_for_rollout
+  fi
+
+  if [[ "${ENABLE_GRAFANA_WORKER_SLI_IMPORTS}" == "true" ]]; then
+    run_grafana_worker_sli_imports
+  else
+    log "Skipping worker/SLI dashboard imports (ENABLE_GRAFANA_WORKER_SLI_IMPORTS=${ENABLE_GRAFANA_WORKER_SLI_IMPORTS})"
   fi
 
   log "Applying ServiceMonitor"

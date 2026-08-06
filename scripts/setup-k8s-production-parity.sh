@@ -228,6 +228,15 @@ main() {
   log "Applying PVC-backed API manifest for full RAG parity: ${API_MANIFEST_PATH}"
   kubectl apply -f "${API_MANIFEST_PATH}" >/dev/null
 
+  # Seed Chroma before waiting on API rollout: API init containers block on
+  # collection existence, so this ordering avoids a first-run deadlock.
+  log "Recreating Chroma seed job for idempotent collection bootstrap"
+  kubectl delete job nasa-chroma-seed -n "${APP_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl apply -f "${CHROMA_SEED_JOB_PATH}" >/dev/null
+
+  log "Waiting for Chroma seed job completion"
+  kubectl wait --for=condition=complete job/nasa-chroma-seed -n "${APP_NAMESPACE}" --timeout=600s >/dev/null
+
   log "Waiting for API to become ready before wiring monitoring configuration"
   kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
 
@@ -245,13 +254,6 @@ main() {
     kubectl rollout status deployment/"${DEPLOYMENT_NAME}" -n "${APP_NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT_SECONDS}s" >/dev/null
   fi
 
-  log "Recreating Chroma seed job for idempotent collection bootstrap"
-  kubectl delete job nasa-chroma-seed -n "${APP_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl apply -f "${CHROMA_SEED_JOB_PATH}" >/dev/null
-
-  log "Waiting for Chroma seed job completion"
-  kubectl wait --for=condition=complete job/nasa-chroma-seed -n "${APP_NAMESPACE}" --timeout=600s >/dev/null
-
   log "Running metrics/API automated setup and smoke checks"
   API_MANIFEST_PATH="${API_MANIFEST_PATH}" \
   APP_NAMESPACE="${APP_NAMESPACE}" \
@@ -265,6 +267,10 @@ main() {
   ENABLE_TRACING_VERIFICATION="${ENABLE_TRACING_VERIFICATION}" \
   TRACING_VERIFY_SCRIPT_PATH="${TRACING_VERIFY_SCRIPT_PATH}" \
   "${SETUP_METRICS_SCRIPT_PATH}"
+
+  log "Reapplying Prometheus ServiceMonitor for Evidently metrics after monitoring stack install"
+  kubectl apply -f "${SERVICEMONITOR_EVIDENTLY_PATH}" >/dev/null || \
+    log "Warn: ServiceMonitor deployment still failed after monitoring stack install"
 
   if [[ "${ENABLE_EVALUATION_WORKER}" == "true" || "${ENABLE_JUDGE_WORKER}" == "true" ]]; then
     log "Enabling Redis-backed broker configuration on API deployment"
