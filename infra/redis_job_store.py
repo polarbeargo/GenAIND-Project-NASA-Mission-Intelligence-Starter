@@ -104,6 +104,36 @@ class RedisAsyncJobStore:
             logger.warning("Failed to release processing lock for job %s: %s", job_id, error)
             return False
 
+    def renew_processing(
+        self,
+        job_id: str,
+        token: str,
+        processing_ttl_seconds: int = 300,
+    ) -> bool:
+        """Extend the in-flight lock TTL iff this token still owns it (heartbeat).
+
+        Compare-and-expire is atomic so a worker can only renew a lock it still holds;
+        if the lock already expired and another worker re-acquired it, the token no
+        longer matches and this is a no-op (returns False), preventing lock stomping.
+        """
+        if not self.redis.is_available() or not token:
+            return False
+
+        try:
+            ttl = max(30, int(processing_ttl_seconds))
+            script = """
+            local current = redis.call('GET', KEYS[1])
+            if current == ARGV[1] then
+                return redis.call('EXPIRE', KEYS[1], ARGV[2])
+            end
+            return 0
+            """
+            result = self.redis.eval(script, 1, self._processing_key(job_id), token, str(ttl))
+            return int(result or 0) > 0
+        except Exception as error:
+            logger.debug("Failed to renew processing lock for job %s: %s", job_id, error)
+            return False
+
     def is_completed(self, job_id: str) -> bool:
         """Check terminal completion marker to deduplicate retried deliveries."""
         if not self.redis.is_available():

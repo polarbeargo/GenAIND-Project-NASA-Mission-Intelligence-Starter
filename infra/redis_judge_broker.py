@@ -5,12 +5,32 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Tuple
 
 from infra.async_reliability_metrics import get_async_reliability_metrics
 from infra.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
+
+# Atomically move due members from the delayed ZSET into the live stream. ZREM gates
+# promotion so only one worker can ever promote a given member (no double-delivery),
+# and members are removed on promotion so the ZSET cannot leak unbounded.
+_PROMOTE_DUE_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+local promoted = 0
+for i = 1, #due do
+    local member = due[i]
+    if redis.call('ZREM', KEYS[1], member) == 1 then
+        local ok, decoded = pcall(cjson.decode, member)
+        if ok and decoded['job_id'] ~= nil and decoded['payload'] ~= nil then
+            redis.call('XADD', KEYS[2], 'job_id', decoded['job_id'], 'payload', decoded['payload'])
+            promoted = promoted + 1
+        end
+    end
+end
+return promoted
+"""
 
 
 class RedisJudgeBroker:
@@ -28,6 +48,7 @@ class RedisJudgeBroker:
         self.stream_name = stream_name
         self.consumer_group = consumer_group
         self.dead_letter_stream = dead_letter_stream or f"{stream_name}:dlq"
+        self.delayed_set = f"{stream_name}:delayed"
         self.enabled = bool(enabled)
         self._group_initialized = False
         self._worker_label = "judge"
@@ -165,6 +186,58 @@ class RedisJudgeBroker:
         except Exception as error:
             logger.warning("Failed to dead-letter judge message %s: %s", message_id, error)
             return False
+
+    def schedule_retry(
+        self,
+        job_id: str,
+        payload: Dict[str, Any],
+        delay_seconds: float,
+    ) -> bool:
+        """Defer a retry without blocking the consumer loop.
+
+        The message is parked in a delayed ZSET keyed by a ready-at timestamp instead of
+        sleeping inline, so backoff no longer stalls throughput or graceful drain. A
+        unique nonce guarantees each retry is a distinct member (ZADD never dedupes two
+        legitimate retries), and ``promote_due`` moves it back to the stream once due.
+        """
+        if not self._ensure_group():
+            return False
+        try:
+            ready_at_ms = round((time.time() + max(0.0, float(delay_seconds))) * 1000)
+            member = json.dumps(
+                {
+                    "job_id": job_id,
+                    "payload": json.dumps(payload),
+                    "nonce": uuid.uuid4().hex,
+                }
+            )
+            self.redis._client.zadd(self.delayed_set, {member: ready_at_ms})
+            return True
+        except Exception as error:
+            logger.warning("Failed to schedule judge retry %s: %s", job_id, error)
+            return False
+
+    def promote_due(self, max_count: int = 50) -> int:
+        """Move due delayed retries back onto the live stream (non-blocking)."""
+        if not self._ensure_group():
+            return 0
+        try:
+            now_ms = round(time.time() * 1000)
+            promoted = self.redis.eval(
+                _PROMOTE_DUE_LUA,
+                2,
+                self.delayed_set,
+                self.stream_name,
+                str(now_ms),
+                str(max(1, int(max_count))),
+            )
+            count = int(promoted or 0)
+            if count > 0:
+                logger.info("Promoted %d due judge retries back to stream", count)
+            return count
+        except Exception as error:
+            logger.debug("Failed to promote due judge retries: %s", error)
+            return 0
 
     def ack(self, message_id: str) -> bool:
         """Acknowledge one stream message as processed."""

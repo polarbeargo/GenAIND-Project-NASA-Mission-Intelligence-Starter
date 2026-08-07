@@ -61,6 +61,12 @@ class AsyncReliabilityMetrics:
     def record_lock_acquire_fail(self, worker: str, reason: str = "contended") -> None:
         self._incr("nasa_async_worker_lock_acquire_fail_total", {"worker": worker, "reason": reason})
 
+    def record_lock_renew_fail(self, worker: str, reason: str = "lost") -> None:
+        self._incr("nasa_async_worker_lock_renew_fail_total", {"worker": worker, "reason": reason})
+
+    def record_retry_scheduled(self, worker: str, reason: str = "processing_error") -> None:
+        self._incr("nasa_async_worker_retry_scheduled_total", {"worker": worker, "reason": reason})
+
     def snapshot(self) -> Dict[str, List[Tuple[Dict[str, str], float]]]:
         if not self.redis.is_available():
             return {}

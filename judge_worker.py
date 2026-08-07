@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import socket
+import threading
 import time
 from typing import Any, Dict
 
@@ -102,6 +103,57 @@ def _backoff_seconds(base: float, max_backoff: float, attempt: int) -> float:
     return min(max_backoff, base * (2 ** safe_attempt))
 
 
+class _ProcessingHeartbeat:
+    """Renew the processing lock in the background while a long judge call runs.
+
+    Long LLM-as-judge calls can outlive the lock TTL, letting another worker re-claim
+    the same job. A daemon thread renews the lock at a ``ttl/3`` cadence so a single
+    missed beat cannot expire it. ``Event.wait`` provides an interruptible sleep, so
+    ``stop`` returns immediately and the thread is always joined — no thread or memory
+    leak. If a renew fails (lock already lost/re-acquired elsewhere) the thread exits
+    rather than stomping the new owner.
+    """
+
+    def __init__(
+        self,
+        *,
+        job_store: RedisAsyncJobStore,
+        job_id: str,
+        token: str,
+        ttl_seconds: int,
+        worker_label: str = "judge",
+    ) -> None:
+        self._job_store = job_store
+        self._job_id = job_id
+        self._token = token
+        self._ttl = max(30, int(ttl_seconds))
+        self._worker_label = worker_label
+        self._interval = max(5.0, self._ttl / 3.0)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"lock-hb-{job_id[:8]}",
+            daemon=True,
+        )
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            renewed = self._job_store.renew_processing(self._job_id, self._token, self._ttl)
+            if not renewed:
+                get_async_reliability_metrics().record_lock_renew_fail(
+                    worker=self._worker_label,
+                    reason="lost",
+                )
+                return
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._interval + 1.0)
+
+
 def run() -> int:
     signal.signal(signal.SIGINT, _stop_worker)
     signal.signal(signal.SIGTERM, _stop_worker)
@@ -143,12 +195,18 @@ def run() -> int:
     reclaim_enabled = os.getenv("JUDGE_WORKER_RECLAIM_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     reclaim_min_idle_ms = max(30_000, int(os.getenv("JUDGE_WORKER_RECLAIM_MIN_IDLE_MS", "300000")))
     reclaim_count = max(1, int(os.getenv("JUDGE_WORKER_RECLAIM_COUNT", "10")))
+    retry_promote_count = max(1, int(os.getenv("JUDGE_WORKER_RETRY_PROMOTE_COUNT", "50")))
     reclaim_idle_cycles: int = 0
 
     consumer_name = _consumer_name()
     logger.info("Judge worker started as consumer=%s", consumer_name)
 
     while not _drain_requested():
+        # Promote any due deferred retries before claiming new work. This is the
+        # non-blocking replacement for inline backoff sleeps: retries are parked in a
+        # delayed set and re-injected here once their backoff window elapses.
+        broker.promote_due(max_count=retry_promote_count)
+
         messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=3000)
         if not messages:
             if reclaim_enabled:
@@ -206,6 +264,14 @@ def run() -> int:
                 broker.ack(message_id)
                 continue
 
+            heartbeat = _ProcessingHeartbeat(
+                job_store=job_store,
+                job_id=job_id,
+                token=processing_token,
+                ttl_seconds=processing_ttl,
+                worker_label="judge",
+            )
+            heartbeat.start()
             started = time.perf_counter()
             try:
                 workflow_input = _coerce_workflow_input(payload)
@@ -294,18 +360,20 @@ def run() -> int:
                         },
                     )
 
-                    if backoff > 0.0:
-                        time.sleep(backoff)
-
-                    if broker.enqueue(job_id, retry_payload):
+                    if broker.schedule_retry(job_id, retry_payload, backoff):
                         get_async_reliability_metrics().record_retry(worker="judge", reason="processing_error")
+                        get_async_reliability_metrics().record_retry_scheduled(
+                            worker="judge",
+                            reason="processing_error",
+                        )
                         broker.ack(message_id)
                         job_store.release_processing(job_id, processing_token)
                         logger.warning(
-                            "Judge job retry scheduled job_id=%s attempt=%s/%s",
+                            "Judge job retry scheduled job_id=%s attempt=%s/%s in %.3fs",
                             job_id,
                             next_attempt,
                             max_retries,
+                            backoff,
                         )
                     else:
                         terminal = {
@@ -366,6 +434,10 @@ def run() -> int:
                     )
                     broker.ack(message_id)
                     logger.warning("Judge job dead-lettered job_id=%s: %s", job_id, str(error)[:120])
+            finally:
+                # Always stop the lock heartbeat so the renewer thread is joined and
+                # never leaks, regardless of success, retry, or dead-letter path.
+                heartbeat.stop()
 
     if _RUNNING and _DRAIN_MARKER_PATH and os.path.exists(_DRAIN_MARKER_PATH):
         logger.info(
