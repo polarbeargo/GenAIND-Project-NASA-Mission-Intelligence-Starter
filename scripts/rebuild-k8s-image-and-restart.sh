@@ -47,16 +47,12 @@ restart_and_wait() {
 main() {
   require_cmd kubectl
   require_cmd minikube
-  require_cmd docker
 
   log "Kubernetes context: $(kubectl config current-context)"
 
   if [[ "${SKIP_BUILD}" != "true" ]]; then
-    log "Configuring docker client to minikube profile: ${MINIKUBE_PROFILE}"
-    eval "$(minikube -p "${MINIKUBE_PROFILE}" docker-env)"
-
-    log "Building image ${IMAGE_NAME} from ${ROOT_DIR}"
-    docker build -t "${IMAGE_NAME}" "${ROOT_DIR}"
+    log "Building image ${IMAGE_NAME} with minikube profile: ${MINIKUBE_PROFILE}"
+    (cd "${ROOT_DIR}" && minikube -p "${MINIKUBE_PROFILE}" image build -t "${IMAGE_NAME}" .)
   else
     log "SKIP_BUILD=true, skipping docker build"
   fi
