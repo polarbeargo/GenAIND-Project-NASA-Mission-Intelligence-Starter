@@ -47,11 +47,16 @@ logging.basicConfig(
 
 _RUNNING = True
 _DRAIN_MARKER_PATH = os.getenv("WORKER_DRAIN_MARKER_PATH", "/tmp/worker-drain").strip()
+# Set by the signal handler so an in-progress outage backoff wait wakes immediately on
+# SIGTERM/SIGINT instead of sleeping out its interval. Waiting on this Event (rather than
+# time.sleep) keeps graceful-drain latency near zero during a Redis outage.
+_DRAIN_EVENT = threading.Event()
 
 
 def _stop_worker(*_args) -> None:
     global _RUNNING
     _RUNNING = False
+    _DRAIN_EVENT.set()
 
 
 def _drain_requested() -> bool:
@@ -201,6 +206,15 @@ def run() -> int:
     retry_promote_count = max(1, int(os.getenv("JUDGE_WORKER_RETRY_PROMOTE_COUNT", "50")))
     reclaim_idle_cycles: int = 0
 
+    # Redis-outage backoff bounds. During a mid-run outage `consume` returns empty
+    # immediately (its error path), so without a wait the loop would busy-spin the CPU
+    # and hammer reconnects. Backoff grows exponentially from base to max and is reset
+    # the moment healthy work resumes.
+    consume_block_ms = 3000
+    outage_backoff_base = max(0.1, float(os.getenv("JUDGE_WORKER_OUTAGE_BACKOFF_BASE_SECONDS", "0.5")))
+    outage_backoff_max = max(outage_backoff_base, float(os.getenv("JUDGE_WORKER_OUTAGE_BACKOFF_MAX_SECONDS", "5.0")))
+    outage_backoff = outage_backoff_base
+
     consumer_name = _consumer_name()
     logger.info("Judge worker started as consumer=%s", consumer_name)
 
@@ -210,7 +224,8 @@ def run() -> int:
         # delayed set and re-injected here once their backoff window elapses.
         broker.promote_due(max_count=retry_promote_count)
 
-        messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=3000)
+        poll_started = time.monotonic()
+        messages = broker.consume(consumer_name=consumer_name, count=1, block_ms=consume_block_ms)
         if not messages:
             if reclaim_enabled:
                 reclaim_idle_cycles += 1
@@ -224,7 +239,22 @@ def run() -> int:
                     for message_id, payload in stale:
                         messages.append((message_id, payload))
             if not messages:
+                # A healthy empty poll blocks ~consume_block_ms server-side; a poll that
+                # returns empty far faster means consume hit its error path (Redis down).
+                # Only in that suspected-outage case do we spend one is_available() ping
+                # to confirm, then wait with capped exponential backoff on the drain
+                # Event so SIGTERM still wakes us instantly. On the healthy-idle path we
+                # add zero overhead and keep the fast consume loop.
+                elapsed_ms = (time.monotonic() - poll_started) * 1000.0
+                if elapsed_ms < consume_block_ms * 0.5 and not broker.is_available():
+                    _DRAIN_EVENT.wait(outage_backoff)
+                    outage_backoff = min(outage_backoff_max, outage_backoff * 2)
+                else:
+                    outage_backoff = outage_backoff_base
                 continue
+
+        # Work is available -> Redis is healthy; reset the outage backoff window.
+        outage_backoff = outage_backoff_base
 
         for message_id, payload in messages:
             job_id = str(payload.get("job_id", ""))
