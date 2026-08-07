@@ -140,11 +140,6 @@ Quick start: build the local Minikube image first, then run full production pari
 ```bash
 minikube -p minikube start
 
-eval "$(minikube docker-env)"
-docker build -t nasa-mission-intelligence-api:latest .
-
-# or
-
 minikube -p minikube image build -t nasa-mission-intelligence-api:latest .
 
 # Full production parity with Postgres-backed monitoring analytics
@@ -1010,106 +1005,179 @@ Ports-and-Adapters (Partial Hexagonal)
 
 ```mermaid
 classDiagram
-        class EvaluationWorkerProcess {
-            +run() int
-            +_process_one_message(...) None
-            +_backoff_seconds(base, max_backoff, attempt) float
-            +_drain_requested() bool
-            +_consumer_name() str
-        }
+    class evaluation_worker {
+        +_drain_requested() bool
+        +_consumer_name() str
+        +_backoff_seconds(base, max_backoff, attempt) float
+        +_process_one_message(...) None
+    }
 
-        class JudgeWorkerProcess {
-            +run() int
-            +_backoff_seconds(base, max_backoff, attempt) float
-            +_drain_requested() bool
-            +_consumer_name() str
-        }
+    class judge_worker {
+        +_drain_requested() bool
+        +_consumer_name() str
+        +_backoff_seconds(base, max_backoff, attempt) float
+        +run() int
+    }
 
-        class RedisEvaluationBroker {
-            +consume(consumer_name, count, block_ms) List
-            +enqueue(job_id, payload) bool
-            +ack(message_id) bool
-            +dead_letter(message_id, payload, reason, consumer_name, attempt) bool
-            +reclaim_stale(consumer_name, min_idle_ms, count) List
-        }
+    class ProcessingHeartbeat {
+        +start() None
+        +stop() None
+    }
 
-        class RedisJudgeBroker {
-            +consume(consumer_name, count, block_ms) List
-            +enqueue(job_id, payload) bool
-            +ack(message_id) bool
-            +dead_letter(message_id, payload, reason, consumer_name, attempt) bool
-            +reclaim_stale(consumer_name, min_idle_ms, count) List
-        }
+    class RedisEvaluationBroker {
+        +is_available() bool
+        +consume(consumer_name, count, block_ms) List
+        +enqueue(job_id, payload) bool
+        +ack(message_id) bool
+        +dead_letter(message_id, payload, reason, consumer_name, attempt) bool
+        +reclaim_stale(consumer_name, min_idle_ms, count) List
+    }
 
-        class RedisAsyncJobStore {
-            +is_completed(job_id) bool
-            +acquire_processing(job_id, processing_ttl_seconds, worker_type) bool
-            +release_processing(job_id) bool
-            +set_result(job_id, result) bool
-            +get_result(job_id) Dict
-        }
+    class RedisJudgeBroker {
+        +is_available() bool
+        +consume(consumer_name, count, block_ms) List
+        +enqueue(job_id, payload) bool
+        +schedule_retry(job_id, payload, delay_seconds) bool
+        +promote_due(max_count) int
+        +ack(message_id) bool
+        +dead_letter(message_id, payload, reason, consumer_name, attempt) bool
+        +reclaim_stale(consumer_name, min_idle_ms, count) List
+    }
 
-        class AnalysisWorker {
-            +evaluate(workflow_input, answer, contexts) Dict
-        }
+    class RedisAsyncJobStore {
+        +is_completed(job_id) bool
+        +acquire_processing(job_id, processing_ttl_seconds, worker_type) str|None
+        +renew_processing(job_id, token, processing_ttl_seconds) bool
+        +release_processing(job_id, token) bool
+        +set_result(job_id, result) bool
+        +get_result(job_id) Dict|None
+    }
 
-        class JudgeWorker {
-            +judge(openai_key, workflow_input, answer, contexts) Dict
-        }
+    class AnalysisWorker {
+        +evaluate(workflow_input, answer, contexts) Dict
+    }
 
-        class AsyncReliabilityMetrics {
-            +record_retry(worker, reason) None
-            +record_dlq(worker, reason) None
-            +record_reclaim(worker, reclaimed_count, min_idle_ms) None
-            +record_lock_acquire_fail(worker, reason) None
-        }
+    class JudgeWorker {
+        +judge(openai_key, workflow_input, answer, contexts) Dict
+    }
 
-        EvaluationWorkerProcess *-- RedisEvaluationBroker
-        EvaluationWorkerProcess *-- RedisAsyncJobStore
-        EvaluationWorkerProcess *-- AnalysisWorker
+    class AsyncReliabilityMetrics {
+        +record_retry(worker, reason) None
+        +record_retry_scheduled(worker, reason) None
+        +record_dlq(worker, reason) None
+        +record_reclaim(worker, reclaimed_count, min_idle_ms) None
+        +record_lock_acquire_fail(worker, reason) None
+        +record_lock_renew_fail(worker, reason) None
+    }
 
-        JudgeWorkerProcess *-- RedisJudgeBroker
-        JudgeWorkerProcess *-- RedisAsyncJobStore
-        JudgeWorkerProcess *-- JudgeWorker
+    evaluation_worker *-- RedisEvaluationBroker
+    evaluation_worker *-- RedisAsyncJobStore
+    evaluation_worker *-- AnalysisWorker
 
-        RedisEvaluationBroker ..> AsyncReliabilityMetrics
-        RedisJudgeBroker ..> AsyncReliabilityMetrics
-        RedisAsyncJobStore ..> AsyncReliabilityMetrics
+    judge_worker *-- RedisJudgeBroker
+    judge_worker *-- RedisAsyncJobStore
+    judge_worker *-- JudgeWorker
+    judge_worker *-- ProcessingHeartbeat
 
-        EvaluationWorkerProcess ..> RedisEvaluationBroker : retry enqueue on failure
-        JudgeWorkerProcess ..> RedisJudgeBroker : retry enqueue on failure
+    RedisEvaluationBroker ..> AsyncReliabilityMetrics
+    RedisJudgeBroker ..> AsyncReliabilityMetrics
+    RedisAsyncJobStore ..> AsyncReliabilityMetrics
 
-        EvaluationWorkerProcess ..> RedisEvaluationBroker : DLQ on poison/retry exhausted
-        JudgeWorkerProcess ..> RedisJudgeBroker : DLQ on poison/retry exhausted
+    evaluation_worker ..> RedisEvaluationBroker : retry enqueue on failure
+    judge_worker ..> RedisJudgeBroker : schedule_retry on failure
+    judge_worker ..> RedisJudgeBroker : promote_due each loop
 
-        EvaluationWorkerProcess ..> RedisAsyncJobStore : idempotency lock and completed marker
-        JudgeWorkerProcess ..> RedisAsyncJobStore : idempotency lock and completed marker
+    evaluation_worker ..> RedisEvaluationBroker : DLQ on poison/retry exhausted
+    judge_worker ..> RedisJudgeBroker : DLQ on poison/retry exhausted
 
-        RedisEvaluationBroker ..> RedisEvaluationBroker : reclaim_stale (XAUTOCLAIM)
-        RedisJudgeBroker ..> RedisJudgeBroker : reclaim_stale (XAUTOCLAIM)
+    evaluation_worker ..> RedisAsyncJobStore : idempotency lock and completed marker
+    judge_worker ..> RedisAsyncJobStore : idempotency lock and completed marker
+    ProcessingHeartbeat ..> RedisAsyncJobStore : renew_processing
+
+    RedisEvaluationBroker ..> RedisEvaluationBroker : reclaim_stale (XAUTOCLAIM)
+    RedisJudgeBroker ..> RedisJudgeBroker : reclaim_stale (XAUTOCLAIM)
+    evaluation_worker ..> RedisEvaluationBroker : outage backoff on unavailable
+    judge_worker ..> RedisJudgeBroker : outage backoff on unavailable
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as RedisJudgeBroker
+    participant W as judge_worker main loop
+    participant J as RedisAsyncJobStore
+    participant H as ProcessingHeartbeat
+    participant A as JudgeWorker
+    participant D as judge DLQ stream
+
+    W->>B: promote_due(max_count)
+    W->>B: consume(consumer_name, count=1, block_ms=3000)
+    alt empty fast return and broker unavailable
+        W->>B: is_available()
+        B-->>W: false
+        W->>W: wait with capped outage backoff
+    else message available
+        W->>J: acquire_processing(job_id, ttl, worker_type="judge")
+        J-->>W: token
+        W->>H: start()
+        loop every ttl/3
+            H->>J: renew_processing(job_id, token, ttl)
+            J-->>H: true/false
+        end
+        W->>A: judge(openai_key, workflow_input, answer, contexts)
+        A-->>W: result or exception
+        alt processing error
+            W->>J: set_result(job_id, {status: "retrying", ...})
+            W->>B: schedule_retry(job_id, payload, delay)
+            alt retry queued
+                W->>B: ack(message_id)
+                W->>J: release_processing(job_id, token)
+            else retry enqueue fails
+                W->>J: set_result(job_id, {status: "dead_lettered", ...})
+                W->>B: dead_letter(message_id, reason=retry_enqueue_failed)
+                B->>D: xadd(dead letter message)
+                W->>B: ack(message_id)
+                W->>J: release_processing(job_id, token)
+            end
+        end
+        W->>H: stop()
+    end
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant B as RedisEvaluationBroker
-    participant W as EvaluationWorkerProcess
+    participant W as evaluation_worker main loop
     participant J as RedisAsyncJobStore
     participant A as AnalysisWorker
-    participant D as eval jobs DLQ stream
+    participant D as eval DLQ stream
 
-    B->>W: consume(consumer_name,count=1)
-    W->>J: acquire_processing(job_id, ttl, worker_type=evaluation)
-    J-->>W: lock acquired
-    W->>A: evaluate(workflow_input, answer, contexts)
-    A-->>W: Exception (processing error)
-    W->>J: set_result(status=retrying, attempt=n+1)
-    W->>B: enqueue(job_id, payload with _attempt=n+1)
-    B-->>W: enqueue failed
-    W->>J: set_result(status=dead_lettered, reason=retry enqueue failed)
-    W->>B: dead_letter(message_id, reason=retry_enqueue_failed)
-    B->>D: xadd(dead letter message)
-    W->>B: ack(message_id)
+    W->>B: consume(consumer_name, count=1, block_ms=3000)
+    alt empty fast return and broker unavailable
+        W->>B: is_available()
+        B-->>W: false
+        W->>W: wait with capped outage backoff
+    else message available
+        W->>J: acquire_processing(job_id, ttl, worker_type="evaluation")
+        J-->>W: token
+        W->>A: evaluate(workflow_input, answer, contexts)
+        A-->>W: result or exception
+        alt processing error
+            W->>J: set_result(job_id, {status: "retrying", ...})
+            W->>B: enqueue(job_id, payload)
+            alt enqueue succeeds
+                W->>B: ack(message_id)
+                W->>J: release_processing(job_id, token)
+            else enqueue fails
+                W->>J: set_result(job_id, {status: "dead_lettered", ...})
+                W->>B: dead_letter(message_id, reason=retry_enqueue_failed)
+                B->>D: xadd(dead letter message)
+                W->>B: ack(message_id)
+                W->>J: release_processing(job_id, token)
+            end
+        end
+    end
 ```
 
 ### Security Guards and OWASP Compliance
