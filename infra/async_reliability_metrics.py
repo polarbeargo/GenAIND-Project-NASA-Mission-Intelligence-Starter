@@ -15,6 +15,20 @@ def _sanitize(value: str) -> str:
     return str(value).replace("|", "_").replace("=", "_")
 
 
+def safe_emit(operation: str, emit) -> None:
+    """Emit a reliability metric without letting a backend error escape.
+
+    Metrics are best-effort observability signal. A transient Redis failure while
+    recording a counter must never crash a per-message handler, consumer loop, or
+    heartbeat thread. Failures are swallowed and logged at debug level so callers stay
+    fully fail-soft.
+    """
+    try:
+        emit()
+    except Exception as error:  # noqa: BLE001 - metrics emission must be fail-soft
+        logger.debug("Reliability metric emit failed (%s): %s", operation, error)
+
+
 class AsyncReliabilityMetrics:
     """Atomic reliability metrics using Redis hash operations.
 

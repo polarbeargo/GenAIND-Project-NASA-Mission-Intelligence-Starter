@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 
 from evidently_monitor import EvidentlyMonitor
 from env_utils import load_project_env
-from infra.async_reliability_metrics import get_async_reliability_metrics
+from infra.async_reliability_metrics import get_async_reliability_metrics, safe_emit
 from infra.redis_client import get_redis_client
 from infra.redis_evaluation_broker import RedisEvaluationBroker
 from infra.redis_job_store import RedisAsyncJobStore
@@ -249,7 +249,13 @@ def _process_one_message(
                 time.sleep(backoff)
 
             if broker.enqueue(job_id, retry_payload):
-                get_async_reliability_metrics().record_retry(worker="evaluation", reason="processing_error")
+                safe_emit(
+                    "record_retry",
+                    lambda: get_async_reliability_metrics().record_retry(
+                        worker="evaluation",
+                        reason="processing_error",
+                    ),
+                )
                 broker.ack(message_id)
                 job_store.release_processing(job_id, processing_token)
                 logger.warning(

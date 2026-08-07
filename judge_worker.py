@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict
 
 from env_utils import load_project_env
-from infra.async_reliability_metrics import get_async_reliability_metrics
+from infra.async_reliability_metrics import get_async_reliability_metrics, safe_emit
 from infra.redis_client import get_redis_client
 from infra.redis_judge_broker import RedisJudgeBroker
 from infra.redis_job_store import RedisAsyncJobStore
@@ -140,9 +140,12 @@ class _ProcessingHeartbeat:
         while not self._stop.wait(self._interval):
             renewed = self._job_store.renew_processing(self._job_id, self._token, self._ttl)
             if not renewed:
-                get_async_reliability_metrics().record_lock_renew_fail(
-                    worker=self._worker_label,
-                    reason="lost",
+                safe_emit(
+                    "record_lock_renew_fail",
+                    lambda: get_async_reliability_metrics().record_lock_renew_fail(
+                        worker=self._worker_label,
+                        reason="lost",
+                    ),
                 )
                 return
 
@@ -361,10 +364,19 @@ def run() -> int:
                     )
 
                     if broker.schedule_retry(job_id, retry_payload, backoff):
-                        get_async_reliability_metrics().record_retry(worker="judge", reason="processing_error")
-                        get_async_reliability_metrics().record_retry_scheduled(
-                            worker="judge",
-                            reason="processing_error",
+                        safe_emit(
+                            "record_retry",
+                            lambda: get_async_reliability_metrics().record_retry(
+                                worker="judge",
+                                reason="processing_error",
+                            ),
+                        )
+                        safe_emit(
+                            "record_retry_scheduled",
+                            lambda: get_async_reliability_metrics().record_retry_scheduled(
+                                worker="judge",
+                                reason="processing_error",
+                            ),
                         )
                         broker.ack(message_id)
                         job_store.release_processing(job_id, processing_token)
