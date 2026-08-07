@@ -26,6 +26,7 @@ import unittest
 import uuid
 from unittest.mock import MagicMock, call, patch
 
+import evaluation_worker
 from evaluation_worker import _process_one_message
 
 
@@ -468,6 +469,46 @@ class TestEvaluationWorkerAckOrdering(unittest.TestCase):
         self.assertIn("enqueue", call_order)
         self.assertIn("release", call_order)
         self.assertLess(call_order.index("enqueue"), call_order.index("release"))
+
+
+class TestEvaluationWorkerOutageBackoff(unittest.TestCase):
+    def setUp(self):
+        evaluation_worker._RUNNING = True
+        evaluation_worker._DRAIN_EVENT.clear()
+
+    def tearDown(self):
+        evaluation_worker._RUNNING = True
+        evaluation_worker._DRAIN_EVENT.clear()
+
+    def test_fast_empty_poll_during_redis_outage_waits_on_drain_event(self):
+        redis_client = MagicMock()
+        redis_client.is_available.return_value = True
+        broker = MagicMock()
+        broker.consume.return_value = []
+        broker.reclaim_stale.return_value = []
+        broker.is_available.return_value = False
+
+        wait_calls: list[float] = []
+
+        def stop_on_wait(timeout):
+            wait_calls.append(timeout)
+            evaluation_worker._stop_worker()
+            return True
+
+        with patch("evaluation_worker.signal.signal"), \
+             patch("evaluation_worker.get_redis_client", return_value=redis_client), \
+             patch("evaluation_worker.RedisEvaluationBroker", return_value=broker), \
+             patch("evaluation_worker.RedisAsyncJobStore"), \
+             patch("evaluation_worker.AnalysisWorker"), \
+             patch("evaluation_worker._shared_monitoring_sink_configured", return_value=False), \
+             patch("evaluation_worker.os.path.exists", return_value=False), \
+             patch("evaluation_worker.time.monotonic", side_effect=[0.0, 0.1]), \
+             patch("evaluation_worker._DRAIN_EVENT.wait", side_effect=stop_on_wait):
+            exit_code = evaluation_worker.run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(wait_calls, [0.5])
+        broker.is_available.assert_called_once_with()
 
 
 if __name__ == "__main__":
