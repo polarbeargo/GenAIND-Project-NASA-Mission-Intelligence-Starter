@@ -142,7 +142,18 @@ minikube -p minikube start
 
 minikube -p minikube image build -t nasa-mission-intelligence-api:latest .
 
-# Full production parity with Postgres-backed monitoring analytics
+# Set OpenAI API key in .env first, then run the following to create the secret in Kubernetes and deploy the full production parity setup:
+export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' .env | cut -d= -f2-)"
+
+echo ${#OPENAI_API_KEY}
+
+kubectl create secret generic nasa-openai -n default \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic nasa-tracing -n default --from-literal=PHOENIX_ENDPOINT='http://host.docker.internal:6006/v1/traces' --from-literal=OTEL_EXPORTER_OTLP_ENDPOINT='' --dry-run=client -o yaml | kubectl apply -f -
+
+# Full production parity with Postgres-backed monitoring analytics. Set rollout timeout seconds to 7200 to avoid timeout when Chroma seed job is running
 ROLLOUT_TIMEOUT_SECONDS=600 \
 DASHBOARD_BINDING_REQUIRED=true \
 ENABLE_MONITORING_POSTGRES=true \
