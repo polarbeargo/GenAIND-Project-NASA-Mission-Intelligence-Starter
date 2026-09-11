@@ -216,9 +216,13 @@ jobs:
           # Keep this list short and remove entries as soon as patched releases exist.
           KNOWN_UNFIXED_VULNS=(
             "CVE-2026-45829"  # chromadb
+            "CVE-2026-45830"  # chromadb
+            "CVE-2026-45831"  # chromadb
+            "CVE-2026-45833"  # chromadb
             "CVE-2026-6587"   # ragas
             "CVE-2025-69872"  # diskcache (transitive)
             "PYSEC-2026-597"  # nltk (remove when upstream publishes a fixed nltk release)
+            "PYSEC-2026-3740" # nltk (remove when upstream publishes a fixed nltk release)
           )
           IGNORE_ARGS=()
           for vuln in "${KNOWN_UNFIXED_VULNS[@]}"; do
