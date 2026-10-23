@@ -1536,6 +1536,7 @@ See [doc/data-requirements.md](doc/data-requirements.md) for the expected direct
 - Russell, S., and Norvig, P. (2020). Artificial Intelligence: A Modern Approach (4th US ed., p. 712). Pearson. Retrieved May 30, 2026, from https://aima.cs.berkeley.edu/
 - [Udacity Generative AI Nanodegree Program](https://www.udacity.com/course/generative-ai--nd608)
 - [Udacity Agentic AI Nanodegree Program](https://www.udacity.com/course/agentic-ai--nd900)
+- [Udacity AI-Powered Software Engineer Nanodegree Program](https://www.udacity.com/course/ai-powered-software-engineer--nd770)
 - [Udacity Security Engineer Nanodegree Program](https://www.udacity.com/course/security-engineer-nanodegree--nd698)
 - [Udacity Cloud Native Application Architecture Nanodegree Program](https://www.udacity.com/blog/kick-off-your-cloud-native-application-architecture-career-with-the-launch-of-our-latest-nanodegree-program/)
 - [CS50 Cybersecurity](https://cs50.harvard.edu/cybersecurity/)
